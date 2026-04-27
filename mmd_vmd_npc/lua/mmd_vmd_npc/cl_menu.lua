@@ -1,0 +1,3255 @@
+MMDVMDNPC = MMDVMDNPC or {}
+MMDVMDNPC.ClientMotions = MMDVMDNPC.ClientMotions or {}
+MMDVMDNPC.TargetStatus = MMDVMDNPC.TargetStatus or {}
+MMDVMDNPC.BuildStatus = MMDVMDNPC.BuildStatus or {}
+MMDVMDNPC.PlayStatus = MMDVMDNPC.PlayStatus or {}
+MMDVMDNPC.ClientBuildJobs = MMDVMDNPC.ClientBuildJobs or {}
+MMDVMDNPC.ClientBuiltCache = MMDVMDNPC.ClientBuiltCache or {}
+MMDVMDNPC.MotionDetails = MMDVMDNPC.MotionDetails or {}
+MMDVMDNPC.AssignedActors = MMDVMDNPC.AssignedActors or { order = {}, byEnt = {} }
+MMDVMDNPC.PauseStatus = MMDVMDNPC.PauseStatus or { svPause = 0, svPauseSP = 0 }
+MMDVMDNPC.AudioOffsets = MMDVMDNPC.AudioOffsets or {}
+MMDVMDNPC.AudioChannels = MMDVMDNPC.AudioChannels or {}
+MMDVMDNPC.LocalPlaybacks = MMDVMDNPC.LocalPlaybacks or {}
+MMDVMDNPC.ActivePlaybackEnts = MMDVMDNPC.ActivePlaybackEnts or {}
+MMDVMDNPC.SelfPlaybackCameraEnt = MMDVMDNPC.SelfPlaybackCameraEnt or nil
+MMDVMDNPC.SelfCameraDistance = MMDVMDNPC.SelfCameraDistance or nil
+MMDVMDNPC.SelfCameraYaw = MMDVMDNPC.SelfCameraYaw or nil
+MMDVMDNPC.SelfCameraPitch = MMDVMDNPC.SelfCameraPitch or nil
+MMDVMDNPC.SelfCameraBaseCenter = MMDVMDNPC.SelfCameraBaseCenter or nil
+MMDVMDNPC.SelfCameraCenterOffset = MMDVMDNPC.SelfCameraCenterOffset or Vector(0, 0, 0)
+
+local DEBUG_REFERENCE_FRAME = -1
+
+local function L(key, fallback)
+    return MMDVMDNPC.L and MMDVMDNPC.L(key, fallback) or (fallback or key)
+end
+
+local function LF(key, ...)
+    return MMDVMDNPC.LFormat and MMDVMDNPC.LFormat(key, ...) or string.format(L(key, key), ...)
+end
+
+surface.CreateFont("MMDVMDNPCManagerText", {
+    font = "Tahoma",
+    size = 18,
+    weight = 500,
+    extended = true,
+})
+
+surface.CreateFont("MMDVMDNPCManagerTextBold", {
+    font = "Tahoma",
+    size = 18,
+    weight = 700,
+    extended = true,
+})
+
+surface.CreateFont("MMDVMDNPCManagerDetails", {
+    font = "Tahoma",
+    size = 17,
+    weight = 500,
+    extended = true,
+})
+
+local function set_manager_font(panel, fontName)
+    if IsValid(panel) and panel.SetFont then
+        panel:SetFont(fontName or "MMDVMDNPCManagerText")
+    end
+end
+
+local function style_manager_button(button, width)
+    if not IsValid(button) then return end
+    set_manager_font(button, "MMDVMDNPCManagerText")
+    if width then button:SetWide(width) end
+end
+
+local function style_manager_list_line(line)
+    if not IsValid(line) then return end
+    if line.SetTall then line:SetTall(30) end
+    if line.Columns then
+        for _, label in ipairs(line.Columns) do
+            set_manager_font(label, "MMDVMDNPCManagerText")
+        end
+    end
+end
+
+local function motion_display_name(metaOrID)
+    if istable(metaOrID) then
+        local display = tostring(metaOrID.displayName or "")
+        if display ~= "" then return display end
+        return tostring(metaOrID.id or "")
+    end
+
+    local id = tostring(metaOrID or "")
+    local meta = MMDVMDNPC.MotionDetails and MMDVMDNPC.MotionDetails[id] or nil
+    local display = meta and tostring(meta.displayName or "") or ""
+    return display ~= "" and display or id
+end
+
+CreateClientConVar("mmd_vmd_npc_disable_armtwist", "0", true, false, L("mmd_vmd_npc.ui.disable_armtwist"))
+CreateClientConVar("mmd_vmd_npc_disable_eyes", "0", true, false, L("mmd_vmd_npc.ui.disable_eyes"))
+CreateClientConVar("mmd_vmd_npc_disable_spine_pelvis_correction", "0", true, false, L("mmd_vmd_npc.ui.disable_spine_pelvis"))
+CreateClientConVar("mmd_vmd_npc_start_delay", tostring(MMDVMDNPC.DefaultStartDelay or 2), true, false, L("mmd_vmd_npc.ui.start_delay"))
+CreateClientConVar("mmd_vmd_npc_pelvis_z_offset", tostring(MMDVMDNPC.DefaultPelvisZOffset or -2.5), true, false, L("mmd_vmd_npc.ui.pelvis_z_offset"))
+CreateClientConVar("mmd_vmd_npc_thirdperson_distance", tostring(MMDVMDNPC.DefaultThirdPersonDistance or 120), true, false, L("mmd_vmd_npc.ui.thirdperson_distance"))
+CreateClientConVar("mmd_vmd_npc_thirdperson_height", tostring(MMDVMDNPC.DefaultThirdPersonHeight or 24), true, false, L("mmd_vmd_npc.ui.thirdperson_height"))
+CreateClientConVar("mmd_vmd_npc_eye_track", "1", true, false, L("mmd_vmd_npc.ui.enable_eye_tracking"))
+CreateClientConVar("mmd_vmd_npc_eye_track_smooth", tostring(MMDVMDNPC.DefaultEyeTrackSmooth or 20), true, false, L("mmd_vmd_npc.ui.eye_smoothing"))
+CreateClientConVar("mmd_vmd_npc_eye_track_moveback", tostring(MMDVMDNPC.DefaultEyeTrackBoneMoveBack or 0.10), true, false, L("mmd_vmd_npc.ui.eye_moveback"))
+CreateClientConVar("mmd_vmd_npc_eye_track_pos_ud", tostring(MMDVMDNPC.DefaultEyeTrackBonePosUD or 0.5), true, false, L("mmd_vmd_npc.ui.eye_pos_ud"))
+CreateClientConVar("mmd_vmd_npc_eye_track_pos_lr", tostring(MMDVMDNPC.DefaultEyeTrackBonePosLR or 0.5), true, false, L("mmd_vmd_npc.ui.eye_pos_lr"))
+CreateClientConVar("mmd_vmd_npc_music_enabled", "1", true, false, L("mmd_vmd_npc.ui.play_imported_music"))
+CreateClientConVar("mmd_vmd_npc_music_volume", tostring(MMDVMDNPC.DefaultMusicVolume or 1), true, false, L("mmd_vmd_npc.ui.music_volume"))
+CreateClientConVar("mmd_vmd_npc_build_frames_per_batch", tostring(MMDVMDNPC.DefaultBuildFramesPerBatch or 16), true, false, L("mmd_vmd_npc.ui.build_frames_per_batch"))
+CreateClientConVar("mmd_vmd_npc_playback_hz", tostring(MMDVMDNPC.DefaultPlaybackHz or 240), true, false, L("mmd_vmd_npc.ui.playback_updates_per_second"))
+
+local selected_options
+local play_ui_cue
+local force_self_view_cleanup
+
+local function request_list()
+    net.Start("mmdvmd_list_request")
+    net.SendToServer()
+end
+
+function MMDVMDNPC.RequestMotionList()
+    request_list()
+end
+
+local function request_motion_details()
+    net.Start("mmdvmd_motion_details_request")
+        local options = selected_options and selected_options() or {}
+        net.WriteBool(options.disableArmTwist == true)
+        net.WriteBool(options.disableEyes == true)
+        net.WriteBool(options.disableSpinePelvisCorrection == true)
+    net.SendToServer()
+end
+
+function MMDVMDNPC.RequestMotionDetails()
+    request_motion_details()
+end
+
+function MMDVMDNPC.RequestPauseStatus()
+    net.Start("mmdvmd_pause_status_request")
+    net.SendToServer()
+end
+
+function MMDVMDNPC.RequestSelectSelf()
+    net.Start("mmdvmd_select_target")
+        net.WriteEntity(LocalPlayer())
+    net.SendToServer()
+end
+
+selected_options = function()
+    local armTwist = GetConVar("mmd_vmd_npc_disable_armtwist")
+    local eyes = GetConVar("mmd_vmd_npc_disable_eyes")
+    local spinePelvis = GetConVar("mmd_vmd_npc_disable_spine_pelvis_correction")
+    return {
+        disableArmTwist = armTwist and armTwist:GetBool() or false,
+        disableEyes = eyes and eyes:GetBool() or false,
+        disableSpinePelvisCorrection = spinePelvis and spinePelvis:GetBool() or false,
+    }
+end
+
+local function write_selected_options()
+    local options = selected_options()
+    net.WriteBool(options.disableArmTwist)
+    net.WriteBool(options.disableEyes)
+    net.WriteBool(options.disableSpinePelvisCorrection)
+end
+
+local function eye_tracking_enabled()
+    local eyeTrack = GetConVar("mmd_vmd_npc_eye_track")
+    local raw = string.lower(tostring(eyeTrack and eyeTrack:GetString() or "1"))
+    return raw == "1" or raw == "true" or raw == "on" or raw == "yes" or raw == "camera" or raw == "player"
+end
+
+local function selected_playback_settings()
+    local delay = GetConVar("mmd_vmd_npc_start_delay")
+    local pelvis = GetConVar("mmd_vmd_npc_pelvis_z_offset")
+    local smooth = GetConVar("mmd_vmd_npc_eye_track_smooth")
+    local moveback = GetConVar("mmd_vmd_npc_eye_track_moveback")
+    local posUD = GetConVar("mmd_vmd_npc_eye_track_pos_ud")
+    local posLR = GetConVar("mmd_vmd_npc_eye_track_pos_lr")
+    local musicEnabled = GetConVar("mmd_vmd_npc_music_enabled")
+    local musicVolume = GetConVar("mmd_vmd_npc_music_volume")
+    local buildFrames = GetConVar("mmd_vmd_npc_build_frames_per_batch")
+    local playbackHz = GetConVar("mmd_vmd_npc_playback_hz")
+    return {
+        startDelay = math.max(MMDVMDNPC.MinStartDelay or 2, delay and delay:GetFloat() or MMDVMDNPC.DefaultStartDelay or 2),
+        -- pelvisZOffset = pelvis and pelvis:GetFloat() or MMDVMDNPC.DefaultPelvisZOffset or -2.5,
+        pelvisZOffset = -2.5, -- bugged
+        eyeTrackMode = eye_tracking_enabled() and "camera" or "off",
+        eyeTrackSmooth = smooth and smooth:GetFloat() or MMDVMDNPC.DefaultEyeTrackSmooth or 20,
+        eyeTrackMoveBack = moveback and moveback:GetFloat() or MMDVMDNPC.DefaultEyeTrackBoneMoveBack or 0.10,
+        eyeTrackPosUD = posUD and posUD:GetFloat() or MMDVMDNPC.DefaultEyeTrackBonePosUD or 0.5,
+        eyeTrackPosLR = posLR and posLR:GetFloat() or MMDVMDNPC.DefaultEyeTrackBonePosLR or 0.5,
+        musicEnabled = not musicEnabled or musicEnabled:GetBool(),
+        musicVolume = math.Clamp(musicVolume and musicVolume:GetFloat() or MMDVMDNPC.DefaultMusicVolume or 1, 0, 2),
+        buildFramesPerBatch = math.Clamp(math.floor(buildFrames and buildFrames:GetFloat() or MMDVMDNPC.DefaultBuildFramesPerBatch or 16), MMDVMDNPC.MinBuildFramesPerBatch or 1, MMDVMDNPC.MaxBuildFramesPerBatch or 128),
+        playbackHz = math.Clamp(playbackHz and playbackHz:GetFloat() or MMDVMDNPC.DefaultPlaybackHz or 240, MMDVMDNPC.MinPlaybackHz or 10, MMDVMDNPC.MaxPlaybackHz or 240),
+    }
+end
+
+local function write_selected_playback_settings()
+    local settings = selected_playback_settings()
+    net.WriteFloat(settings.startDelay)
+    net.WriteFloat(settings.pelvisZOffset)
+    net.WriteString(settings.eyeTrackMode or "off")
+    net.WriteFloat(settings.eyeTrackSmooth or MMDVMDNPC.DefaultEyeTrackSmooth or 20)
+    net.WriteFloat(settings.eyeTrackMoveBack or MMDVMDNPC.DefaultEyeTrackBoneMoveBack or 0.10)
+    net.WriteFloat(settings.eyeTrackPosUD or MMDVMDNPC.DefaultEyeTrackBonePosUD or 0.5)
+    net.WriteFloat(settings.eyeTrackPosLR or MMDVMDNPC.DefaultEyeTrackBonePosLR or 0.5)
+    net.WriteBool(settings.musicEnabled ~= false)
+    net.WriteFloat(settings.musicVolume or MMDVMDNPC.DefaultMusicVolume or 1)
+    net.WriteFloat(settings.buildFramesPerBatch or MMDVMDNPC.DefaultBuildFramesPerBatch or 16)
+    net.WriteFloat(settings.playbackHz or MMDVMDNPC.DefaultPlaybackHz or 240)
+end
+
+function MMDVMDNPC.RequestBuildSelectedMotion()
+    local current = GetConVar("mmd_vmd_npc_motion")
+    local motionID = current and current:GetString() or ""
+    if motionID == "" then
+        play_ui_cue("blocked")
+        print("[MMD VMD] " .. L("mmd_vmd_npc.error.select_motion"))
+        return
+    end
+
+    net.Start("mmdvmd_build_begin")
+        net.WriteString(motionID)
+        write_selected_options()
+        write_selected_playback_settings()
+    net.SendToServer()
+end
+
+function MMDVMDNPC.RequestCancelBuildTasks()
+    net.Start("mmdvmd_build_cancel_request")
+    net.SendToServer()
+end
+
+function MMDVMDNPC.RequestPlaySelectedMotion()
+    local current = GetConVar("mmd_vmd_npc_motion")
+    local motionID = current and current:GetString() or ""
+    if motionID == "" then
+        play_ui_cue("blocked")
+        print("[MMD VMD] " .. L("mmd_vmd_npc.error.select_motion"))
+        return
+    end
+
+    net.Start("mmdvmd_play_request")
+        net.WriteString(motionID)
+        write_selected_options()
+        write_selected_playback_settings()
+    net.SendToServer()
+end
+
+function MMDVMDNPC.RequestPlayAssignedGroup()
+    net.Start("mmdvmd_assignment_play_request")
+        write_selected_playback_settings()
+    net.SendToServer()
+end
+
+function MMDVMDNPC.RequestStopSelectedMotion()
+    net.Start("mmdvmd_stop_request")
+    net.SendToServer()
+end
+
+function MMDVMDNPC.RequestForceSelfPlaybackReset()
+    if force_self_view_cleanup then
+        force_self_view_cleanup()
+    end
+
+    net.Start("mmdvmd_force_self_reset_request")
+    net.SendToServer()
+end
+
+function MMDVMDNPC.RequestClearAssignedActors(mode)
+    net.Start("mmdvmd_assignment_clear_request")
+        net.WriteString(mode == "missing" and "missing" or "all")
+    net.SendToServer()
+end
+
+function MMDVMDNPC.RequestClearBuiltSelectedMotion(scope)
+    local current = GetConVar("mmd_vmd_npc_motion")
+    local motionID = current and current:GetString() or ""
+    if motionID == "" then
+        play_ui_cue("blocked")
+        print("[MMD VMD] " .. L("mmd_vmd_npc.error.select_motion"))
+        return
+    end
+
+    scope = scope == "all" and "all" or "model"
+    MMDVMDNPC.PendingClearBuilt = {
+        motionID = motionID,
+        scope = scope,
+        model = MMDVMDNPC.TargetStatus and MMDVMDNPC.TargetStatus.model or "",
+    }
+
+    net.Start("mmdvmd_clear_built_request")
+        net.WriteString(motionID)
+        net.WriteString(scope)
+    net.SendToServer()
+end
+
+function MMDVMDNPC.RequestDeleteSelectedMotion(motionID)
+    motionID = tostring(motionID or "")
+    if motionID == "" then
+        local current = GetConVar("mmd_vmd_npc_motion")
+        motionID = current and current:GetString() or ""
+    end
+    if motionID == "" then
+        play_ui_cue("blocked")
+        print("[MMD VMD] " .. L("mmd_vmd_npc.error.select_motion"))
+        return
+    end
+
+    net.Start("mmdvmd_delete_motion_request")
+        net.WriteString(motionID)
+    net.SendToServer()
+end
+
+net.Receive("mmdvmd_list_response", function()
+    local count = net.ReadUInt(16)
+    local list = {}
+    for i = 1, count do
+        list[#list + 1] = net.ReadString()
+    end
+
+    MMDVMDNPC.ClientMotions = list
+    hook.Run("MMDVMDNPCMotionListUpdated", list)
+    request_motion_details()
+
+    if count == 0 then
+        print("[MMD VMD] " .. L("mmd_vmd_npc.console.no_motions"))
+    else
+        print("[MMD VMD] " .. L("mmd_vmd_npc.console.motion_files"))
+        for _, id in ipairs(list) do
+            print("  " .. id)
+        end
+    end
+end)
+
+net.Receive("mmdvmd_motion_details_response", function()
+    local count = net.ReadUInt(16)
+    local details = {}
+    local ordered = {}
+
+    for _ = 1, count do
+        local id = net.ReadString()
+        local meta = {
+            id = id,
+            displayName = net.ReadString(),
+            fps = net.ReadUInt(16),
+            frameStart = net.ReadUInt(32),
+            frameEnd = net.ReadUInt(32),
+            frameCount = net.ReadUInt(32),
+            duration = net.ReadFloat(),
+            boneCount = net.ReadUInt(16),
+            flexCount = net.ReadUInt(16),
+            modified = net.ReadFloat(),
+            sourceName = net.ReadString(),
+            musicSound = net.ReadString(),
+            musicSource = net.ReadString(),
+            isAddon = net.ReadBool(),
+            built = net.ReadBool(),
+        }
+        details[id] = meta
+        ordered[#ordered + 1] = meta
+    end
+
+    MMDVMDNPC.MotionDetails = details
+    MMDVMDNPC.MotionDetailsOrdered = ordered
+    hook.Run("MMDVMDNPCMotionDetailsUpdated", ordered, details)
+end)
+
+net.Receive("mmdvmd_pause_status_response", function()
+    MMDVMDNPC.PauseStatus = {
+        svPause = net.ReadFloat(),
+        svPauseSP = net.ReadFloat(),
+    }
+    hook.Run("MMDVMDNPCPauseStatusUpdated", MMDVMDNPC.PauseStatus)
+end)
+
+local function request_audio_settings(motionID)
+    net.Start("mmdvmd_audio_settings_request")
+        net.WriteString(tostring(motionID or ""))
+    net.SendToServer()
+end
+
+function MMDVMDNPC.RequestAudioSettings(motionID)
+    request_audio_settings(motionID)
+end
+
+function MMDVMDNPC.SaveAudioOffset(motionID, offset)
+    net.Start("mmdvmd_audio_settings_save")
+        net.WriteString(tostring(motionID or ""))
+        net.WriteFloat(tonumber(offset) or 0)
+    net.SendToServer()
+end
+
+net.Receive("mmdvmd_audio_settings_response", function()
+    local motionID = net.ReadString()
+    local offset = net.ReadFloat()
+    local soundPath = net.ReadString()
+    MMDVMDNPC.AudioOffsets[motionID] = offset
+    local details = MMDVMDNPC.MotionDetails[motionID]
+    if details then details.musicSound = soundPath ~= "" and soundPath or details.musicSound end
+    hook.Run("MMDVMDNPCAudioSettingsUpdated", motionID, offset, soundPath)
+end)
+
+local function request_debug(motionID, vmdFrame)
+    vmdFrame = math.max(DEBUG_REFERENCE_FRAME, math.floor(tonumber(vmdFrame) or DEBUG_REFERENCE_FRAME))
+    net.Start("mmdvmd_debug_request")
+        net.WriteString(tostring(motionID or ""))
+        net.WriteInt(vmdFrame, 32)
+    net.SendToServer()
+end
+
+local function fmt_num(value)
+    return string.format("%.3f", tonumber(value) or 0)
+end
+
+local function fmt_angle(pitch, yaw, roll)
+    return string.format("%.3f, %.3f, %.3f", tonumber(pitch) or 0, tonumber(yaw) or 0, tonumber(roll) or 0)
+end
+
+local function fmt_vec(x, y, z)
+    return string.format("%.3f, %.3f, %.3f", tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0)
+end
+
+local function fmt_eta(seconds)
+    seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+    local minutes = math.floor(seconds / 60)
+    seconds = seconds % 60
+    return string.format("%02d:%02d", minutes, seconds)
+end
+
+local UI_CUE_SOUNDS = {
+    blocked = "buttons/button10.wav",
+    warning = "buttons/button14.wav",
+    success = "buttons/button15.wav",
+    pause = "buttons/button3.wav",
+}
+
+play_ui_cue = function(kind)
+    kind = UI_CUE_SOUNDS[kind or ""] and kind or "blocked"
+    local soundPath = UI_CUE_SOUNDS[kind]
+    local now = CurTime()
+    MMDVMDNPC.LastUICueTimes = MMDVMDNPC.LastUICueTimes or {}
+    local nextAllowed = MMDVMDNPC.LastUICueTimes[kind] or 0
+    if now < nextAllowed then return end
+
+    MMDVMDNPC.LastUICueTimes[kind] = now + 0.25
+    if surface and surface.PlaySound then
+        surface.PlaySound(soundPath)
+    end
+end
+
+function MMDVMDNPC.PlayUICue(kind)
+    play_ui_cue(kind)
+end
+
+local function show_build_lag_warning(buildID, motionID, startFrame, endFrame)
+    buildID = tonumber(buildID) or 0
+    if buildID > 0 and MMDVMDNPC.LastBuildLagWarningID == buildID then return end
+    MMDVMDNPC.LastBuildLagWarningID = buildID
+    play_ui_cue("warning")
+
+    local frameCount = math.max(0, (tonumber(endFrame) or 0) - (tonumber(startFrame) or 0) + 1)
+    local message = LF(
+        "mmd_vmd_npc.warning.build_lag_fmt",
+        tostring(motionID or L("mmd_vmd_npc.ui.motion")),
+        frameCount
+    )
+
+    if notification and notification.AddLegacy then
+        notification.AddLegacy(message, NOTIFY_HINT or 3, 8)
+    end
+end
+
+local function play_status_cue(status, message)
+    status = tostring(status or "")
+    message = tostring(message or "")
+    local previousStatus = MMDVMDNPC.LastStatusCueStatus
+    MMDVMDNPC.LastStatusCueStatus = status
+
+    local cue
+    if status == "error" or status == "blocked" or status == "missing_build" then
+        cue = "blocked"
+    elseif status == "paused" then
+        if previousStatus == "paused" then return end
+        cue = "pause"
+    elseif status == "playing" and message == "playback resumed" then
+        cue = "success"
+    elseif status == "stopped" or status == "stopped_all" or status == "finished" or status == "built" or status == "aligned" then
+        cue = "success"
+    end
+    if not cue then return end
+
+    local key = cue .. "|" .. status .. "|" .. message
+    local now = CurTime()
+    if MMDVMDNPC.LastStatusCueKey == key and now < (MMDVMDNPC.LastStatusCueUntil or 0) then return end
+    MMDVMDNPC.LastStatusCueKey = key
+    MMDVMDNPC.LastStatusCueUntil = now + 3
+    play_ui_cue(cue)
+    if (status == "error" or status == "blocked") and string.find(string.lower(message), "ai_disabled", 1, true) then
+        if notification and notification.AddLegacy then
+            notification.AddLegacy(message, NOTIFY_ERROR or 1, 6)
+        end
+    end
+end
+
+local function update_build_status(status)
+    status = status or {}
+    local previous = MMDVMDNPC.BuildStatus or {}
+    local now = CurTime()
+    local startFrame = math.floor(tonumber(status.startFrame) or 0)
+    local endFrame = math.floor(tonumber(status.endFrame) or startFrame)
+    if endFrame < startFrame then endFrame = startFrame end
+
+    local currentFrame = math.floor(tonumber(status.currentFrame) or startFrame)
+    local total = math.max(1, endFrame - startFrame + 1)
+    local completed = math.Clamp(currentFrame - startFrame, 0, total)
+    if currentFrame > endFrame then completed = total end
+    local progress = math.Clamp(completed / total, 0, 1)
+    if status.progress ~= nil then
+        progress = math.Clamp(tonumber(status.progress) or progress, 0, 1)
+    end
+
+    local buildID = tonumber(status.buildID) or 0
+    local startedAt = previous.startedAt
+    if previous.buildID ~= buildID or previous.status ~= "building" then
+        startedAt = now
+    end
+
+    local eta = nil
+    if status.status == "building" and progress > 0 and progress < 1 then
+        eta = (now - startedAt) * (1 - progress) / progress
+    end
+
+    local message = tostring(status.message or status.status or "idle")
+    if status.status == "building" then
+        message = string.format(
+            "%s | %.0f%% | ETA %s | queued %d",
+            message,
+            progress * 100,
+            eta and fmt_eta(eta) or "--:--",
+            tonumber(status.queued) or 0
+        )
+    elseif status.status == "queued" then
+        message = string.format("%s | queued %d", message, tonumber(status.queued) or 0)
+    end
+
+    MMDVMDNPC.BuildStatus = {
+        ok = status.ok,
+        status = status.status,
+        path = status.path,
+        message = message,
+        rawMessage = status.message,
+        buildID = buildID,
+        motionID = status.motionID,
+        model = status.model,
+        currentFrame = currentFrame,
+        startFrame = startFrame,
+        endFrame = endFrame,
+        queued = tonumber(status.queued) or 0,
+        progress = progress,
+        eta = eta,
+        startedAt = startedAt,
+        updatedAt = now,
+    }
+    hook.Run("MMDVMDNPCBuildStatusUpdated", MMDVMDNPC.BuildStatus)
+end
+
+local ZERO_VECTOR = Vector(0, 0, 0)
+local ZERO_ANGLE = Angle(0, 0, 0)
+local SOURCE_PELVIS = "ValveBiped.Bip01_Pelvis"
+local SOURCE_SPINE = "ValveBiped.Bip01_Spine"
+local LOCAL_PLAYBACK_HZ = 240
+local EYE_TRACK_BONE_MOVE_BACK = 0.10
+local EYE_TRACK_BONE_POS_UD = 0.5
+local EYE_TRACK_BONE_POS_LR = 0.5
+local EYE_TRACK_SMOOTH = 20
+
+local function local_playback_hz()
+    local cvar = GetConVar("mmd_vmd_npc_playback_hz")
+    return math.Clamp(
+        cvar and cvar:GetFloat() or MMDVMDNPC.DefaultPlaybackHz or LOCAL_PLAYBACK_HZ,
+        MMDVMDNPC.MinPlaybackHz or 10,
+        MMDVMDNPC.MaxPlaybackHz or LOCAL_PLAYBACK_HZ
+    )
+end
+
+local EYE_BONE_LEFT_CANDIDATES = {
+    "Eye_LD",
+    "eye_LD",
+    "左目D",
+    "目D.L",
+    "ValveBiped.Bip01_Eye_L",
+    "ValveBiped.Bip01_L_Eye",
+    "Eye_L",
+    "eye_L",
+    "eye_l",
+    "EyeL",
+    "Eye_l",
+    "Left_Eye",
+    "left_eye",
+    "LeftEye",
+    "lefteye",
+    "LeftEyeReturn",
+    "EyeReturn_L",
+    "左目",
+    "目.L",
+}
+
+local EYE_BONE_RIGHT_CANDIDATES = {
+    "Eye_RD",
+    "eye_RD",
+    "右目D",
+    "目D.R",
+    "ValveBiped.Bip01_Eye_R",
+    "ValveBiped.Bip01_R_Eye",
+    "Eye_R",
+    "eye_R",
+    "eye_r",
+    "EyeR",
+    "Eye_r",
+    "Right_Eye",
+    "right_eye",
+    "RightEye",
+    "righteye",
+    "RightEyeReturn",
+    "EyeReturn_R",
+    "右目",
+    "目.R",
+}
+
+local EYE_ATTACHMENT_CANDIDATES = {
+    "eyes",
+    "anim_attachment_eyes",
+    "anim_attachment_head",
+    "head",
+}
+
+local function lerp_value(a, b, fraction)
+    return (tonumber(a) or 0) + ((tonumber(b) or 0) - (tonumber(a) or 0)) * fraction
+end
+
+local function clean_angle(ang)
+    ang = ang or ZERO_ANGLE
+    local function clean(value)
+        value = tonumber(value) or 0
+        value = math.NormalizeAngle and math.NormalizeAngle(value) or (((value + 180) % 360) - 180)
+        if math.abs(value) < 0.00001 then return 0 end
+        return value
+    end
+
+    return Angle(clean(ang.p), clean(ang.y), clean(ang.r))
+end
+
+local function normalize_angle_delta(a, b)
+    if math.NormalizeAngle then
+        return math.NormalizeAngle((tonumber(b) or 0) - (tonumber(a) or 0))
+    end
+    return ((((tonumber(b) or 0) - (tonumber(a) or 0)) + 180) % 360) - 180
+end
+
+local function lerp_angle_value(a, b, fraction)
+    return (tonumber(a) or 0) + normalize_angle_delta(a, b) * fraction
+end
+
+local function setup_bones_now(ent)
+    if not IsValid(ent) then return end
+    if ent.InvalidateBoneCache then ent:InvalidateBoneCache() end
+    if ent.SetupBones then ent:SetupBones() end
+end
+
+local function lookup_reference_sequence(ent)
+    return MMDVMDNPC.LookupReferenceSequence and MMDVMDNPC.LookupReferenceSequence(ent) or -1
+end
+
+local function lookup_reference_sequence_info(ent)
+    return MMDVMDNPC.LookupReferenceSequenceInfo and MMDVMDNPC.LookupReferenceSequenceInfo(ent) or nil
+end
+
+local function force_reference_pose(ent)
+    if not IsValid(ent) then return false end
+
+    local info = lookup_reference_sequence_info(ent)
+    local seq = info and info.seq or lookup_reference_sequence(ent)
+    if not seq or seq < 0 then return false end
+
+    if ent.SetSequence then
+        ent:SetSequence(seq)
+    end
+    if ent.ResetSequence then
+        ent:ResetSequence(seq)
+    end
+    if ent.ResetSequenceInfo then ent:ResetSequenceInfo() end
+    if ent.SetCycle then ent:SetCycle(0) end
+    if ent.SetPlaybackRate then ent:SetPlaybackRate(0) end
+    if ent.SetIK then ent:SetIK(false) end
+    if ent.FrameAdvance then ent:FrameAdvance(0) end
+    setup_bones_now(ent)
+    ent.MMDVMDNPCReferenceInfo = info
+    return true, info
+end
+
+local function clear_all_bone_manipulations(ent)
+    if not IsValid(ent) or not ent.GetBoneCount then return end
+
+    local count = ent:GetBoneCount() or 0
+    for bone = 0, count - 1 do
+        if ent.ManipulateBoneAngles then ent:ManipulateBoneAngles(bone, ZERO_ANGLE, false) end
+        if ent.ManipulateBonePosition then ent:ManipulateBonePosition(bone, ZERO_VECTOR) end
+    end
+    setup_bones_now(ent)
+end
+
+local function bone_depth(ent, bone)
+    local depth = 0
+    local parent = ent.GetBoneParent and ent:GetBoneParent(bone) or -1
+    local guard = 0
+
+    while parent and parent >= 0 and guard < 512 do
+        depth = depth + 1
+        parent = ent:GetBoneParent(parent)
+        guard = guard + 1
+    end
+
+    return depth
+end
+
+local function rotate_vector_around_axis(vec, axis, degrees)
+    degrees = tonumber(degrees) or 0
+    if math.abs(degrees) < 0.00001 then
+        return Vector(vec.x, vec.y, vec.z)
+    end
+
+    local normal = Vector(axis.x, axis.y, axis.z)
+    if normal:LengthSqr() <= 0.0000001 then return Vector(vec.x, vec.y, vec.z) end
+    normal:Normalize()
+
+    local rad = math.rad(degrees)
+    local cos = math.cos(rad)
+    local sin = math.sin(rad)
+    local dot = vec:Dot(normal)
+
+    return (vec * cos) + (normal:Cross(vec) * sin) + (normal * dot * (1 - cos))
+end
+
+local function rotate_angle_around_sequential_model_axes(baseline, modelAng, degrees)
+    degrees = degrees or {}
+
+    local forward = baseline:Forward()
+    local up = baseline:Up()
+
+    local modelX = modelAng:Forward()
+    local modelY = modelAng:Right()
+    local modelZ = modelAng:Up()
+
+    forward = rotate_vector_around_axis(forward, modelY, degrees.y)
+    up = rotate_vector_around_axis(up, modelY, degrees.y)
+
+    forward = rotate_vector_around_axis(forward, modelX, degrees.x)
+    up = rotate_vector_around_axis(up, modelX, degrees.x)
+
+    forward = rotate_vector_around_axis(forward, modelZ, degrees.z)
+    up = rotate_vector_around_axis(up, modelZ, degrees.z)
+
+    forward:Normalize()
+    up:Normalize()
+
+    return clean_angle(forward:AngleEx(up))
+end
+
+local function reference_basis_is_idlenoise(referenceInfo)
+    return istable(referenceInfo) and tostring(referenceInfo.basis or "") == "idlenoise"
+end
+
+local function transform_reference_vector_to_sequence_basis(vec, referenceInfo)
+    vec = vec or ZERO_VECTOR
+    if reference_basis_is_idlenoise(referenceInfo) then
+        return Vector(-(vec.y or 0), vec.x or 0, vec.z or 0)
+    end
+    return Vector(vec.x or 0, vec.y or 0, vec.z or 0)
+end
+
+local function transform_reference_degrees_to_sequence_basis(degrees, referenceInfo)
+    degrees = degrees or {}
+    if reference_basis_is_idlenoise(referenceInfo) then
+        return {
+            x = -(degrees.y or 0),
+            y = degrees.x or 0,
+            z = degrees.z or 0,
+        }
+    end
+    return {
+        x = degrees.x or 0,
+        y = degrees.y or 0,
+        z = degrees.z or 0,
+    }
+end
+
+local function raw_axis_to_model_axis_degrees(x, y, z, referenceInfo)
+    local referenceDegrees = {
+        x = -(y or 0),
+        y = -(x or 0),
+        z = z or 0,
+    }
+    return transform_reference_degrees_to_sequence_basis(referenceDegrees, referenceInfo)
+end
+
+local function is_zero_degrees(degrees)
+    return not degrees
+        or (math.abs(degrees.x or 0) < 0.00001
+            and math.abs(degrees.y or 0) < 0.00001
+            and math.abs(degrees.z or 0) < 0.00001)
+end
+
+local function is_zero_angle(ang)
+    return not ang
+        or (math.abs(ang.p or 0) < 0.00001
+            and math.abs(ang.y or 0) < 0.00001
+            and math.abs(ang.r or 0) < 0.00001)
+end
+
+local function is_zero_vector(vec)
+    return not vec or vec:LengthSqr() <= 0.0000001
+end
+
+local function copy_vector(vec)
+    vec = vec or ZERO_VECTOR
+    return Vector(vec.x or 0, vec.y or 0, vec.z or 0)
+end
+
+local function convar_bool(name, fallback)
+    local cvar = GetConVar(name)
+    if not cvar then return fallback == true end
+    return cvar:GetBool()
+end
+
+local function source_is_arm_twist(source)
+    source = string.lower(tostring(source or ""))
+    return string.find(source, "zarmtwist", 1, true) ~= nil
+end
+
+local function source_is_eye(source)
+    source = string.lower(tostring(source or ""))
+    return string.find(source, "eye", 1, true) ~= nil
+end
+
+local function transforms_disabled_for_source(source)
+    if convar_bool("mmd_vmd_npc_disable_armtwist", false) and source_is_arm_twist(source) then
+        return true
+    end
+    if convar_bool("mmd_vmd_npc_disable_eyes", false) and source_is_eye(source) then
+        return true
+    end
+    return false
+end
+
+local function spine_pelvis_correction_enabled()
+    return not convar_bool("mmd_vmd_npc_disable_spine_pelvis_correction", false)
+end
+
+local function row_uses_runtime_spine_position(row)
+    return (tostring(row and row.source or "") == SOURCE_SPINE)
+        and (tostring(row and row.role or "") == "source_parent_override")
+end
+
+local function bone_baseline_angle(ent, bone)
+    local matrix = ent.GetBoneMatrix and ent:GetBoneMatrix(bone) or nil
+    if matrix then return matrix:GetAngles() end
+
+    if ent.GetBonePosition then
+        local _, ang = ent:GetBonePosition(bone)
+        return ang or ZERO_ANGLE
+    end
+
+    return ZERO_ANGLE
+end
+
+local function compute_manip_angle_from_model_axes(ent, bone, degrees, baseline)
+    baseline = baseline or bone_baseline_angle(ent, bone)
+    local desired = rotate_angle_around_sequential_model_axes(baseline, ent:GetAngles(), degrees)
+    local _, localManip = WorldToLocal(ZERO_VECTOR, desired, ZERO_VECTOR, baseline)
+    return clean_angle(localManip)
+end
+
+local function bone_world_position(ent, bone)
+    local matrix = ent.GetBoneMatrix and ent:GetBoneMatrix(bone) or nil
+    if matrix then return matrix:GetTranslation() end
+
+    if ent.GetBonePosition then
+        local pos = ent:GetBonePosition(bone)
+        return pos or ZERO_VECTOR
+    end
+
+    return ZERO_VECTOR
+end
+
+local function world_vector_to_entity_local(ent, vec)
+    if not IsValid(ent) then return copy_vector(vec) end
+
+    local origin = ent:GetPos()
+    local localOrigin = ent:WorldToLocal(origin)
+    local localTarget = ent:WorldToLocal(origin + vec)
+    return localTarget - localOrigin
+end
+
+local function send_debug_pose(ent, packed, flexPacked)
+    if not IsValid(ent) then return end
+    flexPacked = flexPacked or {}
+
+    net.Start("mmdvmd_debug_apply")
+        net.WriteEntity(ent)
+        net.WriteUInt(math.min(#packed, 4096), 16)
+        for i = 1, math.min(#packed, 4096) do
+            net.WriteUInt(packed[i].bone, 16)
+            net.WriteAngle(packed[i].ang)
+            net.WriteFloat(packed[i].pos.x)
+            net.WriteFloat(packed[i].pos.y)
+            net.WriteFloat(packed[i].pos.z)
+        end
+        net.WriteUInt(math.min(#flexPacked, 4096), 16)
+        for i = 1, math.min(#flexPacked, 4096) do
+            net.WriteInt(flexPacked[i].flexID, 16)
+            net.WriteFloat(flexPacked[i].weight)
+        end
+    net.SendToServer()
+end
+
+local function packet_to_frame_data(frameNumber, packed, flexPacked)
+    local frame = {
+        frame = math.max(0, math.floor(tonumber(frameNumber) or 0)),
+        bones = {},
+        flexes = {},
+    }
+
+    for _, row in ipairs(packed or {}) do
+        local ang = row.ang or ZERO_ANGLE
+        local pos = row.pos or ZERO_VECTOR
+        frame.bones[#frame.bones + 1] = {
+            row.bone,
+            ang.p or 0,
+            ang.y or 0,
+            ang.r or 0,
+            pos.x or 0,
+            pos.y or 0,
+            pos.z or 0,
+        }
+    end
+
+    for _, row in ipairs(flexPacked or {}) do
+        frame.flexes[#frame.flexes + 1] = {
+            row.flexID,
+            math.Clamp(tonumber(row.weight) or 0, 0, 1),
+        }
+    end
+
+    return frame
+end
+
+local function sorted_client_metadata(map)
+    local out = {}
+    for _, meta in pairs(map or {}) do
+        out[#out + 1] = meta
+    end
+    table.sort(out, function(a, b) return (a.id or 0) < (b.id or 0) end)
+    return out
+end
+
+local function destroy_build_dummy()
+    local dummy = MMDVMDNPC.BuildDummy
+    MMDVMDNPC.BuildDummy = nil
+    if IsValid(dummy) then dummy:Remove() end
+end
+
+local function build_dummy_for_target(target)
+    if not IsValid(target) then return nil end
+
+    local model = target:GetModel() or ""
+    local dummy = MMDVMDNPC.BuildDummy
+    if not IsValid(dummy) or dummy:GetModel() ~= model then
+        destroy_build_dummy()
+        dummy = ClientsideModel(model, RENDERGROUP_OTHER)
+        MMDVMDNPC.BuildDummy = dummy
+    end
+    if not IsValid(dummy) then return nil end
+
+    dummy:SetPos(vector_origin or Vector(0, 0, 0))
+    dummy:SetAngles(IsValid(target) and target:GetAngles() or ZERO_ANGLE)
+    dummy:SetNoDraw(true)
+    if dummy.DrawShadow then dummy:DrawShadow(false) end
+    if dummy.SetRenderMode then dummy:SetRenderMode(RENDERMODE_TRANSALPHA) end
+    if dummy.SetColor then dummy:SetColor(Color(255, 255, 255, 0)) end
+    setup_bones_now(dummy)
+    return dummy
+end
+
+local function clear_local_playback_pose(ent, built)
+    if not IsValid(ent) or not built then return end
+
+    for _, meta in ipairs(built.bones or {}) do
+        local bone = tonumber(meta.id) or -1
+        if bone >= 0 then
+            if ent.ManipulateBoneAngles then ent:ManipulateBoneAngles(bone, ZERO_ANGLE, false) end
+            if ent.ManipulateBonePosition then ent:ManipulateBonePosition(bone, ZERO_VECTOR) end
+        end
+    end
+
+    if ent.SetFlexWeight then
+        for _, meta in ipairs(built.flexes or {}) do
+            local flexID = tonumber(meta.id) or -1
+            if flexID >= 0 then ent:SetFlexWeight(flexID, 0) end
+        end
+    end
+    setup_bones_now(ent)
+end
+
+local function apply_local_built_sample(ent, frameA, frameB, fraction, pelvisZOffset)
+    frameA = frameA or {}
+    frameB = frameB or frameA
+    fraction = math.Clamp(tonumber(fraction) or 0, 0, 1)
+    pelvisZOffset = tonumber(pelvisZOffset) or 0
+    local pelvisBone = ent.LookupBone and ent:LookupBone(SOURCE_PELVIS) or nil
+
+    for index, boneA in ipairs(frameA.bones or {}) do
+        local boneB = (frameB.bones or {})[index] or boneA
+        local bone = tonumber(boneA[1]) or -1
+        if bone >= 0 then
+            if ent.ManipulateBoneAngles then
+                ent:ManipulateBoneAngles(bone, Angle(
+                    lerp_angle_value(boneA[2], boneB[2], fraction),
+                    lerp_angle_value(boneA[3], boneB[3], fraction),
+                    lerp_angle_value(boneA[4], boneB[4], fraction)
+                ), false)
+            end
+            if ent.ManipulateBonePosition then
+                local pos = Vector(
+                    lerp_value(boneA[5], boneB[5], fraction),
+                    lerp_value(boneA[6], boneB[6], fraction),
+                    lerp_value(boneA[7], boneB[7], fraction)
+                )
+                if pelvisBone and bone == pelvisBone then
+                    pos.z = pos.z + pelvisZOffset
+                end
+                ent:ManipulateBonePosition(bone, pos)
+            end
+        end
+    end
+
+    if ent.SetFlexWeight then
+        for index, flexA in ipairs(frameA.flexes or {}) do
+            local flexB = (frameB.flexes or {})[index] or flexA
+            local flexID = tonumber(flexA[1]) or -1
+            if flexID >= 0 then
+                ent:SetFlexWeight(flexID, math.Clamp(lerp_value(flexA[2], flexB[2], fraction), 0, 1))
+            end
+        end
+    end
+
+    setup_bones_now(ent)
+end
+
+local function resolve_local_eye_bones(ent)
+    if not IsValid(ent) or not ent.LookupBone then return nil, nil end
+
+    local leftBone
+    for _, name in ipairs(EYE_BONE_LEFT_CANDIDATES) do
+        local bone = ent:LookupBone(name)
+        if bone and bone >= 0 then
+            leftBone = bone
+            break
+        end
+    end
+
+    local rightBone
+    for _, name in ipairs(EYE_BONE_RIGHT_CANDIDATES) do
+        local bone = ent:LookupBone(name)
+        if bone and bone >= 0 then
+            rightBone = bone
+            break
+        end
+    end
+
+    return leftBone, rightBone
+end
+
+function MMDVMDNPC.ClientEyeBoneSummary(ent)
+    if not IsValid(ent) then return L("mmd_vmd_npc.ui.eye_status_none") end
+
+    local leftBone, rightBone = resolve_local_eye_bones(ent)
+    local leftName = leftBone ~= nil and ent.GetBoneName and ent:GetBoneName(leftBone) or nil
+    local rightName = rightBone ~= nil and ent.GetBoneName and ent:GetBoneName(rightBone) or nil
+
+    return LF(
+        "mmd_vmd_npc.ui.eye_status_fmt",
+        leftName and LF("mmd_vmd_npc.ui.eye_bone_fmt", leftName, leftBone) or L("mmd_vmd_npc.ui.not_found"),
+        rightName and LF("mmd_vmd_npc.ui.eye_bone_fmt", rightName, rightBone) or L("mmd_vmd_npc.ui.not_found")
+    )
+end
+
+local function get_local_eye_attachment(ent)
+    if not IsValid(ent) or not ent.LookupAttachment or not ent.GetAttachment then return nil end
+
+    for _, name in ipairs(EYE_ATTACHMENT_CANDIDATES) do
+        local id = ent:LookupAttachment(name)
+        if id and id > 0 then
+            local att = ent:GetAttachment(id)
+            if att and att.Pos and att.Ang then return att end
+        end
+    end
+
+    return nil
+end
+
+local function local_eye_tracking_target()
+    if MMDVMDNPC.SelfThirdPersonActive and MMDVMDNPC.EyeTrackCameraOrigin then
+        return MMDVMDNPC.EyeTrackCameraOrigin
+    end
+    return EyePos()
+end
+
+local function compute_local_look_controls(ent, targetWorld)
+    if not IsValid(ent) or not isvector(targetWorld) then return 0, 0, 0 end
+
+    local att = get_local_eye_attachment(ent)
+    if att then
+        local localTarget = WorldToLocal(targetWorld, ZERO_ANGLE, att.Pos, att.Ang)
+        local dir = localTarget:GetNormalized()
+        local sum = math.abs(dir.y) + math.abs(dir.z)
+        local sumMax = math.max(sum, 1.5)
+        return math.Clamp(dir.y / sumMax, -1, 1),
+            math.Clamp(dir.z / sumMax, -1, 1),
+            math.Clamp(sum / sumMax, 0, 1)
+    end
+
+    local eyePos = ent.EyePos and ent:EyePos() or ent:GetPos()
+    if not isvector(eyePos) then eyePos = ent:GetPos() end
+    local dirWorld = (targetWorld - eyePos):GetNormalized()
+    local right = ent.GetRight and ent:GetRight() or Vector(0, 1, 0)
+    local up = ent.GetUp and ent:GetUp() or Vector(0, 0, 1)
+    local y = dirWorld:Dot(right)
+    local z = dirWorld:Dot(up)
+    local sum = math.abs(y) + math.abs(z)
+    local sumMax = math.max(sum, 1.5)
+
+    return math.Clamp(y / sumMax, -1, 1),
+        math.Clamp(z / sumMax, -1, 1),
+        math.Clamp(sum / sumMax, 0, 1)
+end
+
+local function reset_local_eye_tracking(ent, eyeState)
+    if not IsValid(ent) or not eyeState then return end
+
+    if eyeState.eyeBoneL ~= nil and ent.ManipulateBonePosition then
+        ent:ManipulateBonePosition(eyeState.eyeBoneL, ZERO_VECTOR)
+    end
+    if eyeState.eyeBoneR ~= nil and ent.ManipulateBonePosition then
+        ent:ManipulateBonePosition(eyeState.eyeBoneR, ZERO_VECTOR)
+    end
+    if ent.SetEyeTarget then
+        pcall(ent.SetEyeTarget, ent, ZERO_VECTOR)
+    end
+    setup_bones_now(ent)
+end
+
+local function apply_local_eye_tracking(ent, state, now)
+    if not IsValid(ent) or not ent.ManipulateBonePosition or not state then return end
+
+    if not eye_tracking_enabled() then
+        reset_local_eye_tracking(ent, state.eyeTrack)
+        state.eyeTrack = nil
+        return
+    end
+
+    local targetWorld = local_eye_tracking_target()
+    if not isvector(targetWorld) then return end
+
+    local eyeState = state.eyeTrack
+    if not eyeState then
+        eyeState = {}
+        state.eyeTrack = eyeState
+    end
+    if not eyeState.eyeBonesResolved then
+        eyeState.eyeBoneL, eyeState.eyeBoneR = resolve_local_eye_bones(ent)
+        eyeState.eyeBonesResolved = true
+    end
+
+    local lookLeftRight, lookUpDown, lookBack = compute_local_look_controls(ent, targetWorld)
+    local dt = math.max(0.001, now - (eyeState.lastApply or now))
+    eyeState.lastApply = now
+    local smooth = GetConVar("mmd_vmd_npc_eye_track_smooth")
+    local moveback = GetConVar("mmd_vmd_npc_eye_track_moveback")
+    local posUD = GetConVar("mmd_vmd_npc_eye_track_pos_ud")
+    local posLR = GetConVar("mmd_vmd_npc_eye_track_pos_lr")
+    local alpha = 1 - math.exp(-dt * math.max(0.1, smooth and smooth:GetFloat() or EYE_TRACK_SMOOTH))
+
+    eyeState.curL = (eyeState.curL or 0) + (lookLeftRight - (eyeState.curL or 0)) * alpha
+    eyeState.curU = (eyeState.curU or 0) + (lookUpDown - (eyeState.curU or 0)) * alpha
+    eyeState.curB = (eyeState.curB or 0) + (lookBack - (eyeState.curB or 0)) * alpha
+
+    if eyeState.eyeBoneL ~= nil or eyeState.eyeBoneR ~= nil then
+        local eyeVec = eyeState.eyeVec or Vector(0, 0, 0)
+        eyeState.eyeVec = eyeVec
+        eyeVec.x = math.Clamp(eyeState.curU or 0, -1, 1) * (posUD and posUD:GetFloat() or EYE_TRACK_BONE_POS_UD)
+        eyeVec.y = math.Clamp(eyeState.curB or 0, 0, 1) * (moveback and moveback:GetFloat() or EYE_TRACK_BONE_MOVE_BACK)
+        eyeVec.z = -math.Clamp(eyeState.curL or 0, -1, 1) * (posLR and posLR:GetFloat() or EYE_TRACK_BONE_POS_LR)
+
+        if eyeState.eyeBoneL ~= nil then ent:ManipulateBonePosition(eyeState.eyeBoneL, eyeVec) end
+        if eyeState.eyeBoneR ~= nil then ent:ManipulateBonePosition(eyeState.eyeBoneR, eyeVec) end
+        setup_bones_now(ent)
+    end
+end
+
+local function default_self_camera_distance()
+    local convarDistance = GetConVar("mmd_vmd_npc_thirdperson_distance")
+    return convarDistance and convarDistance:GetFloat() or MMDVMDNPC.DefaultThirdPersonDistance or 120
+end
+
+local function entity_camera_center(ent)
+    if not IsValid(ent) then return vector_origin or Vector(0, 0, 0) end
+
+    local center = ent:GetPos()
+    if ent.LocalToWorld and ent.OBBCenter then
+        center = ent:LocalToWorld(ent:OBBCenter())
+    end
+    return center
+end
+
+local function clamp_self_camera_offset(offset)
+    offset = offset or Vector(0, 0, 0)
+    local maxRadius = 1000
+    if offset:LengthSqr() > maxRadius * maxRadius then
+        offset:Normalize()
+        offset = offset * maxRadius
+    end
+    return offset
+end
+
+local function activate_self_proxy_camera(ent)
+    if not IsValid(ent) then return end
+
+    local eye = LocalPlayer():EyeAngles()
+    MMDVMDNPC.SelfThirdPersonActive = true
+    MMDVMDNPC.SelfPlaybackCameraEnt = ent
+    MMDVMDNPC.SelfCameraDistance = MMDVMDNPC.SelfCameraDistance or default_self_camera_distance()
+    MMDVMDNPC.SelfCameraYaw = MMDVMDNPC.SelfCameraYaw or eye.y
+    MMDVMDNPC.SelfCameraPitch = MMDVMDNPC.SelfCameraPitch or 10
+    MMDVMDNPC.SelfCameraBaseCenter = MMDVMDNPC.SelfCameraBaseCenter or entity_camera_center(ent)
+    MMDVMDNPC.SelfCameraCenterOffset = MMDVMDNPC.SelfCameraCenterOffset or Vector(0, 0, 0)
+end
+
+local function is_local_self_playback_proxy(ent)
+    if not IsValid(ent) or not ent.GetNWBool then return false end
+    if ent:GetNWBool("MMDVMDNPCSelfProxy", false) ~= true then return false end
+    if ent.GetNWEntity then
+        local owner = ent:GetNWEntity("MMDVMDNPCSelfProxyOwner")
+        if IsValid(owner) and owner ~= LocalPlayer() then return false end
+    end
+    return true
+end
+
+local function start_local_playback(path, playbackEnt)
+    local built = MMDVMDNPC.ClientBuiltCache[path or ""]
+    local targetStatus = MMDVMDNPC.TargetStatus or {}
+    local ent = IsValid(playbackEnt) and playbackEnt or targetStatus.ent
+    if not built or not IsValid(ent) then return end
+    if is_local_self_playback_proxy(ent) then
+        activate_self_proxy_camera(ent)
+    end
+
+    MMDVMDNPC.LocalPlaybacks = MMDVMDNPC.LocalPlaybacks or {}
+    MMDVMDNPC.LocalPlaybacks[ent] = {
+        path = path,
+        built = built,
+        ent = ent,
+        started = CurTime(),
+        nextTick = 0,
+    }
+end
+
+local function pause_local_playback(ent)
+    local playbacks = MMDVMDNPC.LocalPlaybacks or {}
+    if IsValid(ent) then
+        local state = playbacks[ent]
+        if not state or state.paused then return end
+        state.paused = true
+        state.pauseStarted = CurTime()
+        return
+    end
+    for _, state in pairs(playbacks) do
+        if state and not state.paused then
+            state.paused = true
+            state.pauseStarted = CurTime()
+        end
+    end
+end
+
+local function resume_one_local_playback(state)
+    if not state or not state.paused then return end
+    local now = CurTime()
+    local pausedFor = math.max(0, now - (tonumber(state.pauseStarted) or now))
+    state.paused = false
+    state.pauseStarted = nil
+    state.started = (tonumber(state.started) or now) + pausedFor
+    state.nextTick = 0
+end
+
+local function resume_local_playback(ent)
+    local playbacks = MMDVMDNPC.LocalPlaybacks or {}
+    if IsValid(ent) then
+        resume_one_local_playback(playbacks[ent])
+        return
+    end
+    for _, state in pairs(playbacks) do
+        resume_one_local_playback(state)
+    end
+end
+
+local function deactivate_self_proxy_camera()
+    MMDVMDNPC.SelfThirdPersonActive = false
+    MMDVMDNPC.SelfPlaybackCameraEnt = nil
+    MMDVMDNPC.SelfCameraYaw = nil
+    MMDVMDNPC.SelfCameraPitch = nil
+    MMDVMDNPC.SelfCameraBaseCenter = nil
+    MMDVMDNPC.SelfCameraCenterOffset = Vector(0, 0, 0)
+end
+
+local function stop_one_local_playback(ent, clearPose)
+    local playbacks = MMDVMDNPC.LocalPlaybacks or {}
+    local state = playbacks[ent]
+    playbacks[ent] = nil
+    if not state then return end
+    reset_local_eye_tracking(state.ent, state.eyeTrack)
+    if MMDVMDNPC.SelfPlaybackCameraEnt == state.ent then
+        deactivate_self_proxy_camera()
+    end
+    if clearPose ~= false then
+        clear_local_playback_pose(state.ent, state.built)
+    end
+end
+
+local function stop_local_playback(clearPose, ent)
+    if IsValid(ent) then
+        stop_one_local_playback(ent, clearPose)
+        return
+    end
+    for playbackEnt in pairs(MMDVMDNPC.LocalPlaybacks or {}) do
+        stop_one_local_playback(playbackEnt, clearPose)
+    end
+end
+
+force_self_view_cleanup = function()
+    local cameraEnt = MMDVMDNPC.SelfPlaybackCameraEnt
+    if IsValid(cameraEnt) then
+        stop_one_local_playback(cameraEnt, true)
+        if MMDVMDNPC.ActivePlaybackEnts then
+            MMDVMDNPC.ActivePlaybackEnts[cameraEnt] = nil
+        end
+    end
+
+    deactivate_self_proxy_camera()
+    MMDVMDNPC.EyeTrackCameraBridgeActive = false
+    MMDVMDNPC.EyeTrackCameraOrigin = nil
+
+    local playStatus = MMDVMDNPC.PlayStatus or {}
+    if not IsValid(playStatus.ent) or playStatus.ent == cameraEnt then
+        MMDVMDNPC.PlayStatus = {
+            status = "self_reset",
+            message = L("mmd_vmd_npc.status.self_playback_force_reset", "self playback reset; normal view restored"),
+            ent = NULL,
+        }
+        hook.Run("MMDVMDNPCPlayStatusUpdated", MMDVMDNPC.PlayStatus)
+    end
+end
+
+hook.Add("Think", "MMDVMDNPCLocalInterpolatedPlayback", function()
+    local playbacks = MMDVMDNPC.LocalPlaybacks or {}
+    if next(playbacks) == nil then return end
+
+    local now = CurTime()
+    for ent, state in pairs(playbacks) do
+        local built = state.built or {}
+        local frames = built.frames or {}
+        if not IsValid(ent) or #frames <= 0 then
+            stop_one_local_playback(ent, false)
+        elseif state.paused then
+            apply_local_eye_tracking(ent, state, now)
+        elseif now >= (state.nextTick or 0) then
+            state.nextTick = now + (1 / local_playback_hz())
+
+            local startFrame = math.floor(tonumber(built.frame_start) or 0)
+            local endFrame = math.floor(tonumber(built.frame_end) or startFrame)
+            local fps = math.max(1, tonumber(built.fps) or MMDVMDNPC.VMDFPS or 30)
+            local sourceFrame = startFrame + (now - (state.started or now)) * fps
+            local finished = sourceFrame >= endFrame
+            sourceFrame = math.Clamp(sourceFrame, startFrame, endFrame)
+
+            local lowerFrame = math.floor(sourceFrame)
+            local upperFrame = math.min(endFrame, lowerFrame + 1)
+            local fraction = sourceFrame - lowerFrame
+            local lowerIndex = math.Clamp(lowerFrame - startFrame + 1, 1, #frames)
+            local upperIndex = math.Clamp(upperFrame - startFrame + 1, 1, #frames)
+
+            local pelvis = GetConVar("mmd_vmd_npc_pelvis_z_offset")
+            print(string.format("[MMDVMDNPC] Applying local playback sample for frame %.2f (lower: %d, upper: %d, fraction: %.2f)", sourceFrame, lowerFrame, upperFrame, fraction))
+            print(("  pelvisZOffset: " .. (pelvis and pelvis:GetFloat() or 0)))
+            apply_local_built_sample(ent, frames[lowerIndex], frames[upperIndex], fraction, pelvis and pelvis:GetFloat() or 0)
+            apply_local_eye_tracking(ent, state, now)
+
+            if finished then
+                stop_one_local_playback(ent, false)
+            end
+        end
+    end
+end)
+
+local function stop_audio_channel(token)
+    token = tonumber(token) or 0
+    local state = MMDVMDNPC.AudioChannels[token]
+    if not state then return end
+
+    if state.timerName then timer.Remove(state.timerName) end
+    if state.channel and state.channel.Stop then state.channel:Stop() end
+    MMDVMDNPC.AudioChannels[token] = nil
+end
+
+local function stop_all_audio_channels()
+    for token in pairs(MMDVMDNPC.AudioChannels or {}) do
+        stop_audio_channel(token)
+    end
+end
+
+local function stop_audio_preview()
+    local preview = MMDVMDNPC.AudioPreview
+    MMDVMDNPC.AudioPreview = nil
+    if preview and preview.channel and preview.channel.Stop then
+        preview.channel:Stop()
+    end
+end
+
+local function audio_file_candidates(soundPath)
+    soundPath = tostring(soundPath or "")
+    soundPath = string.Replace(soundPath, "\\", "/")
+    soundPath = string.gsub(soundPath, "^/+", "")
+    if soundPath == "" then return {} end
+
+    local out = {}
+    local seen = {}
+    local function add(path)
+        path = tostring(path or "")
+        if path ~= "" and not seen[path] then
+            seen[path] = true
+            out[#out + 1] = path
+        end
+    end
+
+    if string.StartWith(soundPath, "sound/") then
+        add(soundPath)
+        add(string.sub(soundPath, 7))
+    else
+        add("sound/" .. soundPath)
+        add(soundPath)
+    end
+
+    return out
+end
+
+local function play_audio_file_candidates(soundPath, flags, callback)
+    local candidates = audio_file_candidates(soundPath)
+    local index = 1
+
+    local function try_next(lastErrID, lastErrName, lastFilename)
+        local filename = candidates[index]
+        index = index + 1
+        if not filename then
+            callback(nil, lastErrID, lastErrName, lastFilename or tostring(soundPath or ""))
+            return
+        end
+
+        sound.PlayFile(filename, flags, function(channel, errID, errName)
+            if IsValid(channel) then
+                callback(channel, nil, nil, filename)
+                return
+            end
+            try_next(errID, errName, filename)
+        end)
+    end
+
+    try_next()
+end
+
+local function play_audio_preview(soundPath, offset, volume)
+    stop_audio_preview()
+    if tostring(soundPath or "") == "" then
+        print("[MMD VMD] " .. L("mmd_vmd_npc.error.no_imported_music"))
+        return
+    end
+
+    local seek = math.max(0, -(tonumber(offset) or 0))
+    volume = math.Clamp(tonumber(volume) or MMDVMDNPC.DefaultMusicVolume or 1, 0, 2)
+    play_audio_file_candidates(soundPath, "noplay", function(channel, errID, errName)
+        if not IsValid(channel) then
+            print("[MMD VMD] " .. LF("mmd_vmd_npc.console.failed_preview_music_fmt", tostring(errName or errID or L("mmd_vmd_npc.ui.unknown", "unknown"))))
+            return
+        end
+        MMDVMDNPC.AudioPreview = { channel = channel }
+        if seek > 0 and channel.SetTime then channel:SetTime(seek) end
+        if channel.SetVolume then channel:SetVolume(volume) end
+        channel:Play()
+    end)
+end
+
+local function play_synced_audio(token, soundPath, sourceEnt, offset, startTime, volume)
+    token = tonumber(token) or 0
+    if token <= 0 or tostring(soundPath or "") == "" then return end
+
+    stop_audio_channel(token)
+    offset = tonumber(offset) or 0
+    startTime = tonumber(startTime) or CurTime()
+    volume = math.Clamp(tonumber(volume) or MMDVMDNPC.DefaultMusicVolume or 1, 0, 2)
+
+    local seek = math.max(0, -offset)
+    local wait = math.max(0, (startTime + math.max(0, offset)) - CurTime())
+    local timerName = "MMDVMDNPCAudioStart_" .. tostring(token)
+    local state = {
+        token = token,
+        soundPath = soundPath,
+        sourceEnt = sourceEnt,
+        timerName = timerName,
+    }
+    MMDVMDNPC.AudioChannels[token] = state
+
+    timer.Create(timerName, wait, 1, function()
+        if MMDVMDNPC.AudioChannels[token] ~= state then return end
+        play_audio_file_candidates(soundPath, "3d noplay", function(channel, errID, errName, filename)
+            if not IsValid(channel) then
+                print("[MMD VMD] " .. LF("mmd_vmd_npc.console.failed_play_music_fmt", filename, tostring(errName or errID or L("mmd_vmd_npc.ui.unknown", "unknown"))))
+                return
+            end
+            state.channel = channel
+            if channel.Set3DFadeDistance then channel:Set3DFadeDistance(350, 1500) end
+            if channel.SetPos and IsValid(state.sourceEnt) then channel:SetPos(state.sourceEnt:GetPos()) end
+            if seek > 0 and channel.SetTime then channel:SetTime(seek) end
+            if channel.SetVolume then channel:SetVolume(volume) end
+            if not state.paused then channel:Play() end
+        end)
+    end)
+end
+
+net.Receive("mmdvmd_audio_start", function()
+    play_synced_audio(
+        net.ReadUInt(32),
+        net.ReadString(),
+        net.ReadEntity(),
+        net.ReadFloat(),
+        net.ReadFloat(),
+        net.ReadFloat()
+    )
+end)
+
+net.Receive("mmdvmd_audio_stop", function()
+    stop_audio_channel(net.ReadUInt(32))
+end)
+
+net.Receive("mmdvmd_audio_pause", function()
+    local token = net.ReadUInt(32)
+    local paused = net.ReadBool()
+    local state = MMDVMDNPC.AudioChannels[tonumber(token) or 0]
+    if not state then return end
+
+    state.paused = paused == true
+    local channel = state.channel
+    if not IsValid(channel) then return end
+
+    if state.paused then
+        if channel.Pause then channel:Pause() end
+    else
+        if channel.Play then channel:Play() end
+    end
+end)
+
+hook.Add("Think", "MMDVMDNPCAudioFollow", function()
+    for token, state in pairs(MMDVMDNPC.AudioChannels or {}) do
+        if state.channel and state.channel.SetPos and IsValid(state.sourceEnt) then
+            state.channel:SetPos(state.sourceEnt:GetPos())
+        elseif state.channel and state.channel.GetState and state.channel:GetState() == GMOD_CHANNEL_STOPPED then
+            stop_audio_channel(token)
+        end
+    end
+end)
+
+hook.Add("CalcView", "MMDVMDNPCSelfThirdPerson", function(ply, pos, angles, fov)
+    if not MMDVMDNPC.SelfThirdPersonActive then return end
+    local cameraEnt = MMDVMDNPC.SelfPlaybackCameraEnt
+    local state = IsValid(cameraEnt) and (MMDVMDNPC.LocalPlaybacks or {})[cameraEnt] or nil
+
+    local height = GetConVar("mmd_vmd_npc_thirdperson_height")
+    local distance = tonumber(MMDVMDNPC.SelfCameraDistance) or default_self_camera_distance()
+    height = height and height:GetFloat() or MMDVMDNPC.DefaultThirdPersonHeight or 24
+
+    local target = IsValid(MMDVMDNPC.SelfPlaybackCameraEnt) and MMDVMDNPC.SelfPlaybackCameraEnt
+        or (state and IsValid(state.ent) and state.ent)
+        or ply
+    local yaw = tonumber(MMDVMDNPC.SelfCameraYaw) or angles.y
+    local pitch = tonumber(MMDVMDNPC.SelfCameraPitch) or 10
+    local orbit = Angle(pitch, yaw, 0)
+    local origin = MMDVMDNPC.SelfCameraBaseCenter or entity_camera_center(target)
+    origin = origin + clamp_self_camera_offset(MMDVMDNPC.SelfCameraCenterOffset)
+    origin = origin + Vector(0, 0, height)
+    local desired = origin - orbit:Forward() * distance
+    local tr = util.TraceHull({
+        start = origin,
+        endpos = desired,
+        mins = Vector(-4, -4, -4),
+        maxs = Vector(4, 4, 4),
+        filter = { ply, target },
+    })
+    MMDVMDNPC.EyeTrackCameraOrigin = tr.HitPos
+
+    return {
+        origin = tr.HitPos,
+        angles = (origin - tr.HitPos):Angle(),
+        fov = fov,
+        drawviewer = false,
+    }
+end)
+
+hook.Add("InputMouseApply", "MMDVMDNPCSelfProxyCameraOrbit", function(cmd, x, y, ang)
+    if not MMDVMDNPC.SelfThirdPersonActive then return end
+
+    local scale = 0.03
+    local sensitivity = GetConVar("sensitivity")
+    if sensitivity then scale = scale * math.Clamp(sensitivity:GetFloat(), 0.1, 12) end
+
+    MMDVMDNPC.SelfCameraYaw = (tonumber(MMDVMDNPC.SelfCameraYaw) or (ang and ang.y or 0)) - (tonumber(x) or 0) * scale
+    MMDVMDNPC.SelfCameraPitch = math.Clamp((tonumber(MMDVMDNPC.SelfCameraPitch) or 10) + (tonumber(y) or 0) * scale, -65, 80)
+    return true
+end)
+
+hook.Add("CreateMove", "MMDVMDNPCSelfProxyCameraPan", function(cmd)
+    if not MMDVMDNPC.SelfThirdPersonActive or not cmd then return end
+
+    local move = Vector(0, 0, 0)
+    if cmd:KeyDown(IN_FORWARD) then move.x = move.x + 1 end
+    if cmd:KeyDown(IN_BACK) then move.x = move.x - 1 end
+    if cmd:KeyDown(IN_MOVERIGHT) then move.y = move.y + 1 end
+    if cmd:KeyDown(IN_MOVELEFT) then move.y = move.y - 1 end
+    if move:LengthSqr() <= 0 then return end
+
+    local yaw = tonumber(MMDVMDNPC.SelfCameraYaw) or 0
+    local flat = Angle(0, yaw, 0)
+    local delta = flat:Forward() * move.x + flat:Right() * move.y
+    if delta:LengthSqr() <= 0 then return true end
+
+    delta:Normalize()
+    local frameTime = RealFrameTime and RealFrameTime() or FrameTime()
+    local speed = 100
+    MMDVMDNPC.SelfCameraCenterOffset = clamp_self_camera_offset((MMDVMDNPC.SelfCameraCenterOffset or Vector(0, 0, 0)) + delta * speed * frameTime)
+
+    return true
+end)
+
+hook.Add("PlayerBindPress", "MMDVMDNPCSelfProxyCameraWheel", function(ply, bind, pressed)
+    if ply ~= LocalPlayer() or not pressed or not MMDVMDNPC.SelfThirdPersonActive then return end
+
+    bind = string.lower(tostring(bind or ""))
+    local distance = tonumber(MMDVMDNPC.SelfCameraDistance) or default_self_camera_distance()
+
+    if string.find(bind, "invprev", 1, true) then
+        MMDVMDNPC.SelfCameraDistance = math.Clamp(distance - 12, 30, 420)
+        return true
+    elseif string.find(bind, "invnext", 1, true) then
+        MMDVMDNPC.SelfCameraDistance = math.Clamp(distance + 12, 30, 420)
+        return true
+    end
+end)
+
+hook.Add("PreDrawViewModel", "MMDVMDNPCHideSelfProxyViewModel", function()
+    if MMDVMDNPC.SelfThirdPersonActive then return true end
+end)
+
+local function selected_eye_track_mode()
+    return eye_tracking_enabled() and "camera" or "off"
+end
+
+local function has_eye_trackable_local_playback()
+    for ent, state in pairs(MMDVMDNPC.LocalPlaybacks or {}) do
+        if IsValid(ent) and state then return true end
+    end
+    return false
+end
+
+local function should_send_eye_track_camera_target()
+    if selected_eye_track_mode() == "off" then return false end
+    if has_eye_trackable_local_playback() then return true end
+
+    local status = MMDVMDNPC.PlayStatus and MMDVMDNPC.PlayStatus.status or ""
+    return status == "countdown"
+        or status == "playing"
+        or status == "paused"
+        or status == "group_resumed"
+end
+
+local function send_eye_track_camera(active, pos)
+    net.Start("mmdvmd_eye_track_camera")
+        net.WriteBool(active == true)
+        if active == true then
+            local smooth = GetConVar("mmd_vmd_npc_eye_track_smooth")
+            local moveback = GetConVar("mmd_vmd_npc_eye_track_moveback")
+            local posUD = GetConVar("mmd_vmd_npc_eye_track_pos_ud")
+            local posLR = GetConVar("mmd_vmd_npc_eye_track_pos_lr")
+            net.WriteVector(pos or EyePos())
+            net.WriteFloat(smooth and smooth:GetFloat() or MMDVMDNPC.DefaultEyeTrackSmooth or 20)
+            net.WriteFloat(moveback and moveback:GetFloat() or MMDVMDNPC.DefaultEyeTrackBoneMoveBack or 0.10)
+            net.WriteFloat(posUD and posUD:GetFloat() or MMDVMDNPC.DefaultEyeTrackBonePosUD or 0.5)
+            net.WriteFloat(posLR and posLR:GetFloat() or MMDVMDNPC.DefaultEyeTrackBonePosLR or 0.5)
+        end
+    net.SendToServer()
+end
+
+hook.Add("Think", "MMDVMDNPCEyeTrackCameraBridge", function()
+    local shouldSend = should_send_eye_track_camera_target()
+
+    if not shouldSend then
+        if MMDVMDNPC.EyeTrackCameraBridgeActive then
+            MMDVMDNPC.EyeTrackCameraBridgeActive = false
+            send_eye_track_camera(false)
+        end
+        return
+    end
+
+    local now = CurTime()
+    if now < (MMDVMDNPC.EyeTrackCameraNextSend or 0) then return end
+    MMDVMDNPC.EyeTrackCameraNextSend = now + 0.05
+    MMDVMDNPC.EyeTrackCameraBridgeActive = true
+    local viewOrigin = MMDVMDNPC.SelfThirdPersonActive and MMDVMDNPC.EyeTrackCameraOrigin or EyePos()
+    send_eye_track_camera(true, viewOrigin or EyePos())
+end)
+
+local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServer, targetOverride)
+    local target = targetOverride or (targetEntIndex and targetEntIndex > 0 and Entity(targetEntIndex) or nil)
+    if not IsValid(target) or not target.GetBoneCount then
+        for _, row in ipairs(rows) do
+            row.p = 0
+            row.localYaw = 0
+            row.r = 0
+            row.resolved = false
+        end
+        return {}, {}
+    end
+
+    local _, referenceInfo = force_reference_pose(target)
+    referenceInfo = referenceInfo or lookup_reference_sequence_info(target)
+    clear_all_bone_manipulations(target)
+
+    local pelvisBone = target.LookupBone and target:LookupBone(SOURCE_PELVIS) or nil
+    local spineBone = target.LookupBone and target:LookupBone(SOURCE_SPINE) or nil
+    local referenceSpineVector = nil
+    if pelvisBone and spineBone then
+        referenceSpineVector = bone_world_position(target, spineBone) - bone_world_position(target, pelvisBone)
+    end
+
+    for index, row in ipairs(rows) do
+        local bone = target.LookupBone and target:LookupBone(row.source or "") or nil
+        row.index = index
+        row.bone = bone
+        row.depth = bone and bone_depth(target, bone) or 999999
+        row.resolved = bone ~= nil
+        row.p = 0
+        row.localYaw = 0
+        row.r = 0
+    end
+
+    table.sort(rows, function(a, b)
+        if a.resolved ~= b.resolved then return a.resolved end
+        if a.depth ~= b.depth then return a.depth < b.depth end
+        if (a.bone or 999999) ~= (b.bone or 999999) then return (a.bone or 999999) < (b.bone or 999999) end
+        return (a.index or 0) < (b.index or 0)
+    end)
+
+    -- This must run clientside: the conversion needs bone matrices after each
+    -- already-applied parent manipulation, matching mmd_axis_bone_rotator.
+    local packed = {}
+    local packedByBone = {}
+    local appliedAngles = {}
+    local appliedPositions = {}
+    local function remember_packet(bone, ang, pos)
+        local packet = packedByBone[bone]
+        if not packet then
+            packet = { bone = bone, ang = ZERO_ANGLE, pos = ZERO_VECTOR }
+            packedByBone[bone] = packet
+            packed[#packed + 1] = packet
+        end
+        packet.ang = clean_angle(ang or ZERO_ANGLE)
+        packet.pos = copy_vector(pos or ZERO_VECTOR)
+    end
+
+    for _, row in ipairs(rows) do
+        if row.resolved then
+            row.disabled = transforms_disabled_for_source(row.source)
+            if row.disabled then
+                row.p = 0
+                row.localYaw = 0
+                row.r = 0
+            else
+                local degrees = raw_axis_to_model_axis_degrees(row.x, row.y, row.z, referenceInfo)
+                local position = transform_reference_vector_to_sequence_basis(Vector(row.px or 0, row.py or 0, row.pz or 0), referenceInfo)
+                if spine_pelvis_correction_enabled() and row_uses_runtime_spine_position(row) then
+                    position = Vector(0, 0, 0)
+                    row.runtimePosition = true
+                end
+                local baseline = bone_baseline_angle(target, row.bone)
+                local manip = compute_manip_angle_from_model_axes(target, row.bone, degrees, baseline)
+
+                row.p = manip.p or 0
+                row.localYaw = manip.y or 0
+                row.r = manip.r or 0
+                appliedAngles[row.bone] = manip
+                appliedPositions[row.bone] = position
+                remember_packet(row.bone, manip, position)
+
+                if not is_zero_vector(position) and target.ManipulateBonePosition then
+                    target:ManipulateBonePosition(row.bone, position)
+                end
+                if not is_zero_degrees(degrees) and target.ManipulateBoneAngles then
+                    target:ManipulateBoneAngles(row.bone, manip, false)
+                end
+                if not is_zero_degrees(degrees) or not is_zero_vector(position) then
+                    setup_bones_now(target)
+                end
+            end
+        end
+    end
+
+    if spine_pelvis_correction_enabled() and pelvisBone and spineBone and referenceSpineVector and target.ManipulateBonePosition then
+        setup_bones_now(target)
+
+        local frameSpineVector = bone_world_position(target, spineBone) - bone_world_position(target, pelvisBone)
+        local correctionWorld = (frameSpineVector - referenceSpineVector) * -0.5
+        if not is_zero_vector(correctionWorld) then
+            local correctionLocal = world_vector_to_entity_local(target, correctionWorld)
+            local pelvisPosition = copy_vector(appliedPositions[pelvisBone]) + correctionLocal
+            local pelvisAngle = appliedAngles[pelvisBone] or ZERO_ANGLE
+
+            target:ManipulateBonePosition(pelvisBone, pelvisPosition)
+            if target.ManipulateBoneAngles then
+                target:ManipulateBoneAngles(pelvisBone, pelvisAngle, false)
+            end
+            setup_bones_now(target)
+
+            remember_packet(pelvisBone, pelvisAngle, pelvisPosition)
+        end
+    end
+
+    local flexPacked = {}
+    for _, row in ipairs(flexRows or {}) do
+        if row.resolved and row.flexID and row.flexID >= 0 then
+            flexPacked[#flexPacked + 1] = {
+                flexID = row.flexID,
+                weight = math.Clamp(tonumber(row.weight) or 0, 0, 1),
+            }
+        end
+    end
+
+    if sendToServer ~= false then
+        send_debug_pose(target, packed, flexPacked)
+    end
+    return packed, flexPacked
+end
+
+local function debug_flex_choice_label(row, index)
+    local mmd = tostring(row and row.mmd or "")
+    local source = tostring(row and row.source or "")
+    local label = mmd ~= "" and mmd or source
+    if mmd ~= "" and source ~= "" and mmd ~= source then
+        label = mmd .. " -> " .. source
+    end
+    return string.format("%03d  %s", tonumber(index) or 0, label ~= "" and label or "?")
+end
+
+local function selected_debug_flex_row(frame)
+    if not IsValid(frame) or not IsValid(frame.UnresolvedMorphCombo) then return nil end
+    local key = frame.UnresolvedMorphCombo:GetValue()
+    return frame.UnresolvedFlexChoices and frame.UnresolvedFlexChoices[key] or nil
+end
+
+local function selected_debug_model_flex(frame)
+    if not IsValid(frame) or not IsValid(frame.ModelFlexCombo) then return nil end
+    local key = frame.ModelFlexCombo:GetValue()
+    return frame.ModelFlexChoices and frame.ModelFlexChoices[key] or nil
+end
+
+local function refresh_flex_override_controls(frame, flexRows, targetEntIndex)
+    if not IsValid(frame) or not IsValid(frame.UnresolvedMorphCombo) or not IsValid(frame.ModelFlexCombo) then return end
+
+    frame.TargetEntIndex = targetEntIndex or 0
+    frame.UnresolvedFlexChoices = {}
+    frame.ModelFlexChoices = {}
+    frame.UnresolvedMorphCombo:Clear()
+    frame.ModelFlexCombo:Clear()
+
+    local firstUnresolved
+    for index, row in ipairs(flexRows or {}) do
+        if row and row.resolved ~= true then
+            local label = debug_flex_choice_label(row, index)
+            frame.UnresolvedMorphCombo:AddChoice(label)
+            frame.UnresolvedFlexChoices[label] = {
+                mmd = tostring(row.mmd or ""),
+                source = tostring(row.source or ""),
+            }
+            firstUnresolved = firstUnresolved or label
+        end
+    end
+
+    if firstUnresolved then
+        frame.UnresolvedMorphCombo:SetValue(firstUnresolved)
+        frame.UnresolvedMorphCombo:SetEnabled(true)
+    else
+        frame.UnresolvedMorphCombo:SetValue(L("mmd_vmd_npc.debug.no_unresolved_flex"))
+        frame.UnresolvedMorphCombo:SetEnabled(false)
+    end
+
+    local ent = targetEntIndex and targetEntIndex > 0 and Entity(targetEntIndex) or nil
+    local firstFlex
+    if IsValid(ent) and ent.GetFlexNum and ent.GetFlexName then
+        for flexID = 0, (ent:GetFlexNum() or 0) - 1 do
+            local flexName = tostring(ent:GetFlexName(flexID) or "")
+            if flexName ~= "" then
+                local label = string.format("%s #%d", flexName, flexID)
+                frame.ModelFlexCombo:AddChoice(label)
+                frame.ModelFlexChoices[label] = flexName
+                firstFlex = firstFlex or label
+            end
+        end
+    end
+
+    if firstFlex then
+        frame.ModelFlexCombo:SetValue(firstFlex)
+        frame.ModelFlexCombo:SetEnabled(true)
+    else
+        frame.ModelFlexCombo:SetValue(L("mmd_vmd_npc.debug.no_model_flex"))
+        frame.ModelFlexCombo:SetEnabled(false)
+    end
+
+    local canAssign = firstUnresolved ~= nil and firstFlex ~= nil and targetEntIndex and targetEntIndex > 0
+    if IsValid(frame.AssignFlexOverride) then frame.AssignFlexOverride:SetEnabled(canAssign) end
+    if IsValid(frame.ClearFlexOverride) then frame.ClearFlexOverride:SetEnabled(firstUnresolved ~= nil and targetEntIndex and targetEntIndex > 0) end
+end
+
+local function request_flex_override(frame, clear)
+    if not IsValid(frame) then return end
+
+    local row = selected_debug_flex_row(frame)
+    if not row then return end
+
+    local ent = frame.TargetEntIndex and Entity(frame.TargetEntIndex) or nil
+    if not IsValid(ent) then return end
+
+    local flexName = clear and "" or selected_debug_model_flex(frame)
+    if not clear and (not flexName or flexName == "") then return end
+
+    net.Start(clear and "mmdvmd_flex_override_clear" or "mmdvmd_flex_override_save")
+        net.WriteEntity(ent)
+        net.WriteString(tostring(frame.MotionID or ""))
+        net.WriteString(tostring(row.mmd or ""))
+        net.WriteString(tostring(row.source or ""))
+        if not clear then
+            net.WriteString(tostring(flexName or ""))
+        end
+    net.SendToServer()
+
+    timer.Simple(0.2, function()
+        if IsValid(frame) then
+            MMDVMDNPC.OpenDebugMenu(frame.MotionID, frame.ActiveFrame or frame.RequestedFrame or 0)
+        end
+    end)
+end
+
+function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
+    motionID = tostring(motionID or "")
+    if motionID == "" then return end
+
+    vmdFrame = math.max(DEBUG_REFERENCE_FRAME, math.floor(tonumber(vmdFrame) or DEBUG_REFERENCE_FRAME))
+
+    local frame = MMDVMDNPC.DebugFrame
+    if not IsValid(frame) then
+        frame = vgui.Create("DFrame")
+        MMDVMDNPC.DebugFrame = frame
+        local screenW = ScrW and ScrW() or 1280
+        local screenH = ScrH and ScrH() or 720
+        frame:SetSize(math.min(screenW - 40, 1360), math.min(screenH - 40, 800))
+        frame:Center()
+        frame:MakePopup()
+
+        frame.Summary = vgui.Create("DLabel", frame)
+        frame.Summary:Dock(TOP)
+        frame.Summary:DockMargin(8, 6, 8, 4)
+        frame.Summary:SetTall(38)
+        frame.Summary:SetWrap(true)
+
+        frame.Rows = vgui.Create("DListView", frame)
+        frame.Rows:Dock(FILL)
+        frame.Rows:AddColumn(L("mmd_vmd_npc.debug.column_mmd_bone"))
+        frame.Rows:AddColumn(L("mmd_vmd_npc.debug.column_source_bone"))
+        frame.Rows:AddColumn(L("mmd_vmd_npc.debug.column_role"))
+        frame.Rows:AddColumn(L("mmd_vmd_npc.debug.column_raw_x"))
+        frame.Rows:AddColumn(L("mmd_vmd_npc.debug.column_raw_y"))
+        frame.Rows:AddColumn(L("mmd_vmd_npc.debug.column_raw_z"))
+        frame.Rows:AddColumn(L("mmd_vmd_npc.debug.column_bone_position"))
+        frame.Rows:AddColumn(L("mmd_vmd_npc.debug.column_manip_angles"))
+
+        frame.FlexRows = vgui.Create("DListView", frame)
+        frame.FlexRows:Dock(BOTTOM)
+        frame.FlexRows:SetTall(150)
+        frame.FlexRows:AddColumn(L("mmd_vmd_npc.debug.column_mmd_morph"))
+        frame.FlexRows:AddColumn(L("mmd_vmd_npc.debug.column_source_flex"))
+        frame.FlexRows:AddColumn(L("mmd_vmd_npc.debug.column_weight"))
+        frame.FlexRows:AddColumn(L("mmd_vmd_npc.debug.column_target"))
+        frame.FlexRows.OnRowSelected = function(_, _, line)
+            if not IsValid(frame.UnresolvedMorphCombo) or not line then return end
+            local mmd = line:GetColumnText(1)
+            local source = line:GetColumnText(2)
+            for label, row in pairs(frame.UnresolvedFlexChoices or {}) do
+                if row.mmd == mmd and row.source == source then
+                    frame.UnresolvedMorphCombo:SetValue(label)
+                    return
+                end
+            end
+        end
+
+        local flexOverride = vgui.Create("DPanel", frame)
+        flexOverride:Dock(BOTTOM)
+        flexOverride:SetTall(58)
+
+        frame.FlexOverrideTitle = vgui.Create("DLabel", flexOverride)
+        frame.FlexOverrideTitle:Dock(TOP)
+        frame.FlexOverrideTitle:SetTall(20)
+        frame.FlexOverrideTitle:SetText(L("mmd_vmd_npc.debug.flex_mapping"))
+
+        local flexOverrideRow = vgui.Create("DPanel", flexOverride)
+        flexOverrideRow:Dock(FILL)
+
+        frame.UnresolvedMorphCombo = vgui.Create("DComboBox", flexOverrideRow)
+        frame.UnresolvedMorphCombo:Dock(LEFT)
+        frame.UnresolvedMorphCombo:SetWide(360)
+        frame.UnresolvedMorphCombo:SetTooltip(L("mmd_vmd_npc.debug.unresolved_morph"))
+
+        frame.ModelFlexCombo = vgui.Create("DComboBox", flexOverrideRow)
+        frame.ModelFlexCombo:Dock(LEFT)
+        frame.ModelFlexCombo:DockMargin(6, 0, 0, 0)
+        frame.ModelFlexCombo:SetWide(360)
+        frame.ModelFlexCombo:SetTooltip(L("mmd_vmd_npc.debug.model_flex"))
+
+        frame.AssignFlexOverride = vgui.Create("DButton", flexOverrideRow)
+        frame.AssignFlexOverride:Dock(LEFT)
+        frame.AssignFlexOverride:DockMargin(6, 0, 0, 0)
+        frame.AssignFlexOverride:SetWide(130)
+        frame.AssignFlexOverride:SetText(L("mmd_vmd_npc.debug.assign_flex"))
+        frame.AssignFlexOverride.DoClick = function()
+            request_flex_override(frame, false)
+        end
+
+        frame.ClearFlexOverride = vgui.Create("DButton", flexOverrideRow)
+        frame.ClearFlexOverride:Dock(LEFT)
+        frame.ClearFlexOverride:DockMargin(6, 0, 0, 0)
+        frame.ClearFlexOverride:SetWide(130)
+        frame.ClearFlexOverride:SetText(L("mmd_vmd_npc.debug.clear_flex_mapping"))
+        frame.ClearFlexOverride.DoClick = function()
+            request_flex_override(frame, true)
+        end
+
+        local options = vgui.Create("DPanel", frame)
+        options:Dock(BOTTOM)
+        options:SetTall(28)
+
+        frame.DisableArmTwist = vgui.Create("DCheckBoxLabel", options)
+        frame.DisableArmTwist:Dock(LEFT)
+        frame.DisableArmTwist:SetWide(260)
+        frame.DisableArmTwist:SetText(L("mmd_vmd_npc.ui.disable_armtwist"))
+        frame.DisableArmTwist:SetConVar("mmd_vmd_npc_disable_armtwist")
+        frame.DisableArmTwist:SetValue(convar_bool("mmd_vmd_npc_disable_armtwist", false) and 1 or 0)
+        frame.DisableArmTwist:SizeToContents()
+        frame.DisableArmTwist.OnChange = function()
+            MMDVMDNPC.OpenDebugMenu(frame.MotionID, frame.ActiveFrame or frame.RequestedFrame or 0)
+        end
+
+        frame.DisableEyes = vgui.Create("DCheckBoxLabel", options)
+        frame.DisableEyes:Dock(LEFT)
+        frame.DisableEyes:SetWide(220)
+        frame.DisableEyes:SetText(L("mmd_vmd_npc.ui.disable_eyes"))
+        frame.DisableEyes:SetConVar("mmd_vmd_npc_disable_eyes")
+        frame.DisableEyes:SetValue(convar_bool("mmd_vmd_npc_disable_eyes", false) and 1 or 0)
+        frame.DisableEyes:SizeToContents()
+        frame.DisableEyes.OnChange = function()
+            MMDVMDNPC.OpenDebugMenu(frame.MotionID, frame.ActiveFrame or frame.RequestedFrame or 0)
+        end
+
+        frame.DisableSpinePelvis = vgui.Create("DCheckBoxLabel", options)
+        frame.DisableSpinePelvis:Dock(LEFT)
+        frame.DisableSpinePelvis:SetWide(310)
+        frame.DisableSpinePelvis:SetText(L("mmd_vmd_npc.ui.disable_spine_pelvis"))
+        frame.DisableSpinePelvis:SetConVar("mmd_vmd_npc_disable_spine_pelvis_correction")
+        frame.DisableSpinePelvis:SetValue(convar_bool("mmd_vmd_npc_disable_spine_pelvis_correction", false) and 1 or 0)
+        frame.DisableSpinePelvis:SizeToContents()
+        frame.DisableSpinePelvis.OnChange = function()
+            MMDVMDNPC.OpenDebugMenu(frame.MotionID, frame.ActiveFrame or frame.RequestedFrame or 0)
+        end
+
+        local controls = vgui.Create("DPanel", frame)
+        controls:Dock(BOTTOM)
+        controls:SetTall(36)
+
+        frame.Prev = vgui.Create("DButton", controls)
+        frame.Prev:Dock(LEFT)
+        frame.Prev:SetWide(100)
+        frame.Prev:SetText(L("mmd_vmd_npc.debug.previous"))
+        frame.Prev.DoClick = function()
+            MMDVMDNPC.OpenDebugMenu(frame.MotionID, frame.PrevFrame or frame.ActiveFrame or 0)
+        end
+
+        frame.JumpButton = vgui.Create("DButton", controls)
+        frame.JumpButton:Dock(LEFT)
+        frame.JumpButton:SetWide(90)
+        frame.JumpButton:SetText(L("mmd_vmd_npc.debug.jump"))
+        frame.JumpButton.DoClick = function()
+            local target = IsValid(frame.FrameEntry) and tonumber(frame.FrameEntry:GetValue()) or nil
+            if target then
+                MMDVMDNPC.OpenDebugMenu(frame.MotionID, math.max(DEBUG_REFERENCE_FRAME, math.floor(target)))
+            end
+        end
+
+        frame.FrameEntry = vgui.Create("DTextEntry", controls)
+        frame.FrameEntry:Dock(LEFT)
+        frame.FrameEntry:SetWide(110)
+        frame.FrameEntry:SetNumeric(false)
+        frame.FrameEntry:SetPlaceholderText(L("mmd_vmd_npc.debug.vmd_frame"))
+        frame.FrameEntry.OnEnter = function(entry)
+            local target = tonumber(entry:GetValue())
+            if target then
+                MMDVMDNPC.OpenDebugMenu(frame.MotionID, math.max(DEBUG_REFERENCE_FRAME, math.floor(target)))
+            end
+        end
+
+        frame.Next = vgui.Create("DButton", controls)
+        frame.Next:Dock(RIGHT)
+        frame.Next:SetWide(100)
+        frame.Next:SetText(L("mmd_vmd_npc.debug.next"))
+        frame.Next.DoClick = function()
+            MMDVMDNPC.OpenDebugMenu(frame.MotionID, frame.NextFrame or frame.ActiveFrame or 0)
+        end
+
+        frame.Refresh = vgui.Create("DButton", controls)
+        frame.Refresh:Dock(FILL)
+        frame.Refresh:SetText(L("mmd_vmd_npc.debug.refresh"))
+        frame.Refresh.DoClick = function()
+            MMDVMDNPC.OpenDebugMenu(frame.MotionID, frame.ActiveFrame or 0)
+        end
+    end
+
+    frame.MotionID = motionID
+    frame.RequestedFrame = vmdFrame
+    frame:SetTitle(LF("mmd_vmd_npc.debug.title_fmt", motionID))
+    request_debug(motionID, vmdFrame)
+end
+
+local function read_frame_payload()
+    local startFrame = net.ReadInt(32)
+    local endFrame = net.ReadInt(32)
+    local activeFrame = net.ReadInt(32)
+    local prevFrame = net.ReadInt(32)
+    local nextFrame = net.ReadInt(32)
+    local fps = net.ReadUInt(16)
+    local duration = net.ReadFloat()
+    local targetEntIndex = net.ReadUInt(16)
+    local referenceSeq = net.ReadInt(16)
+    local referenceName = net.ReadString()
+    local referenceBasis = net.ReadString()
+    local referenceAxisText = net.ReadString()
+    local count = net.ReadUInt(16)
+    local rows = {}
+
+    for i = 1, count do
+        rows[i] = {
+            mmd = net.ReadString(),
+            source = net.ReadString(),
+            role = net.ReadString(),
+            x = net.ReadFloat(),
+            y = net.ReadFloat(),
+            z = net.ReadFloat(),
+            px = net.ReadFloat(),
+            py = net.ReadFloat(),
+            pz = net.ReadFloat(),
+            p = net.ReadFloat(),
+            localYaw = net.ReadFloat(),
+            r = net.ReadFloat(),
+            resolved = net.ReadBool(),
+        }
+    end
+    local flexCount = net.ReadUInt(16)
+    local flexRows = {}
+
+    for i = 1, flexCount do
+        flexRows[i] = {
+            mmd = net.ReadString(),
+            source = net.ReadString(),
+            resolvedName = net.ReadString(),
+            weight = net.ReadFloat(),
+            flexID = net.ReadInt(16),
+            resolved = net.ReadBool(),
+        }
+    end
+
+    local referenceInfo = {
+        seq = referenceSeq,
+        name = referenceName,
+        basis = referenceBasis,
+        axisText = referenceAxisText,
+    }
+
+    return startFrame, endFrame, activeFrame, prevFrame, nextFrame, fps, duration, targetEntIndex, referenceInfo, rows, flexRows
+end
+
+net.Receive("mmdvmd_debug_response", function()
+    local ok = net.ReadBool()
+    local motionID = net.ReadString()
+    local err = net.ReadString()
+    if not ok then
+        print("[MMD VMD] " .. LF("mmd_vmd_npc.console.debug_failed_fmt", motionID, err))
+        return
+    end
+
+    local startFrame, endFrame, activeFrame, prevFrame, nextFrame, fps, duration, targetEntIndex, referenceInfo, rows, flexRows = read_frame_payload()
+
+    local frame = MMDVMDNPC.DebugFrame
+    if not IsValid(frame) or frame.MotionID ~= motionID then
+        MMDVMDNPC.OpenDebugMenu(motionID, activeFrame)
+        return
+    end
+
+    frame.ActiveFrame = activeFrame
+    frame.PrevFrame = prevFrame
+    frame.NextFrame = nextFrame
+
+    if IsValid(frame.FrameEntry) then
+        frame.FrameEntry:SetValue(tostring(activeFrame))
+    end
+
+    rebuild_debug_preview(rows, flexRows, targetEntIndex, true)
+
+    local referenceText = ""
+    if referenceInfo and tostring(referenceInfo.name or "") ~= "" then
+        local referenceLabel = string.format(
+            "%s (#%s, %s)",
+            tostring(referenceInfo.name or ""),
+            tostring(referenceInfo.seq or "?"),
+            tostring(referenceInfo.axisText or referenceInfo.basis or "")
+        )
+        referenceText = LF("mmd_vmd_npc.debug.reference_fmt", referenceLabel)
+    end
+
+    local activeSeconds = activeFrame == DEBUG_REFERENCE_FRAME and 0 or (activeFrame / math.max(1, fps))
+    frame.Summary:SetText(LF(
+        "mmd_vmd_npc.debug.summary_fmt",
+        motionID,
+        activeFrame,
+        endFrame,
+        activeSeconds,
+        duration,
+        #rows,
+        #flexRows,
+        (targetEntIndex > 0 and LF("mmd_vmd_npc.debug.preview_entity_fmt", tostring(targetEntIndex)) or "") .. referenceText
+    ))
+
+    frame.Rows:Clear()
+    for _, row in ipairs(rows) do
+        frame.Rows:AddLine(
+            row.mmd,
+            row.source,
+            row.role,
+            fmt_num(row.x),
+            fmt_num(row.y),
+            fmt_num(row.z),
+            fmt_vec(row.px, row.py, row.pz),
+            row.disabled and "disabled"
+                or (row.resolved and fmt_angle(row.p, row.localYaw, row.r) or "unresolved")
+        )
+    end
+
+    if IsValid(frame.FlexRows) then
+        frame.FlexRows:Clear()
+        for _, row in ipairs(flexRows) do
+            frame.FlexRows:AddLine(
+                row.mmd,
+                row.source,
+                fmt_num(row.weight),
+                row.resolved and (tostring(row.resolvedName or "") .. " #" .. tostring(row.flexID)) or "unresolved"
+            )
+        end
+    end
+    refresh_flex_override_controls(frame, flexRows, targetEntIndex)
+
+    frame.Prev:SetEnabled(activeFrame > DEBUG_REFERENCE_FRAME)
+    frame.Next:SetEnabled(activeFrame < endFrame)
+end)
+
+net.Receive("mmdvmd_build_progress", function()
+    update_build_status({
+        status = net.ReadString(),
+        message = net.ReadString(),
+        buildID = net.ReadUInt(32),
+        motionID = net.ReadString(),
+        model = net.ReadString(),
+        currentFrame = net.ReadUInt(32),
+        startFrame = net.ReadUInt(32),
+        endFrame = net.ReadUInt(32),
+        queued = net.ReadUInt(16),
+    })
+end)
+
+net.Receive("mmdvmd_build_plan", function()
+    local buildID = net.ReadUInt(32)
+    local motionID = net.ReadString()
+    local target = net.ReadEntity()
+    local model = net.ReadString()
+    local fps = net.ReadUInt(16)
+    local startFrame = net.ReadUInt(32)
+    local endFrame = net.ReadUInt(32)
+    local startDelay = net.ReadFloat()
+    local boneCount = net.ReadUInt(16)
+    local boneTracks = {}
+
+    show_build_lag_warning(buildID, motionID, startFrame, endFrame)
+
+    for i = 1, boneCount do
+        boneTracks[i] = {
+            mmd = net.ReadString(),
+            source = net.ReadString(),
+            role = net.ReadString(),
+            resolved = net.ReadBool(),
+            bone = net.ReadUInt(16),
+        }
+    end
+
+    local flexCount = net.ReadUInt(16)
+    local flexTracks = {}
+    for i = 1, flexCount do
+        flexTracks[i] = {
+            mmd = net.ReadString(),
+            source = net.ReadString(),
+            resolvedName = net.ReadString(),
+            resolved = net.ReadBool(),
+            flexID = net.ReadInt(16),
+        }
+    end
+
+    MMDVMDNPC.ClientBuildJobs[buildID] = {
+        motionID = motionID,
+        model = model,
+        target = target,
+        fps = fps,
+        frame_start = startFrame,
+        frame_end = endFrame,
+        start_delay = startDelay,
+        frames = {},
+        bonesByID = {},
+        flexesByID = {},
+        boneTracks = boneTracks,
+        flexTracks = flexTracks,
+    }
+end)
+
+net.Receive("mmdvmd_build_compact_request", function()
+    local buildID = net.ReadUInt(32)
+    local motionID = net.ReadString()
+    local batchCount = net.ReadUInt(8)
+    local job = MMDVMDNPC.ClientBuildJobs[buildID]
+    if not job then return end
+
+    local visibleTarget = job.target
+    local dummy = build_dummy_for_target(visibleTarget)
+    local results = {}
+    local lastFrame = job.frame_start or 0
+
+    for _ = 1, batchCount do
+        local activeFrame = net.ReadUInt(32)
+        local rows = {}
+        for index, track in ipairs(job.boneTracks or {}) do
+            rows[index] = {
+                mmd = track.mmd,
+                source = track.source,
+                role = track.role,
+                x = net.ReadFloat(),
+                y = net.ReadFloat(),
+                z = net.ReadFloat(),
+                px = net.ReadFloat(),
+                py = net.ReadFloat(),
+                pz = net.ReadFloat(),
+                resolved = track.resolved,
+                bone = track.bone,
+            }
+        end
+
+        local flexRows = {}
+        for index, track in ipairs(job.flexTracks or {}) do
+            flexRows[index] = {
+                mmd = track.mmd,
+                source = track.source,
+                resolvedName = track.resolvedName,
+                weight = net.ReadFloat(),
+                flexID = track.flexID,
+                resolved = track.resolved,
+            }
+        end
+
+        local targetEntIndex = IsValid(visibleTarget) and visibleTarget:EntIndex() or 0
+        local packed, flexPacked = rebuild_debug_preview(rows, flexRows, targetEntIndex, false, dummy)
+        job.frames[#job.frames + 1] = packet_to_frame_data(activeFrame, packed, flexPacked)
+
+        for _, row in ipairs(rows) do
+            if row.resolved and row.bone then
+                job.bonesByID[row.bone] = {
+                    id = row.bone,
+                    name = row.source or "",
+                    source = row.source or "",
+                    mmd = row.mmd or "",
+                    role = row.role or "",
+                }
+            end
+        end
+        for _, row in ipairs(flexRows) do
+            if row.resolved and row.flexID and row.flexID >= 0 then
+                job.flexesByID[row.flexID] = {
+                    id = row.flexID,
+                    name = row.resolvedName or "",
+                    source = row.source or "",
+                    mmd = row.mmd or "",
+                    resolved = row.resolvedName or "",
+                }
+            end
+        end
+
+        results[#results + 1] = { frame = activeFrame, packed = packed, flexPacked = flexPacked }
+        lastFrame = activeFrame
+    end
+
+    update_build_status({
+        status = "building",
+        message = string.format("%s frame %d", motionID, lastFrame),
+        buildID = buildID,
+        motionID = motionID,
+        model = job.model or "",
+        currentFrame = lastFrame + 1,
+        startFrame = job.frame_start or 0,
+        endFrame = job.frame_end or lastFrame,
+        queued = MMDVMDNPC.BuildStatus and MMDVMDNPC.BuildStatus.queued or 0,
+    })
+
+    net.Start("mmdvmd_build_frame_result")
+        net.WriteUInt(buildID, 32)
+        net.WriteUInt(math.min(#results, 255), 8)
+        for _, result in ipairs(results) do
+            local packed = result.packed or {}
+            local flexPacked = result.flexPacked or {}
+            net.WriteUInt(math.max(0, result.frame), 32)
+            net.WriteUInt(math.min(#packed, 4096), 16)
+            for i = 1, math.min(#packed, 4096) do
+                net.WriteUInt(packed[i].bone, 16)
+                net.WriteAngle(packed[i].ang)
+                net.WriteFloat(packed[i].pos.x)
+                net.WriteFloat(packed[i].pos.y)
+                net.WriteFloat(packed[i].pos.z)
+            end
+            net.WriteUInt(math.min(#flexPacked, 4096), 16)
+            for i = 1, math.min(#flexPacked, 4096) do
+                net.WriteInt(flexPacked[i].flexID, 16)
+                net.WriteFloat(flexPacked[i].weight)
+            end
+        end
+    net.SendToServer()
+end)
+
+net.Receive("mmdvmd_build_frame_request", function()
+    local buildID = net.ReadUInt(32)
+    local motionID = net.ReadString()
+    local batchCount = net.ReadUInt(8)
+    local job = MMDVMDNPC.ClientBuildJobs[buildID]
+
+    local results = {}
+    local lastFrame = 0
+    for _ = 1, batchCount do
+        local startFrame, endFrame, activeFrame, _, _, fps, _, targetEntIndex, _referenceInfo, rows, flexRows = read_frame_payload()
+        local visibleTarget = targetEntIndex and targetEntIndex > 0 and Entity(targetEntIndex) or nil
+        local dummy = build_dummy_for_target(visibleTarget)
+        local packed, flexPacked = rebuild_debug_preview(rows, flexRows, targetEntIndex, false, dummy)
+
+        if not job then
+            job = {
+                motionID = motionID,
+                model = IsValid(visibleTarget) and (visibleTarget:GetModel() or "") or "",
+                fps = fps,
+                frame_start = startFrame,
+                frame_end = endFrame,
+                frames = {},
+                bonesByID = {},
+                flexesByID = {},
+            }
+            MMDVMDNPC.ClientBuildJobs[buildID] = job
+        elseif job.model == "" and IsValid(visibleTarget) then
+            job.model = visibleTarget:GetModel() or ""
+        end
+        job.frames[#job.frames + 1] = packet_to_frame_data(activeFrame, packed, flexPacked)
+        for _, row in ipairs(rows or {}) do
+            if row.resolved and row.bone then
+                job.bonesByID[row.bone] = {
+                    id = row.bone,
+                    name = row.source or "",
+                    source = row.source or "",
+                    mmd = row.mmd or "",
+                    role = row.role or "",
+                }
+            end
+        end
+        for _, row in ipairs(flexRows or {}) do
+            if row.resolved and row.flexID and row.flexID >= 0 then
+                job.flexesByID[row.flexID] = {
+                    id = row.flexID,
+                    name = row.resolvedName or "",
+                    source = row.source or "",
+                    mmd = row.mmd or "",
+                    resolved = row.resolvedName or "",
+                }
+            end
+        end
+
+        results[#results + 1] = { frame = activeFrame, packed = packed, flexPacked = flexPacked }
+        lastFrame = activeFrame
+    end
+
+    update_build_status({
+        status = "building",
+        message = string.format("%s frame %d", motionID, lastFrame),
+        buildID = buildID,
+        motionID = motionID,
+        model = job and job.model or "",
+        currentFrame = lastFrame + 1,
+        startFrame = job and job.frame_start or 0,
+        endFrame = job and job.frame_end or lastFrame,
+        queued = MMDVMDNPC.BuildStatus and MMDVMDNPC.BuildStatus.queued or 0,
+    })
+
+    net.Start("mmdvmd_build_frame_result")
+        net.WriteUInt(buildID, 32)
+        net.WriteUInt(math.min(#results, 255), 8)
+        for _, result in ipairs(results) do
+            local packed = result.packed or {}
+            local flexPacked = result.flexPacked or {}
+            net.WriteUInt(math.max(0, result.frame), 32)
+            net.WriteUInt(math.min(#packed, 4096), 16)
+            for i = 1, math.min(#packed, 4096) do
+                net.WriteUInt(packed[i].bone, 16)
+                net.WriteAngle(packed[i].ang)
+                net.WriteFloat(packed[i].pos.x)
+                net.WriteFloat(packed[i].pos.y)
+                net.WriteFloat(packed[i].pos.z)
+            end
+            net.WriteUInt(math.min(#flexPacked, 4096), 16)
+            for i = 1, math.min(#flexPacked, 4096) do
+                net.WriteInt(flexPacked[i].flexID, 16)
+                net.WriteFloat(flexPacked[i].weight)
+            end
+        end
+    net.SendToServer()
+end)
+
+net.Receive("mmdvmd_target_status", function()
+    local valid = net.ReadBool()
+    local ent = net.ReadEntity()
+    local model = net.ReadString()
+    local targetType = net.ReadString()
+    local message = net.ReadString()
+
+    MMDVMDNPC.TargetStatus = {
+        valid = valid,
+        ent = ent,
+        model = model,
+        targetType = targetType,
+        message = message,
+    }
+    hook.Run("MMDVMDNPCTargetStatusUpdated", MMDVMDNPC.TargetStatus)
+    request_motion_details()
+end)
+
+net.Receive("mmdvmd_assignment_status", function()
+    local count = net.ReadUInt(16)
+    local order = {}
+    local byEnt = {}
+
+    for _ = 1, count do
+        local ent = net.ReadEntity()
+        local index = net.ReadUInt(16)
+        local first = net.ReadBool()
+        local motionID = net.ReadString()
+        local model = net.ReadString()
+        local status = net.ReadString()
+        local row = {
+            ent = ent,
+            index = index,
+            first = first,
+            motionID = motionID,
+            model = model,
+            status = status,
+        }
+        if IsValid(ent) then
+            order[#order + 1] = ent
+            byEnt[ent] = row
+        end
+    end
+
+    table.sort(order, function(a, b)
+        local aa = byEnt[a] and byEnt[a].index or 0
+        local bb = byEnt[b] and byEnt[b].index or 0
+        return aa < bb
+    end)
+
+    MMDVMDNPC.AssignedActors = {
+        order = order,
+        byEnt = byEnt,
+    }
+    hook.Run("MMDVMDNPCAssignmentStatusUpdated", MMDVMDNPC.AssignedActors)
+    request_motion_details()
+end)
+
+net.Receive("mmdvmd_build_done", function()
+    local ok = net.ReadBool()
+    local path = net.ReadString()
+    local message = net.ReadString()
+
+    if ok then
+        for buildID, job in pairs(MMDVMDNPC.ClientBuildJobs or {}) do
+            table.sort(job.frames, function(a, b) return (a.frame or 0) < (b.frame or 0) end)
+            MMDVMDNPC.ClientBuiltCache[path] = {
+                format = MMDVMDNPC.BuiltFormat,
+                motion_id = job.motionID,
+                model = job.model or "",
+                fps = job.fps or MMDVMDNPC.VMDFPS or 30,
+                frame_start = job.frame_start or 0,
+                frame_end = job.frame_end or 0,
+                bones = sorted_client_metadata(job.bonesByID),
+                flexes = sorted_client_metadata(job.flexesByID),
+                frames = job.frames,
+            }
+            MMDVMDNPC.ClientBuildJobs[buildID] = nil
+            break
+        end
+    else
+        MMDVMDNPC.ClientBuildJobs = {}
+    end
+    destroy_build_dummy()
+
+    update_build_status({
+        ok = ok,
+        status = ok and "built" or "error",
+        path = path,
+        message = message,
+        progress = ok and 1 or 0,
+    })
+    request_motion_details()
+    play_ui_cue(ok and "success" or "blocked")
+    print("[MMD VMD] " .. (ok and LF("mmd_vmd_npc.console.build_success_fmt", path) or LF("mmd_vmd_npc.console.build_failed_fmt", message)))
+end)
+
+net.Receive("mmdvmd_play_status", function()
+    local status = net.ReadString()
+    local message = net.ReadString()
+    local playbackEnt = net.ReadEntity()
+
+    MMDVMDNPC.PlayStatus = {
+        status = status,
+        message = message,
+        ent = playbackEnt,
+    }
+    hook.Run("MMDVMDNPCPlayStatusUpdated", MMDVMDNPC.PlayStatus)
+    MMDVMDNPC.ActivePlaybackEnts = MMDVMDNPC.ActivePlaybackEnts or {}
+    if status == "playing" and IsValid(playbackEnt) then
+        MMDVMDNPC.ActivePlaybackEnts[playbackEnt] = true
+    elseif status == "stopped" or status == "finished" or status == "error" then
+        if IsValid(playbackEnt) then
+            MMDVMDNPC.ActivePlaybackEnts[playbackEnt] = nil
+        end
+    elseif status == "stopped_all" then
+        MMDVMDNPC.ActivePlaybackEnts = {}
+    end
+    play_status_cue(status, message)
+
+    if status == "playing" then
+        if message == "playback resumed" then
+            resume_local_playback(playbackEnt)
+        else
+            start_local_playback(message, playbackEnt)
+        end
+    elseif status == "paused" then
+        pause_local_playback(playbackEnt)
+    elseif status == "group_resumed" then
+        resume_local_playback()
+    elseif status == "countdown" then
+        if is_local_self_playback_proxy(playbackEnt) then
+            activate_self_proxy_camera(playbackEnt)
+        end
+    elseif status == "stopped" or status == "finished" or status == "error" then
+        stop_local_playback(status == "stopped" or status == "error", playbackEnt)
+    elseif status == "stopped_all" then
+        stop_local_playback(true)
+    elseif status == "self_reset" then
+        if force_self_view_cleanup then
+            force_self_view_cleanup()
+        end
+    end
+end)
+
+net.Receive("mmdvmd_clear_built_done", function()
+    local ok = net.ReadBool()
+    local removed = net.ReadUInt(16)
+    local message = net.ReadString()
+    local pending = MMDVMDNPC.PendingClearBuilt
+
+    if ok and pending then
+        for playbackEnt, localPlayback in pairs(MMDVMDNPC.LocalPlaybacks or {}) do
+            local built = localPlayback and localPlayback.built or nil
+            local motionMatches = built and tostring(built.motion_id or "") == tostring(pending.motionID or "")
+            local modelMatches = built and (pending.scope == "all" or tostring(built.model or "") == tostring(pending.model or ""))
+            if motionMatches and modelMatches then
+                stop_local_playback(true, playbackEnt)
+            end
+        end
+
+        for path, built in pairs(MMDVMDNPC.ClientBuiltCache or {}) do
+            local motionMatches = tostring(built.motion_id or "") == tostring(pending.motionID or "")
+            local modelMatches = pending.scope == "all" or tostring(built.model or "") == tostring(pending.model or "")
+            if motionMatches and modelMatches then
+                MMDVMDNPC.ClientBuiltCache[path] = nil
+            end
+        end
+    end
+    MMDVMDNPC.PendingClearBuilt = nil
+
+    MMDVMDNPC.BuildStatus = {
+        ok = ok,
+        status = ok and "cleared" or "error",
+        message = message,
+        removed = removed,
+    }
+    hook.Run("MMDVMDNPCBuildStatusUpdated", MMDVMDNPC.BuildStatus)
+    request_motion_details()
+    play_ui_cue(ok and "success" or "blocked")
+    print("[MMD VMD] " .. message)
+end)
+
+local function forget_client_motion(motionID)
+    motionID = tostring(motionID or "")
+    if motionID == "" then return end
+
+    for i = #(MMDVMDNPC.ClientMotions or {}), 1, -1 do
+        if tostring(MMDVMDNPC.ClientMotions[i] or "") == motionID then
+            table.remove(MMDVMDNPC.ClientMotions, i)
+        end
+    end
+    if MMDVMDNPC.MotionDetails then
+        MMDVMDNPC.MotionDetails[motionID] = nil
+    end
+    for i = #(MMDVMDNPC.MotionDetailsOrdered or {}), 1, -1 do
+        if tostring(MMDVMDNPC.MotionDetailsOrdered[i].id or "") == motionID then
+            table.remove(MMDVMDNPC.MotionDetailsOrdered, i)
+        end
+    end
+    if MMDVMDNPC.AudioOffsets then
+        MMDVMDNPC.AudioOffsets[motionID] = nil
+    end
+    for path, built in pairs(MMDVMDNPC.ClientBuiltCache or {}) do
+        if built and tostring(built.motion_id or "") == motionID then
+            MMDVMDNPC.ClientBuiltCache[path] = nil
+        end
+    end
+
+    local current = GetConVar("mmd_vmd_npc_motion")
+    if current and current:GetString() == motionID then
+        RunConsoleCommand("mmd_vmd_npc_motion", "")
+    end
+    hook.Run("MMDVMDNPCMotionListUpdated", MMDVMDNPC.ClientMotions or {})
+    hook.Run("MMDVMDNPCMotionDetailsUpdated", MMDVMDNPC.MotionDetailsOrdered or {})
+end
+
+net.Receive("mmdvmd_delete_motion_done", function()
+    local ok = net.ReadBool()
+    local motionID = net.ReadString()
+    local message = net.ReadString()
+    local removedBuilt = net.ReadUInt(16)
+    local musicPath = net.ReadString()
+    local musicRemoved = net.ReadBool()
+
+    if ok then
+        forget_client_motion(motionID)
+        request_list()
+        request_motion_details()
+    end
+
+    play_ui_cue(ok and "success" or "blocked")
+    if notification and notification.AddLegacy then
+        notification.AddLegacy(message, ok and (NOTIFY_GENERIC or 0) or (NOTIFY_ERROR or 1), 8)
+    end
+    local suffix = {}
+    if removedBuilt > 0 then
+        suffix[#suffix + 1] = LF("mmd_vmd_npc.console.built_removed_fmt", tostring(removedBuilt))
+    end
+    if musicPath ~= "" then
+        suffix[#suffix + 1] = musicRemoved
+            and LF("mmd_vmd_npc.console.music_removed_fmt", musicPath)
+            or LF("mmd_vmd_npc.console.music_checked_fmt", musicPath)
+    end
+    print(string.format(
+        "[MMD VMD] %s%s",
+        message,
+        #suffix > 0 and (" | " .. table.concat(suffix, " | ")) or ""
+    ))
+end)
+
+hook.Add("HUDPaint", "MMDVMDNPCBuildProgressHUD", function()
+    local status = MMDVMDNPC.BuildStatus or {}
+    if status.status ~= "building" and status.status ~= "queued" and status.status ~= "countdown" then return end
+
+    local width = math.min(520, ScrW() - 80)
+    local height = 54
+    local x = math.floor((ScrW() - width) * 0.5)
+    local y = math.floor(ScrH() * 0.78)
+    local progress = math.Clamp(tonumber(status.progress) or 0, 0, 1)
+    local title = status.status == "queued" and L("mmd_vmd_npc.hud.build_queued")
+        or (status.status == "countdown" and L("mmd_vmd_npc.hud.countdown") or L("mmd_vmd_npc.hud.build"))
+    local detail = tostring(status.message or "")
+
+    draw.RoundedBox(6, x, y, width, height, Color(20, 20, 20, 220))
+    draw.SimpleText(title, "DermaDefaultBold", x + 12, y + 8, Color(255, 255, 255), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+    draw.SimpleText(detail, "DermaDefault", x + 12, y + 24, Color(220, 220, 220), TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+
+    local barX = x + 12
+    local barY = y + height - 13
+    local barW = width - 24
+    draw.RoundedBox(3, barX, barY, barW, 6, Color(70, 70, 70, 230))
+    draw.RoundedBox(3, barX, barY, math.floor(barW * progress), 6, Color(80, 170, 255, 245))
+end)
+
+hook.Add("PreDrawHalos", "MMDVMDNPCAssignedActorHalos", function()
+    if not halo or not halo.Add then return end
+    local assignments = MMDVMDNPC.AssignedActors or {}
+    local first = {}
+    local selected = {}
+    local missing = {}
+
+    for _, ent in ipairs(assignments.order or {}) do
+        local row = assignments.byEnt and assignments.byEnt[ent] or nil
+        if IsValid(ent) and row then
+            if row.status == "missing" then
+                missing[#missing + 1] = ent
+            elseif row.first then
+                first[#first + 1] = ent
+            else
+                selected[#selected + 1] = ent
+            end
+        end
+    end
+
+    if #first > 0 then halo.Add(first, Color(80, 255, 150), 4, 4, 2, true, true) end
+    if #selected > 0 then halo.Add(selected, Color(80, 170, 255), 3, 3, 1, true, true) end
+    if #missing > 0 then halo.Add(missing, Color(255, 205, 70), 4, 4, 2, true, true) end
+end)
+
+local function assigned_label_color(status)
+    if status == "built" then return Color(80, 235, 130, 235) end
+    if status == "building" or status == "queued" then return Color(90, 180, 255, 235) end
+    if status == "missing" then return Color(255, 205, 70, 235) end
+    return Color(220, 220, 220, 235)
+end
+
+local function should_draw_assigned_actor_label(ent)
+    if not IsValid(ent) then return false end
+    if (MMDVMDNPC.ActivePlaybackEnts or {})[ent] then return false end
+    if (MMDVMDNPC.LocalPlaybacks or {})[ent] then return false end
+    return true
+end
+
+hook.Add("PostDrawTranslucentRenderables", "MMDVMDNPCAssignedActorLabels", function()
+    local assignments = MMDVMDNPC.AssignedActors or {}
+    if not assignments.order or #assignments.order <= 0 then return end
+
+    local eyeAng = EyeAngles()
+    local ang = Angle(0, eyeAng.y - 90, 90)
+    for _, ent in ipairs(assignments.order) do
+        local row = assignments.byEnt and assignments.byEnt[ent] or nil
+        if row and should_draw_assigned_actor_label(ent) then
+            local mins, maxs = ent:OBBMins(), ent:OBBMaxs()
+            local pos = ent:LocalToWorld(Vector(0, 0, maxs.z + 14))
+            local title = string.format("#%d %s", tonumber(row.index) or 0, motion_display_name(row.motionID))
+            local status = tostring(row.status or "")
+            local width = math.max(190, math.min(360, 18 + math.max(#title, #status) * 7))
+
+            cam.Start3D2D(pos, ang, 0.06)
+                draw.RoundedBox(6, -width * 0.5, -34, width, 48, Color(15, 15, 18, 205))
+                draw.SimpleText(title, "DermaDefaultBold", 0, -27, row.first and Color(120, 255, 170) or Color(235, 245, 255), TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP)
+                draw.SimpleText(status, "DermaDefault", 0, -10, assigned_label_color(status), TEXT_ALIGN_CENTER, TEXT_ALIGN_TOP)
+            cam.End3D2D()
+        end
+    end
+end)
+
+net.Receive("mmdvmd_debug_open", function()
+    local motionID = net.ReadString()
+    local requestedFrame = net.ReadInt(32)
+    MMDVMDNPC.OpenDebugMenu(motionID, requestedFrame)
+end)
+
+local function open_motion_browser()
+    local frame = vgui.Create("DFrame")
+    frame:SetTitle(L("mmd_vmd_npc.manager.title"))
+    local maxWidth = math.max(760, ScrW() - 80)
+    local maxHeight = math.max(560, ScrH() - 80)
+    local frameWidth = math.min(1180, maxWidth)
+    local frameHeight = math.min(760, maxHeight)
+    if maxWidth >= 900 then frameWidth = math.max(900, frameWidth) end
+    if maxHeight >= 620 then frameHeight = math.max(620, frameHeight) end
+    frame:SetSize(frameWidth, frameHeight)
+    if frame.SetSizable then frame:SetSizable(true) end
+    if frame.SetMinWidth then frame:SetMinWidth(math.min(980, frameWidth)) end
+    if frame.SetMinHeight then frame:SetMinHeight(math.min(660, frameHeight)) end
+    frame:Center()
+    frame:MakePopup()
+
+    local top = vgui.Create("DPanel", frame)
+    top:Dock(TOP)
+    top:SetTall(48)
+
+    local search = vgui.Create("DTextEntry", top)
+    search:Dock(FILL)
+    search:SetPlaceholderText(L("mmd_vmd_npc.manager.search_placeholder"))
+    set_manager_font(search, "MMDVMDNPCManagerText")
+
+    local refresh = vgui.Create("DButton", top)
+    refresh:Dock(RIGHT)
+    style_manager_button(refresh, 150)
+    refresh:SetText(L("mmd_vmd_npc.manager.refresh"))
+    refresh.DoClick = function()
+        request_list()
+        request_motion_details()
+    end
+
+    local list = vgui.Create("DListView", frame)
+    list:Dock(FILL)
+    local columns = {
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_motion_id")), 290 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_duration")), 105 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_frames")), 105 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_bones")), 95 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_flexes")), 95 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_music")), 95 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_addon")), 130 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_built")), 115 },
+    }
+    for _, columnInfo in ipairs(columns) do
+        local column, width = columnInfo[1], columnInfo[2]
+        if IsValid(column) and column.SetFixedWidth then column:SetFixedWidth(width) end
+    end
+    if list.SetDataHeight then list:SetDataHeight(30) end
+    if IsValid(list.Header) and list.Header.SetTall then list.Header:SetTall(32) end
+    for _, column in ipairs(list.Columns or {}) do
+        if IsValid(column.Header) then
+            set_manager_font(column.Header, "MMDVMDNPCManagerTextBold")
+            if column.Header.SetTall then column.Header:SetTall(32) end
+        end
+    end
+
+    local details = vgui.Create("DLabel", frame)
+    details:Dock(BOTTOM)
+    details:SetTall(96)
+    details:SetWrap(true)
+    set_manager_font(details, "MMDVMDNPCManagerDetails")
+    details:SetText(L("mmd_vmd_npc.manager.select_motion_details"))
+
+    local audioPanel = vgui.Create("DPanel", frame)
+    audioPanel:Dock(BOTTOM)
+    audioPanel:SetTall(56)
+
+    local audioOptionsPanel = vgui.Create("DPanel", frame)
+    audioOptionsPanel:Dock(BOTTOM)
+    audioOptionsPanel:SetTall(52)
+
+    local musicToggle = vgui.Create("DCheckBoxLabel", audioOptionsPanel)
+    musicToggle:Dock(LEFT)
+    musicToggle:SetWide(170)
+    musicToggle:SetText(L("mmd_vmd_npc.manager.play_music"))
+    musicToggle:SetConVar("mmd_vmd_npc_music_enabled")
+    set_manager_font(musicToggle.Label, "MMDVMDNPCManagerText")
+
+    local volumeSlider = vgui.Create("DNumSlider", audioOptionsPanel)
+    volumeSlider:Dock(FILL)
+    volumeSlider:SetText(L("mmd_vmd_npc.manager.volume"))
+    volumeSlider:SetMin(0)
+    volumeSlider:SetMax(2)
+    volumeSlider:SetDecimals(2)
+    volumeSlider:SetConVar("mmd_vmd_npc_music_volume")
+    set_manager_font(volumeSlider.Label, "MMDVMDNPCManagerText")
+
+    local offsetEntry = vgui.Create("DNumberWang", audioPanel)
+    offsetEntry:Dock(LEFT)
+    offsetEntry:SetWide(110)
+    set_manager_font(offsetEntry, "MMDVMDNPCManagerText")
+    offsetEntry:SetDecimals(2)
+    offsetEntry:SetMinMax(-5, 5)
+    offsetEntry:SetValue(0)
+
+    local audioLabel = vgui.Create("DLabel", audioPanel)
+    audioLabel:Dock(FILL)
+    audioLabel:SetWrap(true)
+    set_manager_font(audioLabel, "MMDVMDNPCManagerDetails")
+    audioLabel:SetText(L("mmd_vmd_npc.manager.audio_offset_help"))
+
+    local audioPreview = vgui.Create("DButton", audioPanel)
+    audioPreview:Dock(RIGHT)
+    style_manager_button(audioPreview, 160)
+    audioPreview:SetText(L("mmd_vmd_npc.manager.preview_music_only"))
+
+    local motionPreview = vgui.Create("DButton", audioPanel)
+    motionPreview:Dock(RIGHT)
+    style_manager_button(motionPreview, 160)
+    motionPreview:SetText(L("mmd_vmd_npc.manager.preview_motion"))
+
+    local audioStop = vgui.Create("DButton", audioPanel)
+    audioStop:Dock(RIGHT)
+    style_manager_button(audioStop, 120)
+    audioStop:SetText(L("mmd_vmd_npc.manager.stop_music"))
+    audioStop.DoClick = stop_audio_preview
+
+    local audioSave = vgui.Create("DButton", audioPanel)
+    audioSave:Dock(RIGHT)
+    style_manager_button(audioSave, 125)
+    audioSave:SetText(L("mmd_vmd_npc.manager.save_offset"))
+
+    local selectedMotion = nil
+    local selectedMeta = nil
+
+    local function populate(motions)
+        if not IsValid(list) then return end
+        list:Clear()
+        local query = string.lower(search:GetValue() or "")
+        local rows = MMDVMDNPC.MotionDetailsOrdered or {}
+        if #rows <= 0 then
+            for _, id in ipairs(motions or MMDVMDNPC.ClientMotions or {}) do
+                rows[#rows + 1] = { id = id }
+            end
+        end
+
+        for _, meta in ipairs(rows) do
+            local displayName = motion_display_name(meta)
+            local haystack = string.lower(table.concat({
+                meta.id or "",
+                displayName,
+                meta.sourceName or "",
+                meta.musicSound or "",
+            }, " "))
+            if query == "" or string.find(haystack, query, 1, true) then
+                local line = list:AddLine(
+                    displayName,
+                    string.format("%.2fs", tonumber(meta.duration) or 0),
+                    tostring(meta.frameCount or ((meta.frameEnd or 0) - (meta.frameStart or 0) + 1)),
+                    tostring(meta.boneCount or 0),
+                    tostring(meta.flexCount or 0),
+                    (meta.musicSound and meta.musicSound ~= "") and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
+                    meta.isAddon and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
+                    meta.built and L("mmd_vmd_npc.ui.built") or L("mmd_vmd_npc.ui.missing")
+                )
+                line.MotionID = meta.id
+                line.Meta = meta
+                style_manager_list_line(line)
+            end
+        end
+    end
+
+    local function update_selection(line)
+        if not line then return end
+        selectedMotion = line.MotionID
+        selectedMeta = line.Meta or (selectedMotion and MMDVMDNPC.MotionDetails[selectedMotion]) or nil
+        if selectedMotion then
+            RunConsoleCommand("mmd_vmd_npc_motion", selectedMotion)
+            request_audio_settings(selectedMotion)
+        end
+        local meta = selectedMeta or {}
+        local selectedDisplayName = selectedMotion and motion_display_name(meta.id and meta or selectedMotion) or L("mmd_vmd_npc.ui.none")
+        details:SetText(LF(
+            "mmd_vmd_npc.manager.details_fmt",
+            tostring(selectedDisplayName),
+            tostring(meta.fps or "?"),
+            tostring(meta.frameStart or "?"),
+            tostring(meta.frameEnd or "?"),
+            tonumber(meta.duration) or 0,
+            tostring(meta.boneCount or 0),
+            tostring(meta.flexCount or 0),
+            tostring(meta.musicSound or "") ~= "" and tostring(meta.musicSound) or L("mmd_vmd_npc.ui.none"),
+            tostring(meta.sourceName or "")
+        ))
+        offsetEntry:SetValue(tonumber(MMDVMDNPC.AudioOffsets[selectedMotion or ""]) or 0)
+    end
+
+    list.OnRowSelected = function(_, _, line)
+        update_selection(line)
+    end
+
+    list.DoDoubleClick = function(_, _, line)
+        update_selection(line)
+        if line and line.MotionID then
+            MMDVMDNPC.OpenDebugMenu(line.MotionID, DEBUG_REFERENCE_FRAME)
+        end
+    end
+
+    search.OnChange = function()
+        populate()
+    end
+
+    local controls = vgui.Create("DPanel", frame)
+    controls:Dock(BOTTOM)
+    controls:SetTall(54)
+
+    local open = vgui.Create("DButton", controls)
+    open:Dock(LEFT)
+    style_manager_button(open, 140)
+    open:SetText(L("mmd_vmd_npc.manager.debug"))
+    open.DoClick = function()
+        local selected = list:GetSelectedLine()
+        local line = selected and list:GetLine(selected)
+        if line and line.MotionID then
+            MMDVMDNPC.OpenDebugMenu(line.MotionID, DEBUG_REFERENCE_FRAME)
+        end
+    end
+
+    local build = vgui.Create("DButton", controls)
+    build:Dock(LEFT)
+    style_manager_button(build, 170)
+    build:SetText(L("mmd_vmd_npc.manager.build_selected"))
+    build.DoClick = function()
+        if selectedMotion then
+            MMDVMDNPC.RequestBuildSelectedMotion()
+        end
+    end
+
+    local play = vgui.Create("DButton", controls)
+    play:Dock(LEFT)
+    style_manager_button(play, 170)
+    play:SetText(L("mmd_vmd_npc.manager.play_built"))
+    play.DoClick = function()
+        if selectedMotion then
+            MMDVMDNPC.RequestPlaySelectedMotion()
+        end
+    end
+
+    local stop = vgui.Create("DButton", controls)
+    stop:Dock(LEFT)
+    style_manager_button(stop, 120)
+    stop:SetText(L("mmd_vmd_npc.manager.stop"))
+    stop.DoClick = function()
+        MMDVMDNPC.RequestStopSelectedMotion()
+        stop_audio_preview()
+    end
+
+    local clearModel = vgui.Create("DButton", controls)
+    clearModel:Dock(LEFT)
+    style_manager_button(clearModel, 190)
+    clearModel:SetText(L("mmd_vmd_npc.manager.clear_this_model"))
+    clearModel.DoClick = function()
+        MMDVMDNPC.RequestClearBuiltSelectedMotion("model")
+        request_motion_details()
+    end
+
+    local clearAll = vgui.Create("DButton", controls)
+    clearAll:Dock(LEFT)
+    style_manager_button(clearAll, 235)
+    clearAll:SetText(L("mmd_vmd_npc.manager.clear_all_models"))
+    clearAll.DoClick = function()
+        MMDVMDNPC.RequestClearBuiltSelectedMotion("all")
+        request_motion_details()
+    end
+
+    local deleteMotion = vgui.Create("DButton", controls)
+    deleteMotion:Dock(FILL)
+    deleteMotion:SetText(L("mmd_vmd_npc.manager.delete_motion_music"))
+    style_manager_button(deleteMotion)
+    set_manager_font(deleteMotion, "MMDVMDNPCManagerTextBold")
+    deleteMotion:SetTextColor(Color(180, 40, 40))
+    deleteMotion.DoClick = function()
+        if not selectedMotion or selectedMotion == "" then
+            play_ui_cue("blocked")
+            print("[MMD VMD] " .. L("mmd_vmd_npc.error.select_motion"))
+            return
+        end
+
+        local function delete_selected()
+            stop_audio_preview()
+            MMDVMDNPC.RequestDeleteSelectedMotion(selectedMotion)
+        end
+        local prompt = LF("mmd_vmd_npc.manager.delete_prompt_fmt", tostring(selectedMotion))
+        if Derma_Query then
+            Derma_Query(prompt, L("mmd_vmd_npc.manager.delete_title"), L("mmd_vmd_npc.manager.delete_confirm"), delete_selected, L("mmd_vmd_npc.manager.cancel"))
+        else
+            delete_selected()
+        end
+    end
+
+    audioPreview.DoClick = function()
+        local meta = selectedMeta or (selectedMotion and MMDVMDNPC.MotionDetails[selectedMotion]) or {}
+        local volume = GetConVar("mmd_vmd_npc_music_volume")
+        play_audio_preview(meta.musicSound or "", offsetEntry:GetValue(), volume and volume:GetFloat() or MMDVMDNPC.DefaultMusicVolume or 1)
+    end
+    motionPreview.DoClick = function()
+        if selectedMotion then
+            MMDVMDNPC.SaveAudioOffset(selectedMotion, offsetEntry:GetValue())
+            MMDVMDNPC.RequestPlaySelectedMotion()
+        end
+    end
+    audioSave.DoClick = function()
+        if selectedMotion then
+            MMDVMDNPC.SaveAudioOffset(selectedMotion, offsetEntry:GetValue())
+        end
+    end
+
+    local hookID = "MMDVMDNPCMotionBrowser_" .. tostring(frame)
+    hook.Add("MMDVMDNPCMotionListUpdated", hookID, populate)
+    hook.Add("MMDVMDNPCMotionDetailsUpdated", hookID .. "_Details", populate)
+    hook.Add("MMDVMDNPCAudioSettingsUpdated", hookID .. "_Audio", function(motionID, offset)
+        if motionID == selectedMotion and IsValid(offsetEntry) then
+            offsetEntry:SetValue(offset)
+        end
+    end)
+    frame.OnRemove = function()
+        hook.Remove("MMDVMDNPCMotionListUpdated", hookID)
+        hook.Remove("MMDVMDNPCMotionDetailsUpdated", hookID .. "_Details")
+        hook.Remove("MMDVMDNPCAudioSettingsUpdated", hookID .. "_Audio")
+        stop_audio_preview()
+    end
+
+    populate()
+    request_list()
+    request_motion_details()
+end
+
+concommand.Add("mmdvmd_menu", open_motion_browser)
+MMDVMDNPC.OpenMotionManager = open_motion_browser
+
+concommand.Add("mmdvmd_list", function()
+    request_list()
+end)
+
+concommand.Add("mmdvmd_debug", function(_, _, args)
+    local motionID = args and args[1] or ""
+    if motionID == "" then
+        print("[MMD VMD] " .. L("mmd_vmd_npc.console.debug_usage"))
+        return
+    end
+    MMDVMDNPC.OpenDebugMenu(motionID, args and args[2] or DEBUG_REFERENCE_FRAME)
+end)
