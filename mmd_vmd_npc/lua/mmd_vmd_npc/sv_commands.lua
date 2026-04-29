@@ -809,7 +809,7 @@ local function resolve_eye_bones(ent)
             break
         end
     end
-    print("Resolved eye bones for " .. tostring(ent:GetModel() or "") .. ": left=" .. tostring(leftBone) .. ", right=" .. tostring(rightBone))
+    -- print("Resolved eye bones for " .. tostring(ent:GetModel() or "") .. ": left=" .. tostring(leftBone) .. ", right=" .. tostring(rightBone))
     return leftBone, rightBone
 end
 

@@ -1394,7 +1394,7 @@ hook.Add("Think", "MMDVMDNPCLocalInterpolatedPlayback", function()
             local upperIndex = math.Clamp(upperFrame - startFrame + 1, 1, #frames)
 
             local pelvis = GetConVar("mmd_vmd_npc_pelvis_z_offset")
-            print(string.format("[MMDVMDNPC] Applying local playback sample for frame %.2f (lower: %d, upper: %d, fraction: %.2f)", sourceFrame, lowerFrame, upperFrame, fraction))
+            -- print(string.format("[MMDVMDNPC] Applying local playback sample for frame %.2f (lower: %d, upper: %d, fraction: %.2f)", sourceFrame, lowerFrame, upperFrame, fraction))
             print(("  pelvisZOffset: " .. (pelvis and pelvis:GetFloat() or 0)))
             apply_local_built_sample(ent, frames[lowerIndex], frames[upperIndex], fraction, pelvis and pelvis:GetFloat() or 0)
             apply_local_eye_tracking(ent, state, now)
