@@ -216,18 +216,3 @@ Pass the path manually in the UI, or use CLI:
 ```powershell
 python tools/import_vmd.py "motions\dance.vmd" --gmod-dir "H:\SteamLibrary\steamapps\common\GarrysMod" --bake-with-blender --cache
 ```
-
-## Run Tests
-
-```powershell
-python -m unittest discover -s tests
-```
-
-The tests are mostly parser/static contract checks. Some preview tests are skipped automatically when optional fixtures or GUI/OpenGL support are unavailable.
-
-## Notes For GitHub Releases
-
-- Commit source files, not `build/`, `dist/`, or generated `.spec` build outputs unless intentionally needed.
-- Release builds should be generated from a clean virtual environment.
-- Include a short note in releases if the EXE was built with `-NoBundledFFmpeg`.
-- The packaged EXE still requires Blender to be installed on the user's machine.
