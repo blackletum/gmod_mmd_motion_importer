@@ -1220,11 +1220,34 @@ local function get_local_eye_attachment(ent)
     return nil
 end
 
-local function local_eye_tracking_target()
-    if MMDVMDNPC.SelfThirdPersonActive and MMDVMDNPC.EyeTrackCameraOrigin then
+-- Single source of truth for "where the local player is currently viewing the
+-- scene from", with a stable priority: the imported camera animation when
+-- active, else the third-person orbit camera, else the eyes. Both the local
+-- (self-proxy) eye tracking and the server bridge read THIS, so the two systems
+-- never chase divergent targets and fight over the same eyes frame to frame
+-- (the flicker seen when a player dance and an NPC dance overlap). The globals
+-- are only trusted while their owning mode is active, so a stale value left
+-- behind by a just-deactivated mode is ignored.
+function MMDVMDNPC.CurrentViewOrigin()
+    -- A camera debug preview renders through CameraAnimViewOrigin without
+    -- setting CameraAnimActive, and it suppresses the orbit camera (freezing
+    -- EyeTrackCameraOrigin). Recognise it first so eyes track the debug camera
+    -- the player is actually looking through, not a frozen orbit point.
+    if MMDVMDNPC.CameraDebugPreviewRenderable and MMDVMDNPC.CameraDebugPreviewRenderable()
+        and isvector(MMDVMDNPC.CameraAnimViewOrigin) then
+        return MMDVMDNPC.CameraAnimViewOrigin
+    end
+    if MMDVMDNPC.CameraAnimActive and isvector(MMDVMDNPC.CameraAnimViewOrigin) then
+        return MMDVMDNPC.CameraAnimViewOrigin
+    end
+    if MMDVMDNPC.SelfThirdPersonActive and isvector(MMDVMDNPC.EyeTrackCameraOrigin) then
         return MMDVMDNPC.EyeTrackCameraOrigin
     end
     return EyePos()
+end
+
+local function local_eye_tracking_target()
+    return MMDVMDNPC.CurrentViewOrigin()
 end
 
 local function compute_local_look_controls(ent, targetWorld)
@@ -1979,9 +2002,17 @@ local function send_eye_track_camera(active, pos)
 end
 
 hook.Add("Think", "MMDVMDNPCEyeTrackCameraBridge", function()
+    local now = CurTime()
     local shouldSend = should_send_eye_track_camera_target()
+    if shouldSend then
+        -- Keep the bridge alive for a short grace period after the trigger
+        -- momentarily drops (e.g. one dance ends a frame before another's play
+        -- status updates). Tearing the target down and rebuilding it snaps the
+        -- eyes; lingering lets the smoothing carry through the handover.
+        MMDVMDNPC.EyeTrackCameraBridgeUntil = now + 0.4
+    end
 
-    if not shouldSend then
+    if now >= (MMDVMDNPC.EyeTrackCameraBridgeUntil or 0) then
         if MMDVMDNPC.EyeTrackCameraBridgeActive then
             MMDVMDNPC.EyeTrackCameraBridgeActive = false
             send_eye_track_camera(false)
@@ -1989,16 +2020,12 @@ hook.Add("Think", "MMDVMDNPCEyeTrackCameraBridge", function()
         return
     end
 
-    local now = CurTime()
     if now < (MMDVMDNPC.EyeTrackCameraNextSend or 0) then return end
     MMDVMDNPC.EyeTrackCameraNextSend = now + 0.05
     MMDVMDNPC.EyeTrackCameraBridgeActive = true
-    -- Eye tracking looks at whatever the player is actually seeing through:
-    -- the animated MMD camera when active, else the orbit camera, else the eyes.
-    local viewOrigin = (MMDVMDNPC.CameraAnimActive and MMDVMDNPC.CameraAnimViewOrigin)
-        or (MMDVMDNPC.SelfThirdPersonActive and MMDVMDNPC.EyeTrackCameraOrigin)
-        or EyePos()
-    send_eye_track_camera(true, viewOrigin or EyePos())
+    -- Same authoritative view origin the local self-proxy eye tracking uses, so
+    -- server NPC eyes and local proxy eyes always target the same point.
+    send_eye_track_camera(true, MMDVMDNPC.CurrentViewOrigin())
 end)
 
 local function convar_float(name, fallback)
@@ -2628,6 +2655,27 @@ end
 -- window's current frame, previews it through CalcView (anchored on the debug
 -- target), and exposes the global camera transform tuning convars.
 
+-- The default Derma frame body is a light grey; several debug labels use the
+-- skin's default (also light) text colour and become nearly invisible on it.
+-- Paint a known dark body under the content and force light text so the debug
+-- readouts are legible regardless of the active Derma skin.
+local DEBUG_TEXT_COLOR = Color(226, 231, 238)
+
+local function paint_dark_frame_body(self, w, h)
+    derma.SkinHook("Paint", "Frame", self, w, h)
+    surface.SetDrawColor(34, 38, 46, 255)
+    surface.DrawRect(4, 24, w - 8, h - 28)
+end
+
+local function style_debug_label(panel, color)
+    if IsValid(panel) and panel.SetTextColor then
+        panel:SetTextColor(color or DEBUG_TEXT_COLOR)
+    end
+    if IsValid(panel) and panel.Label and panel.Label.SetTextColor then
+        panel.Label:SetTextColor(color or DEBUG_TEXT_COLOR)
+    end
+end
+
 function MMDVMDNPC.CloseCameraDebugPanel()
     MMDVMDNPC.CameraDebugPreview = nil
     local panel = MMDVMDNPC.CameraDebugPanel
@@ -2671,6 +2719,7 @@ function MMDVMDNPC.OpenCameraDebugPanel(debugFrame)
         hook.Remove("MMDVMDNPCCameraDebugTrackUpdated", hookID)
     end
     panel:SetTitle(LF("mmd_vmd_npc.camera.debug_title_fmt", motionID))
+    panel.Paint = paint_dark_frame_body
     panel:SetSize(math.min(420, ScrW() - 40), math.min(430, ScrH() - 40))
     panel:SetPos(24, math.floor(ScrH() * 0.2))
     panel:SetSizable(true)
@@ -2690,6 +2739,7 @@ function MMDVMDNPC.OpenCameraDebugPanel(debugFrame)
     values:SetWrap(true)
     values:SetAutoStretchVertical(false)
     values:SetText(L("mmd_vmd_npc.camera.debug_waiting"))
+    style_debug_label(values)
 
     local help = vgui.Create("DLabel", panel)
     help:Dock(TOP)
@@ -2697,6 +2747,7 @@ function MMDVMDNPC.OpenCameraDebugPanel(debugFrame)
     help:SetTall(48)
     help:SetWrap(true)
     help:SetText(L("mmd_vmd_npc.camera.debug_help"))
+    style_debug_label(help, Color(180, 190, 205))
 
     local scroll = vgui.Create("DScrollPanel", panel)
     scroll:Dock(FILL)
@@ -2711,6 +2762,7 @@ function MMDVMDNPC.OpenCameraDebugPanel(debugFrame)
         slider:SetMax(maxValue)
         slider:SetDecimals(decimals)
         slider:SetConVar(cvarName)
+        style_debug_label(slider)
         return slider
     end
 
@@ -2721,6 +2773,14 @@ function MMDVMDNPC.OpenCameraDebugPanel(debugFrame)
     add_slider("mmd_vmd_npc.camera.yaw", "mmd_vmd_npc_cam_yaw", -180, 180, 1)
     add_slider("mmd_vmd_npc.camera.pitch", "mmd_vmd_npc_cam_pitch", -89, 89, 1)
     add_slider("mmd_vmd_npc.camera.fov_offset", "mmd_vmd_npc_cam_fov", -30, 30, 1)
+    add_slider("mmd_vmd_npc.camera.max_distance", "mmd_vmd_npc_cam_max_distance", 0, 3000, 0)
+
+    local collision = vgui.Create("DCheckBoxLabel", scroll)
+    collision:Dock(TOP)
+    collision:DockMargin(8, 4, 8, 2)
+    collision:SetText(L("mmd_vmd_npc.camera.collision"))
+    collision:SetConVar("mmd_vmd_npc_cam_collision")
+    style_debug_label(collision)
 
     local reset = vgui.Create("DButton", scroll)
     reset:Dock(TOP)
@@ -2774,7 +2834,7 @@ function MMDVMDNPC.OpenCameraDebugPanel(debugFrame)
             return
         end
 
-        local anchor = MMDVMDNPC.TargetStatus and MMDVMDNPC.TargetStatus.ent or nil
+        local anchor = MMDVMDNPC.CameraDebugAnchor and MMDVMDNPC.CameraDebugAnchor() or nil
         values:SetText(LF(
             "mmd_vmd_npc.camera.debug_values_fmt",
             frame,
@@ -2801,6 +2861,7 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
         frame:SetSize(math.min(screenW - 40, 1360), math.min(screenH - 40, 800))
         frame:Center()
         frame:MakePopup()
+        frame.Paint = paint_dark_frame_body
         frame.OnClose = function()
             set_debug_preview_playing(frame, false)
         end
@@ -3078,6 +3139,20 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
         frame.Refresh.DoClick = function()
             MMDVMDNPC.OpenDebugMenu(frame.MotionID, frame.ActiveFrame or 0)
         end
+
+        -- Light text on the dark body painted above (Derma's default label
+        -- colour is near-invisible on it).
+        style_debug_label(frame.Summary)
+        style_debug_label(frame.FlexOverrideTitle)
+        style_debug_label(frame.DisableArmTwist)
+        style_debug_label(frame.DisableHandTwist)
+        style_debug_label(frame.DisableEyes)
+        style_debug_label(frame.DisableSpinePelvis)
+        style_debug_label(frame.CameraPreview)
+        style_debug_label(frame.FlexScaleAll)
+        style_debug_label(frame.FlexScaleEye)
+        style_debug_label(frame.FlexScaleBrow)
+        style_debug_label(frame.FlexScaleMouth)
     end
 
     frame.MotionID = motionID

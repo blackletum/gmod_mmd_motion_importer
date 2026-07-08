@@ -365,6 +365,17 @@ local function optional_convar(name)
     return GetConVar(name)
 end
 
+-- Apply cvar changes IMMEDIATELY via ConVar:SetString rather than the deferred
+-- RunConsoleCommand. Two suppression sets share the RPE body cvar on one
+-- refcounted state, and the build->play handoff releases then re-acquires it in
+-- the same frame. With a deferred restore the re-acquire would read the still-
+-- suppressed "0" as the "original" and pin the cvar off permanently; an
+-- immediate restore means the re-capture sees the true original value.
+local function set_cvar_now(name, value)
+    local cvar = optional_convar(name)
+    if cvar then cvar:SetString(tostring(value)) end
+end
+
 local function begin_scoped_cvar_suppression(names)
     local token = {}
     for _, name in ipairs(names or {}) do
@@ -377,7 +388,7 @@ local function begin_scoped_cvar_suppression(names)
                     count = 0,
                 }
                 MMDVMDNPC.CVarSuppressions[name] = state
-                RunConsoleCommand(name, "0")
+                set_cvar_now(name, "0")
             end
             state.count = (state.count or 0) + 1
             token[#token + 1] = name
@@ -393,31 +404,10 @@ local function end_scoped_cvar_suppression(token)
             state.count = math.max(0, (state.count or 1) - 1)
             if state.count <= 0 then
                 MMDVMDNPC.CVarSuppressions[name] = nil
-                if optional_convar(name) then
-                    RunConsoleCommand(name, tostring(state.original or "0"))
-                end
+                set_cvar_now(name, tostring(state.original or "0"))
             end
         end
     end
-end
-
-local function has_selected_npc_assignment()
-    for ply, ent in pairs(MMDVMDNPC.DebugTargets or {}) do
-        if IsValid(ply) and is_playable_npc(ent) then
-            return true
-        end
-    end
-    for ply, set in pairs(MMDVMDNPC.AssignedActors or {}) do
-        if IsValid(ply) and istable(set) then
-            local byEnt = set.byEnt or {}
-            for _, ent in ipairs(set.order or {}) do
-                if byEnt[ent] and is_playable_npc(ent) then
-                    return true
-                end
-            end
-        end
-    end
-    return false
 end
 
 local function has_active_animation_playback()
@@ -430,7 +420,13 @@ local function has_active_animation_playback()
 end
 
 update_rpe_body_suppression = function()
-    local needed = has_selected_npc_assignment() or has_active_animation_playback()
+    -- Only suppress the other addon's body/eye driving while a dance is
+    -- ACTUALLY playing. Keying off a lingering NPC selection kept the cvars
+    -- forced to 0 after the dance ended (and the NPC stayed selected), so the
+    -- other addon never resumed until the selection was cleared. A play request
+    -- creates the Playbacks entry before its countdown, so this still covers the
+    -- pre-roll where the NPC must hold the reference pose.
+    local needed = has_active_animation_playback()
     local token = MMDVMDNPC.RPEBodySuppressionToken
     if needed and not token then
         MMDVMDNPC.RPEBodySuppressionToken = begin_scoped_cvar_suppression(RPE_BODY_SUPPRESSED_CVARS)

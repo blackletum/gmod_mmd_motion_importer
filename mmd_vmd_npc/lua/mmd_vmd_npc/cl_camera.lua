@@ -24,6 +24,8 @@ CreateClientConVar("mmd_vmd_npc_cam_offset_z", "0", true, false, "Camera animati
 CreateClientConVar("mmd_vmd_npc_cam_yaw", "0", true, false, "Camera animation: global yaw offset (degrees)")
 CreateClientConVar("mmd_vmd_npc_cam_pitch", "0", true, false, "Camera animation: global pitch offset (degrees)")
 CreateClientConVar("mmd_vmd_npc_cam_fov", "0", true, false, "Camera animation: fov offset (degrees)")
+CreateClientConVar("mmd_vmd_npc_cam_collision", "1", true, false, "Camera animation: pull the camera in front of walls it would otherwise clip through")
+CreateClientConVar("mmd_vmd_npc_cam_max_distance", "2500", true, false, "Camera animation: cap the camera's distance to the subject (0 = unlimited)")
 
 local function L(key, fallback)
     return MMDVMDNPC.L and MMDVMDNPC.L(key, fallback) or (fallback or key)
@@ -166,6 +168,92 @@ local function anchor_transform(ent)
     return ent:GetPos(), Angle(0, ang.y or 0, 0)
 end
 
+-- Wall collision + distance cap. The animated camera can be authored to swing
+-- far from the character or, once the character is at an arbitrary world
+-- position, end up on the far side of a wall so the player only sees geometry.
+-- Both cases are corrected by pulling the camera along the subject->camera line
+-- until it is in front of the obstruction (and no farther than a cap), then
+-- widening the vertical FOV so the subject keeps its intended apparent size
+-- (tan(fov/2) scales with the distance ratio).
+local CAMERA_WALL_MARGIN = 8
+-- Degenerate floor: never divide by ~zero and never pull nearer than this even
+-- if a wall is right against the subject. Applied uniformly at every distance
+-- (no separate "close-up" cutoff), so the camera never snaps on/off as an
+-- animated close pass crosses a threshold.
+local CAMERA_MIN_PULL = 4
+local CAMERA_MAX_ADJUSTED_FOV = 130
+local CAMERA_HULL_MIN = Vector(-4, -4, -4)
+local CAMERA_HULL_MAX = Vector(4, 4, 4)
+
+local function camera_pivot(anchorEnt)
+    if anchorEnt.WorldSpaceCenter then
+        local center = anchorEnt:WorldSpaceCenter()
+        if isvector(center) then return center end
+    end
+    return anchorEnt:GetPos() + Vector(0, 0, 40)
+end
+
+-- Occlusion trace from the subject to the desired camera spot. Uses the DEFAULT
+-- solid mask (world brushes AND props/func_detail/displacements — the same mask
+-- the working orbit camera uses; MASK_SOLID_BRUSHWORLD missed prop and detail
+-- walls). A ±4 hull keeps the lens clear of the surface. If the hull merely
+-- grazes nearby geometry at the start it reports StartSolid even though the
+-- subject is in the open, so fall back to a line trace to tell a genuine
+-- overshoot (subject truly inside a brush) from a false positive.
+local function trace_camera_wall(pivot, target, anchorEnt)
+    local filter = { anchorEnt }
+    local ply = LocalPlayer()
+    if IsValid(ply) then filter[#filter + 1] = ply end
+
+    local hull = util.TraceHull({
+        start = pivot,
+        endpos = target,
+        mins = CAMERA_HULL_MIN,
+        maxs = CAMERA_HULL_MAX,
+        filter = filter,
+    })
+    if not hull.StartSolid then return hull end
+
+    return util.TraceLine({
+        start = pivot,
+        endpos = target,
+        filter = filter,
+    })
+end
+
+local function apply_camera_collision(anchorEnt, pivot, camPos, vfov)
+    local toCam = camPos - pivot
+    local dist = toCam:Length()
+    if dist <= CAMERA_MIN_PULL then return camPos, vfov end
+    local dir = toCam / dist
+
+    local capped = dist
+    local maxDist = convar_number("mmd_vmd_npc_cam_max_distance", 2500)
+    if maxDist > 0 then capped = math.min(capped, maxDist) end
+
+    local collide = GetConVar("mmd_vmd_npc_cam_collision")
+    if not collide or collide:GetBool() then
+        local tr = trace_camera_wall(pivot, pivot + dir * capped, anchorEnt)
+        -- StartSolid here means the subject itself is inside a brush (a real
+        -- animation overshoot through a wall); leave the camera where the
+        -- animation put it rather than yanking it onto a surface behind the
+        -- character.
+        if tr.Hit and not tr.StartSolid then
+            capped = math.min(capped, (tr.HitPos - pivot):Length() - CAMERA_WALL_MARGIN)
+        end
+    end
+
+    capped = math.max(CAMERA_MIN_PULL, capped)
+    if capped >= dist - 0.5 then return camPos, vfov end
+
+    -- Widen to preserve apparent size, but never below the authored FOV (the
+    -- ceiling only trims extreme fisheye — a base FOV already wider than the
+    -- ceiling must not be narrowed by the collision path).
+    local half = math.rad(math.Clamp(vfov, 1, 179)) * 0.5
+    local widened = math.deg(2 * math.atan(math.tan(half) * (dist / capped)))
+    return pivot + dir * capped, math.Clamp(widened, vfov, math.max(vfov, CAMERA_MAX_ADJUSTED_FOV))
+end
+
 local function camera_view_for(track, anchorEnt, frame)
     local x, y, z, p, yw, r, fov = MMDVMDNPC.SampleCameraTrack(track, frame)
     if x == nil then return nil end
@@ -173,6 +261,7 @@ local function camera_view_for(track, anchorEnt, frame)
 
     local anchorPos, anchorAng = anchor_transform(anchorEnt)
     local worldPos, worldAng = LocalToWorld(Vector(x, y, z), Angle(p, yw, r), anchorPos, anchorAng)
+    worldPos, fov = apply_camera_collision(anchorEnt, camera_pivot(anchorEnt), worldPos, fov)
     return {
         origin = worldPos,
         angles = worldAng,
@@ -180,6 +269,23 @@ local function camera_view_for(track, anchorEnt, frame)
         drawviewer = true,
         localValues = { x = x, y = y, z = z, p = p, yw = yw, r = r, fov = fov },
     }
+end
+
+-- The camera debug preview orbits the "entity of interest": the first assigned
+-- group actor, else the selected debug target, else the local player (so a
+-- debug session with nothing selected previews on the player's own model).
+function MMDVMDNPC.CameraDebugAnchor()
+    local assigned = MMDVMDNPC.AssignedActors
+    if istable(assigned) and istable(assigned.order) then
+        for _, ent in ipairs(assigned.order) do
+            if IsValid(ent) then return ent end
+        end
+    end
+    local target = MMDVMDNPC.TargetStatus and MMDVMDNPC.TargetStatus.ent or nil
+    if IsValid(target) then return target end
+    local ply = LocalPlayer()
+    if IsValid(ply) then return ply end
+    return nil
 end
 
 -- Public helpers for the debug panel ------------------------------------------
@@ -196,7 +302,7 @@ function MMDVMDNPC.CameraDebugPreviewRenderable()
     if not istable(debugPreview) then return false end
     local track = MMDVMDNPC.CameraDebugTracks[tostring(debugPreview.motionID or "")]
     if not track then return false end
-    local anchor = MMDVMDNPC.TargetStatus and MMDVMDNPC.TargetStatus.ent or nil
+    local anchor = MMDVMDNPC.CameraDebugAnchor()
     if not IsValid(anchor) then return false end
     local frameWindow = MMDVMDNPC.DebugFrame
     local frame = IsValid(frameWindow) and tonumber(frameWindow.ActiveFrame) or nil
@@ -456,7 +562,7 @@ hook.Add("CalcView", "MMDVMDNPCCameraAnim", function(ply, pos, angles, fov)
     if MMDVMDNPC.CameraDebugPreviewRenderable() then
         local debugPreview = MMDVMDNPC.CameraDebugPreview
         local track = MMDVMDNPC.CameraDebugTracks[tostring(debugPreview.motionID or "")]
-        local anchor = MMDVMDNPC.TargetStatus and MMDVMDNPC.TargetStatus.ent or nil
+        local anchor = MMDVMDNPC.CameraDebugAnchor()
         local frameWindow = MMDVMDNPC.DebugFrame
         local frame = IsValid(frameWindow) and tonumber(frameWindow.ActiveFrame) or 0
         local view = camera_view_for(track, anchor, math.max(0, frame))
