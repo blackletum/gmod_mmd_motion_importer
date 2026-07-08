@@ -1,3 +1,4 @@
+include("mmd_vmd_npc/cl_radial.lua")
 MMDVMDNPC = MMDVMDNPC or {}
 MMDVMDNPC.ClientMotions = MMDVMDNPC.ClientMotions or {}
 MMDVMDNPC.TargetStatus = MMDVMDNPC.TargetStatus or {}
@@ -19,6 +20,8 @@ MMDVMDNPC.SelfCameraYaw = MMDVMDNPC.SelfCameraYaw or nil
 MMDVMDNPC.SelfCameraPitch = MMDVMDNPC.SelfCameraPitch or nil
 MMDVMDNPC.SelfCameraBaseCenter = MMDVMDNPC.SelfCameraBaseCenter or nil
 MMDVMDNPC.SelfCameraCenterOffset = MMDVMDNPC.SelfCameraCenterOffset or Vector(0, 0, 0)
+
+
 
 local DEBUG_REFERENCE_FRAME = -1
 local DEBUG_PREVIEW_TIMER = "MMDVMDNPCDebugPreviewPlay"
@@ -75,20 +78,11 @@ local function style_manager_list_line(line)
     end
 end
 
-local function motion_display_name(metaOrID)
-    if istable(metaOrID) then
-        local display = tostring(metaOrID.displayName or "")
-        if display ~= "" then return display end
-        return tostring(metaOrID.id or "")
-    end
+CreateClientConVar("mmd_vmd_npc_show_halos", "1", true, false, "ON/OFF NPC's halos") -- ADDED
 
-    local id = tostring(metaOrID or "")
-    local meta = MMDVMDNPC.MotionDetails and MMDVMDNPC.MotionDetails[id] or nil
-    local display = meta and tostring(meta.displayName or "") or ""
-    return display ~= "" and display or id
-end
 
 CreateClientConVar("mmd_vmd_npc_disable_armtwist", "0", true, false, L("mmd_vmd_npc.ui.disable_armtwist"))
+CreateClientConVar("mmd_vmd_npc_disable_handtwist", "0", true, false, L("mmd_vmd_npc.ui.disable_handtwist"))
 CreateClientConVar("mmd_vmd_npc_disable_eyes", "0", true, false, L("mmd_vmd_npc.ui.disable_eyes"))
 CreateClientConVar("mmd_vmd_npc_disable_spine_pelvis_correction", "0", true, false, L("mmd_vmd_npc.ui.disable_spine_pelvis"))
 CreateClientConVar("mmd_vmd_npc_start_delay", tostring(MMDVMDNPC.DefaultStartDelay or 2), true, false, L("mmd_vmd_npc.ui.start_delay"))
@@ -102,6 +96,7 @@ CreateClientConVar("mmd_vmd_npc_eye_track_pos_ud", tostring(MMDVMDNPC.DefaultEye
 CreateClientConVar("mmd_vmd_npc_eye_track_pos_lr", tostring(MMDVMDNPC.DefaultEyeTrackBonePosLR or 0.5), true, false, L("mmd_vmd_npc.ui.eye_pos_lr"))
 CreateClientConVar("mmd_vmd_npc_music_enabled", "1", true, false, L("mmd_vmd_npc.ui.play_imported_music"))
 CreateClientConVar("mmd_vmd_npc_music_volume", tostring(MMDVMDNPC.DefaultMusicVolume or 1), true, false, L("mmd_vmd_npc.ui.music_volume"))
+CreateClientConVar("mmd_vmd_npc_loop_playback", "0", true, false, L("mmd_vmd_npc.ui.loop_playback"))
 CreateClientConVar("mmd_vmd_npc_build_frames_per_batch", tostring(MMDVMDNPC.DefaultBuildFramesPerBatch or 16), true, false, L("mmd_vmd_npc.ui.build_frames_per_batch"))
 CreateClientConVar("mmd_vmd_npc_playback_hz", tostring(MMDVMDNPC.DefaultPlaybackHz or 120), true, false, L("mmd_vmd_npc.ui.playback_updates_per_second"))
 CreateClientConVar("mmd_vmd_npc_flex_scale_all", "1", true, false, L("mmd_vmd_npc.debug.flex_scale_all"))
@@ -126,6 +121,7 @@ local function request_motion_details()
     net.Start("mmdvmd_motion_details_request")
         local options = selected_options and selected_options() or {}
         net.WriteBool(options.disableArmTwist == true)
+        net.WriteBool(options.disableHandTwist == true)
         net.WriteBool(options.disableEyes == true)
         net.WriteBool(options.disableSpinePelvisCorrection == true)
     net.SendToServer()
@@ -148,10 +144,12 @@ end
 
 selected_options = function()
     local armTwist = GetConVar("mmd_vmd_npc_disable_armtwist")
+    local handTwist = GetConVar("mmd_vmd_npc_disable_handtwist")
     local eyes = GetConVar("mmd_vmd_npc_disable_eyes")
     local spinePelvis = GetConVar("mmd_vmd_npc_disable_spine_pelvis_correction")
     return {
         disableArmTwist = armTwist and armTwist:GetBool() or false,
+        disableHandTwist = handTwist and handTwist:GetBool() or false,
         disableEyes = eyes and eyes:GetBool() or false,
         disableSpinePelvisCorrection = spinePelvis and spinePelvis:GetBool() or false,
     }
@@ -160,6 +158,7 @@ end
 local function write_selected_options()
     local options = selected_options()
     net.WriteBool(options.disableArmTwist)
+    net.WriteBool(options.disableHandTwist)
     net.WriteBool(options.disableEyes)
     net.WriteBool(options.disableSpinePelvisCorrection)
 end
@@ -179,8 +178,13 @@ local function selected_playback_settings()
     local posLR = GetConVar("mmd_vmd_npc_eye_track_pos_lr")
     local musicEnabled = GetConVar("mmd_vmd_npc_music_enabled")
     local musicVolume = GetConVar("mmd_vmd_npc_music_volume")
+    local loopPlayback = GetConVar("mmd_vmd_npc_loop_playback")
     local buildFrames = GetConVar("mmd_vmd_npc_build_frames_per_batch")
     local playbackHz = GetConVar("mmd_vmd_npc_playback_hz")
+    local loopPlaybackEnabled = MMDVMDNPC.DefaultLoopPlayback == true
+    if loopPlayback then
+        loopPlaybackEnabled = loopPlayback:GetBool()
+    end
     return {
         startDelay = math.max(MMDVMDNPC.MinStartDelay or 2, delay and delay:GetFloat() or MMDVMDNPC.DefaultStartDelay or 2),
         -- pelvisZOffset = pelvis and pelvis:GetFloat() or MMDVMDNPC.DefaultPelvisZOffset or -2.5,
@@ -192,7 +196,8 @@ local function selected_playback_settings()
         eyeTrackPosLR = posLR and posLR:GetFloat() or MMDVMDNPC.DefaultEyeTrackBonePosLR or 0.5,
         musicEnabled = not musicEnabled or musicEnabled:GetBool(),
         musicVolume = math.Clamp(musicVolume and musicVolume:GetFloat() or MMDVMDNPC.DefaultMusicVolume or 1, 0, 2),
-        buildFramesPerBatch = math.Clamp(math.floor(buildFrames and buildFrames:GetFloat() or MMDVMDNPC.DefaultBuildFramesPerBatch or 16), MMDVMDNPC.MinBuildFramesPerBatch or 1, MMDVMDNPC.MaxBuildFramesPerBatch or 128),
+        loopPlayback = loopPlaybackEnabled,
+        buildFramesPerBatch = math.Clamp(math.floor(buildFrames and buildFrames:GetFloat() or MMDVMDNPC.DefaultBuildFramesPerBatch or 16), MMDVMDNPC.MinBuildFramesPerBatch or 1, 1024),
         playbackHz = math.Clamp(playbackHz and playbackHz:GetFloat() or MMDVMDNPC.DefaultPlaybackHz or 120, MMDVMDNPC.MinPlaybackHz or 10, MMDVMDNPC.MaxPlaybackHz or 240),
     }
 end
@@ -210,6 +215,7 @@ local function write_selected_playback_settings()
     net.WriteFloat(settings.musicVolume or MMDVMDNPC.DefaultMusicVolume or 1)
     net.WriteFloat(settings.buildFramesPerBatch or MMDVMDNPC.DefaultBuildFramesPerBatch or 16)
     net.WriteFloat(settings.playbackHz or MMDVMDNPC.DefaultPlaybackHz or 120)
+    net.WriteBool(settings.loopPlayback == true)
 end
 
 function MMDVMDNPC.RequestBuildSelectedMotion()
@@ -840,6 +846,14 @@ local function source_is_arm_twist(source)
     return string.find(source, "zarmtwist", 1, true) ~= nil
 end
 
+local function source_is_hand_twist(source)
+    source = string.lower(tostring(source or ""))
+    return string.find(source, "zhandtwist", 1, true) ~= nil
+        or string.find(source, "handtwist", 1, true) ~= nil
+        or string.find(source, "手捩", 1, true) ~= nil
+        or string.find(source, "手首捩", 1, true) ~= nil
+end
+
 local function source_is_eye(source)
     source = string.lower(tostring(source or ""))
     return string.find(source, "eye", 1, true) ~= nil
@@ -847,6 +861,9 @@ end
 
 local function transforms_disabled_for_source(source)
     if convar_bool("mmd_vmd_npc_disable_armtwist", false) and source_is_arm_twist(source) then
+        return true
+    end
+    if convar_bool("mmd_vmd_npc_disable_handtwist", false) and source_is_hand_twist(source) then
         return true
     end
     if convar_bool("mmd_vmd_npc_disable_eyes", false) and source_is_eye(source) then
@@ -1278,29 +1295,16 @@ local function entity_camera_center(ent)
     end
     return center
 end
-
-local function clamp_self_camera_offset(offset)
-    offset = offset or Vector(0, 0, 0)
-    local maxRadius = 1000
-    if offset:LengthSqr() > maxRadius * maxRadius then
-        offset:Normalize()
-        offset = offset * maxRadius
-    end
-    return offset
-end
-
-local function activate_self_proxy_camera(ent)
-    if not IsValid(ent) then return end
-
-    local eye = LocalPlayer():EyeAngles()
-    MMDVMDNPC.SelfThirdPersonActive = true
-    MMDVMDNPC.SelfPlaybackCameraEnt = ent
-    MMDVMDNPC.SelfCameraDistance = MMDVMDNPC.SelfCameraDistance or default_self_camera_distance()
-    MMDVMDNPC.SelfCameraYaw = MMDVMDNPC.SelfCameraYaw or eye.y
-    MMDVMDNPC.SelfCameraPitch = MMDVMDNPC.SelfCameraPitch or 10
-    MMDVMDNPC.SelfCameraBaseCenter = MMDVMDNPC.SelfCameraBaseCenter or entity_camera_center(ent)
-    MMDVMDNPC.SelfCameraCenterOffset = MMDVMDNPC.SelfCameraCenterOffset or Vector(0, 0, 0)
-end
+-- NO NEED IN THIS FORK
+-- local function clamp_self_camera_offset(offset)
+--     offset = offset or Vector(0, 0, 0)
+--     local maxRadius = 1000
+--     if offset:LengthSqr() > maxRadius * maxRadius then
+--         offset:Normalize()
+--         offset = offset * maxRadius
+--     end
+--     return offset
+-- end
 
 local function is_local_self_playback_proxy(ent)
     if not IsValid(ent) or not ent.GetNWBool then return false end
@@ -1310,6 +1314,30 @@ local function is_local_self_playback_proxy(ent)
         if IsValid(owner) and owner ~= LocalPlayer() then return false end
     end
     return true
+end
+
+ 
+MMDVMDNPC.CameraTrackMode = MMDVMDNPC.CameraTrackMode or true
+MMDVMDNPC.StaticCameraCenter = nil 
+
+local function activate_self_proxy_camera(ent)
+    if not IsValid(ent) then return end
+
+    local eye = LocalPlayer():EyeAngles()
+    MMDVMDNPC.SelfThirdPersonActive = true
+    MMDVMDNPC.SelfPlaybackCameraEnt = ent  
+    
+    MMDVMDNPC.SelfCameraDistance = MMDVMDNPC.SelfCameraDistance or default_self_camera_distance()
+    MMDVMDNPC.SelfCameraYaw = MMDVMDNPC.SelfCameraYaw or (ent:GetAngles().y + 180)
+    MMDVMDNPC.SelfCameraPitch = MMDVMDNPC.SelfCameraPitch or 10
+    
+     
+     
+    local mins, maxs = ent:GetModelBounds()
+    local centerOffset = (maxs.z + mins.z) * 0.5
+    MMDVMDNPC.StaticCameraCenter = ent:GetPos() + Vector(0, 0, centerOffset)
+    
+    MMDVMDNPC.CameraInitialized = true
 end
 
 local function start_local_playback(path, playbackEnt)
@@ -1322,12 +1350,14 @@ local function start_local_playback(path, playbackEnt)
     end
 
     MMDVMDNPC.LocalPlaybacks = MMDVMDNPC.LocalPlaybacks or {}
+    local settings = selected_playback_settings()
     MMDVMDNPC.LocalPlaybacks[ent] = {
         path = path,
         built = built,
         ent = ent,
         started = CurTime(),
         nextTick = 0,
+        loopPlayback = settings and settings.loopPlayback == true,
     }
 end
 
@@ -1375,7 +1405,10 @@ local function deactivate_self_proxy_camera()
     MMDVMDNPC.SelfCameraYaw = nil
     MMDVMDNPC.SelfCameraPitch = nil
     MMDVMDNPC.SelfCameraBaseCenter = nil
+
     MMDVMDNPC.SelfCameraCenterOffset = Vector(0, 0, 0)
+    MMDVMDNPC.CameraInitialized = false
+    MMDVMDNPC.SelfCameraHeightOffset = 0
 end
 
 local function stop_one_local_playback(ent, clearPose)
@@ -1446,6 +1479,16 @@ hook.Add("Think", "MMDVMDNPCLocalInterpolatedPlayback", function()
             local fps = math.max(1, tonumber(built.fps) or MMDVMDNPC.VMDFPS or 30)
             local sourceFrame = startFrame + (now - (state.started or now)) * fps
             local finished = sourceFrame >= endFrame
+            if finished and state.loopPlayback == true then
+                local duration = math.max(0, (endFrame - startFrame) / fps)
+                if duration > 0 then
+                    local elapsed = math.max(0, now - (tonumber(state.started) or now))
+                    local loops = math.max(1, math.floor(elapsed / duration))
+                    state.started = (tonumber(state.started) or now) + loops * duration
+                    sourceFrame = startFrame + (now - (state.started or now)) * fps
+                    finished = false
+                end
+            end
             sourceFrame = math.Clamp(sourceFrame, startFrame, endFrame)
 
             local lowerFrame = math.floor(sourceFrame)
@@ -1570,8 +1613,8 @@ local function play_synced_audio(token, soundPath, sourceEnt, offset, startTime,
     startTime = tonumber(startTime) or CurTime()
     volume = math.Clamp(tonumber(volume) or MMDVMDNPC.DefaultMusicVolume or 1, 0, 2)
 
-    local seek = math.max(0, -offset)
-    local wait = math.max(0, (startTime + math.max(0, offset)) - CurTime())
+    local audibleStart = startTime + math.max(0, offset)
+    local wait = math.max(0, audibleStart - CurTime())
     local timerName = "MMDVMDNPCAudioStart_" .. tostring(token)
     local state = {
         token = token,
@@ -1591,6 +1634,7 @@ local function play_synced_audio(token, soundPath, sourceEnt, offset, startTime,
             state.channel = channel
             if channel.Set3DFadeDistance then channel:Set3DFadeDistance(350, 1500) end
             if channel.SetPos and IsValid(state.sourceEnt) then channel:SetPos(state.sourceEnt:GetPos()) end
+            local seek = math.max(0, -offset) + math.max(0, CurTime() - audibleStart)
             if seek > 0 and channel.SetTime then channel:SetTime(seek) end
             if channel.SetVolume then channel:SetVolume(volume) end
             if not state.paused then channel:Play() end
@@ -1642,35 +1686,46 @@ end)
 
 hook.Add("CalcView", "MMDVMDNPCSelfThirdPerson", function(ply, pos, angles, fov)
     if not MMDVMDNPC.SelfThirdPersonActive then return end
-    local cameraEnt = MMDVMDNPC.SelfPlaybackCameraEnt
-    local state = IsValid(cameraEnt) and (MMDVMDNPC.LocalPlaybacks or {})[cameraEnt] or nil
+    
+    local target = MMDVMDNPC.SelfPlaybackCameraEnt
+    if not IsValid(target) then 
+        MMDVMDNPC.SelfThirdPersonActive = false
+        return 
+    end
 
-    local height = GetConVar("mmd_vmd_npc_thirdperson_height")
-    local distance = tonumber(MMDVMDNPC.SelfCameraDistance) or default_self_camera_distance()
-    height = height and height:GetFloat() or MMDVMDNPC.DefaultThirdPersonHeight or 24
+    local heightSlider = GetConVar("mmd_vmd_npc_thirdperson_height"):GetFloat() or 0
+    local distance = tonumber(MMDVMDNPC.SelfCameraDistance) or 120
+    local dynamicHeight = MMDVMDNPC.SelfCameraHeightOffset or 0
 
-    local target = IsValid(MMDVMDNPC.SelfPlaybackCameraEnt) and MMDVMDNPC.SelfPlaybackCameraEnt
-        or (state and IsValid(state.ent) and state.ent)
-        or ply
-    local yaw = tonumber(MMDVMDNPC.SelfCameraYaw) or angles.y
+    local center
+    if MMDVMDNPC.CameraTrackMode then
+        local pelvisBone = target:LookupBone("ValveBiped.Bip01_Pelvis") or target:LookupBone("Pelvis") or 0
+        local bonePos, _ = target:GetBonePosition(pelvisBone)
+        center = bonePos or target:WorldSpaceCenter()
+    else
+        center = MMDVMDNPC.StaticCameraCenter or target:WorldSpaceCenter()
+    end
+    
+    center = center + Vector(0, 0, heightSlider + dynamicHeight)
+
+    local yaw = tonumber(MMDVMDNPC.SelfCameraYaw) or 0
     local pitch = tonumber(MMDVMDNPC.SelfCameraPitch) or 10
     local orbit = Angle(pitch, yaw, 0)
-    local origin = MMDVMDNPC.SelfCameraBaseCenter or entity_camera_center(target)
-    origin = origin + clamp_self_camera_offset(MMDVMDNPC.SelfCameraCenterOffset)
-    origin = origin + Vector(0, 0, height)
-    local desired = origin - orbit:Forward() * distance
+    local desiredPos = center - orbit:Forward() * distance
+
     local tr = util.TraceHull({
-        start = origin,
-        endpos = desired,
+        start = center,
+        endpos = desiredPos,
         mins = Vector(-4, -4, -4),
         maxs = Vector(4, 4, 4),
         filter = { ply, target },
     })
+
     MMDVMDNPC.EyeTrackCameraOrigin = tr.HitPos
 
     return {
         origin = tr.HitPos,
-        angles = (origin - tr.HitPos):Angle(),
+        angles = (center - tr.HitPos):Angle(),
         fov = fov,
         drawviewer = false,
     }
@@ -1679,7 +1734,7 @@ end)
 hook.Add("InputMouseApply", "MMDVMDNPCSelfProxyCameraOrbit", function(cmd, x, y, ang)
     if not MMDVMDNPC.SelfThirdPersonActive then return end
 
-    local scale = 0.03
+    local scale = 0.005
     local sensitivity = GetConVar("sensitivity")
     if sensitivity then scale = scale * math.Clamp(sensitivity:GetFloat(), 0.1, 12) end
 
@@ -1691,37 +1746,34 @@ end)
 hook.Add("CreateMove", "MMDVMDNPCSelfProxyCameraPan", function(cmd)
     if not MMDVMDNPC.SelfThirdPersonActive or not cmd then return end
 
-    local move = Vector(0, 0, 0)
-    if cmd:KeyDown(IN_FORWARD) then move.x = move.x + 1 end
-    if cmd:KeyDown(IN_BACK) then move.x = move.x - 1 end
-    if cmd:KeyDown(IN_MOVERIGHT) then move.y = move.y + 1 end
-    if cmd:KeyDown(IN_MOVELEFT) then move.y = move.y - 1 end
-    if move:LengthSqr() <= 0 then return end
+    local speed = 60 
+    local frameTime = RealFrameTime()
+    
+    MMDVMDNPC.SelfCameraHeightOffset = MMDVMDNPC.SelfCameraHeightOffset or 0
 
-    local yaw = tonumber(MMDVMDNPC.SelfCameraYaw) or 0
-    local flat = Angle(0, yaw, 0)
-    local delta = flat:Forward() * move.x + flat:Right() * move.y
-    if delta:LengthSqr() <= 0 then return true end
+    if cmd:KeyDown(IN_FORWARD) then 
+        MMDVMDNPC.SelfCameraHeightOffset = MMDVMDNPC.SelfCameraHeightOffset + speed * frameTime
+    end
+    if cmd:KeyDown(IN_BACK) then 
+        MMDVMDNPC.SelfCameraHeightOffset = MMDVMDNPC.SelfCameraHeightOffset - speed * frameTime
+    end
 
-    delta:Normalize()
-    local frameTime = RealFrameTime and RealFrameTime() or FrameTime()
-    local speed = 100
-    MMDVMDNPC.SelfCameraCenterOffset = clamp_self_camera_offset((MMDVMDNPC.SelfCameraCenterOffset or Vector(0, 0, 0)) + delta * speed * frameTime)
+    MMDVMDNPC.SelfCameraHeightOffset = math.Clamp(MMDVMDNPC.SelfCameraHeightOffset, -50, 100)
 
-    return true
+    return true 
 end)
 
 hook.Add("PlayerBindPress", "MMDVMDNPCSelfProxyCameraWheel", function(ply, bind, pressed)
     if ply ~= LocalPlayer() or not pressed or not MMDVMDNPC.SelfThirdPersonActive then return end
 
     bind = string.lower(tostring(bind or ""))
-    local distance = tonumber(MMDVMDNPC.SelfCameraDistance) or default_self_camera_distance()
+    local distance = tonumber(MMDVMDNPC.SelfCameraDistance) or 120
 
-    if string.find(bind, "invprev", 1, true) then
-        MMDVMDNPC.SelfCameraDistance = math.Clamp(distance - 12, 30, 420)
+    if string.find(bind, "invprev", 1, true) then  
+        MMDVMDNPC.SelfCameraDistance = math.Clamp(distance - 10, 20, 500)
         return true
-    elseif string.find(bind, "invnext", 1, true) then
-        MMDVMDNPC.SelfCameraDistance = math.Clamp(distance + 12, 30, 420)
+    elseif string.find(bind, "invnext", 1, true) then  
+        MMDVMDNPC.SelfCameraDistance = math.Clamp(distance + 10, 20, 500)
         return true
     end
 end)
@@ -2326,6 +2378,17 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
         frame.DisableArmTwist:SetValue(convar_bool("mmd_vmd_npc_disable_armtwist", false) and 1 or 0)
         frame.DisableArmTwist:SizeToContents()
         frame.DisableArmTwist.OnChange = function()
+            MMDVMDNPC.OpenDebugMenu(frame.MotionID, frame.ActiveFrame or frame.RequestedFrame or 0)
+        end
+
+        frame.DisableHandTwist = vgui.Create("DCheckBoxLabel", options)
+        frame.DisableHandTwist:Dock(LEFT)
+        frame.DisableHandTwist:SetWide(260)
+        frame.DisableHandTwist:SetText(L("mmd_vmd_npc.ui.disable_handtwist"))
+        frame.DisableHandTwist:SetConVar("mmd_vmd_npc_disable_handtwist")
+        frame.DisableHandTwist:SetValue(convar_bool("mmd_vmd_npc_disable_handtwist", false) and 1 or 0)
+        frame.DisableHandTwist:SizeToContents()
+        frame.DisableHandTwist.OnChange = function()
             MMDVMDNPC.OpenDebugMenu(frame.MotionID, frame.ActiveFrame or frame.RequestedFrame or 0)
         end
 
@@ -3000,6 +3063,8 @@ net.Receive("mmdvmd_play_status", function()
         if force_self_view_cleanup then
             force_self_view_cleanup()
         end
+    elseif status == "missing_build" then
+        chat.AddText(Color(255, 200, 0), "[MMD VMD] ", Color(255, 255, 255), tostring(message))
     end
 end)
 
@@ -3135,6 +3200,7 @@ end)
 
 hook.Add("PreDrawHalos", "MMDVMDNPCAssignedActorHalos", function()
     if not halo or not halo.Add then return end
+    if GetConVar("mmd_vmd_npc_show_halos"):GetInt() == 0 then return end 
     local assignments = MMDVMDNPC.AssignedActors or {}
     local first = {}
     local selected = {}
@@ -3443,6 +3509,51 @@ local function open_motion_browser()
         end
     end
 
+    local star = vgui.Create("DButton", controls)
+    star:Dock(LEFT)
+    style_manager_button(star, 150)  
+    star:SetText("⭐ +FAV")
+     
+    
+    star.DoClick = function()
+        if selectedMotion and selectedMotion ~= "" then
+            local isAdded = MMDVMDNPC.ToggleFavorite(selectedMotion)
+            
+            if isAdded then
+                surface.PlaySound("garrysmod/content_downloaded.wav")  
+                notification.AddLegacy("Added to wheel!", NOTIFY_GENERIC, 3)
+            else
+                surface.PlaySound("buttons/button15.wav")  
+                notification.AddLegacy("Removed from wheel", NOTIFY_CLEANUP, 3)
+            end
+        else
+            notification.AddLegacy("First choice motion from the list!", NOTIFY_ERROR, 3)
+        end
+    end
+
+    local rename = vgui.Create("DButton", controls)
+    rename:Dock(LEFT)
+    style_manager_button(rename, 110)
+    rename:SetText("RENAME")
+    -- rename:SetTextColor(Color(100, 255, 100))
+    rename.DoClick = function()
+        if selectedMotion and selectedMotion ~= "" then
+            Derma_StringRequest(
+                "Rename",
+                "Name for: " .. selectedMotion,
+                MMDVMDNPC.GetNiceName(selectedMotion), 
+                function(text)
+                    if text and text ~= "" then
+                        MMDVMDNPC.CustomNames[selectedMotion] = text
+                        MMDVMDNPC.SaveCustomNames()
+                        notification.AddLegacy("Saved!", NOTIFY_GENERIC, 3)
+                        if IsValid(list) then populate() end
+                    end
+                end
+            )
+        end
+    end
+
     local stop = vgui.Create("DButton", controls)
     stop:Dock(LEFT)
     style_manager_button(stop, 120)
@@ -3547,3 +3658,51 @@ concommand.Add("mmdvmd_debug", function(_, _, args)
     end
     MMDVMDNPC.OpenDebugMenu(motionID, args and args[2] or DEBUG_REFERENCE_FRAME)
 end)
+
+hook.Add("PlayerBindPress", "MMD_SpaceToStopAnimation", function(ply, bind, pressed)
+    if not pressed then return end
+
+    if string.find(bind, "+jump") then
+        if ply:GetNWBool("MMDVMDNPCSelfProxy", false) or MMDVMDNPC.SelfThirdPersonActive then
+            
+            MMDVMDNPC.RequestForceSelfPlaybackReset()
+            
+            return true 
+        end
+    end
+end)
+
+-- Create DB
+MMDVMDNPC.CustomNames = MMDVMDNPC.CustomNames or {}
+local NAMES_FILE = "mmdvmd_custom_names.json"
+
+function MMDVMDNPC.LoadCustomNames()
+    local raw = file.Read(NAMES_FILE, "DATA")
+    if raw then MMDVMDNPC.CustomNames = util.JSONToTable(raw) or {} end
+end
+
+function MMDVMDNPC.SaveCustomNames()
+    file.Write(NAMES_FILE, util.TableToJSON(MMDVMDNPC.CustomNames))
+end
+
+function MMDVMDNPC.GetNiceName(id)
+    id = tostring(id or "")
+    if id == "stop_playback" then return "STOP" end
+    if id == "toggle_cam_mode" then 
+        return MMDVMDNPC.CameraTrackMode and "CAMERA: FOLLOW" or "CAMERA: STATIC"
+    end
+    if id == "stop_playback" then return "STOP" end
+    if MMDVMDNPC.CustomNames[id] then return MMDVMDNPC.CustomNames[id] end
+    local meta = MMDVMDNPC.MotionDetails and MMDVMDNPC.MotionDetails[id]
+    if meta and meta.displayName and meta.displayName ~= "" then return meta.displayName end
+    return id
+end
+
+ 
+function motion_display_name(metaOrID)
+    local id = istable(metaOrID) and metaOrID.id or tostring(metaOrID or "")
+    return MMDVMDNPC.GetNiceName(id)
+end
+
+ 
+MMDVMDNPC.LoadCustomNames()

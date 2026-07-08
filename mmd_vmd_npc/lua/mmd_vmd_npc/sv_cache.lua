@@ -108,6 +108,35 @@ local function normalize_flex_name(name)
     return name
 end
 
+local function exact_flex_on_entity(ent, flexName)
+    if not IsValid(ent) or not ent.GetFlexNum or not ent.GetFlexName then return nil, nil end
+
+    flexName = tostring(flexName or "")
+    if flexName == "" then return nil, nil end
+
+    local maxFlex = ent:GetFlexNum() or 0
+    for flexID = 0, maxFlex - 1 do
+        local current = tostring(ent:GetFlexName(flexID) or "")
+        if current == flexName then
+            return flexID, current
+        end
+    end
+
+    local wantedLower = string.lower(flexName)
+    for flexID = 0, maxFlex - 1 do
+        local current = tostring(ent:GetFlexName(flexID) or "")
+        if string.lower(current) == wantedLower then
+            return flexID, current
+        end
+    end
+
+    return nil, nil
+end
+
+function MMDVMDNPC.FindExactFlexOnEntity(ent, flexName)
+    return exact_flex_on_entity(ent, flexName)
+end
+
 local function flex_override_model_key(modelPath)
     modelPath = string.lower(tostring(modelPath or ""))
     modelPath = string.gsub(modelPath, "\\", "/")
@@ -264,7 +293,7 @@ function MMDVMDNPC.LoadFlexAliases()
 end
 
 function MMDVMDNPC.ResolveFlexID(ent, sourceName, mmdName)
-    if not IsValid(ent) or not ent.GetFlexIDByName then return -1, "" end
+    if not IsValid(ent) then return -1, "" end
 
     local candidates = {}
     local seen = {}
@@ -294,9 +323,19 @@ function MMDVMDNPC.ResolveFlexID(ent, sourceName, mmdName)
     end
 
     for _, name in ipairs(candidates) do
-        local flexID = ent:GetFlexIDByName(name)
-        if flexID and flexID >= 0 then
-            return flexID, name
+        local exactID, exactName = exact_flex_on_entity(ent, name)
+        if exactID and exactID >= 0 then
+            return exactID, exactName or name
+        end
+    end
+
+    if ent.GetFlexIDByName then
+        for _, name in ipairs(candidates) do
+            local flexID = ent:GetFlexIDByName(name)
+            if flexID and flexID >= 0 then
+                local actualName = ent.GetFlexName and ent:GetFlexName(flexID) or nil
+                return flexID, actualName or name
+            end
         end
     end
 

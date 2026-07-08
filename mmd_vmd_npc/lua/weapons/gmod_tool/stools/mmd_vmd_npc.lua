@@ -96,7 +96,9 @@ end
 
 TOOL.ClientConVar = {
     motion = "",
+    show_halos = "1",
     disable_armtwist = "0",
+    disable_handtwist = "0",
     disable_eyes = "0",
     disable_spine_pelvis_correction = "0",
     start_delay = "2",
@@ -110,6 +112,7 @@ TOOL.ClientConVar = {
     eye_track_pos_lr = "0.5",
     music_enabled = "1",
     music_volume = "1",
+    loop_playback = "0",
     build_frames_per_batch = "16",
     playback_hz = "120",
 }
@@ -297,8 +300,33 @@ function TOOL.BuildCPanel(panel)
     panel:ClearControls()
     panel:Help(L("mmd_vmd_npc.ui.tool_help"))
 
+    local screenW = ScrW and ScrW() or 1280
+    local screenH = ScrH and ScrH() or 720
+    local compactPanel = screenW <= 1366 or screenH <= 760
+    local textLimit = compactPanel and 38 or 64
+    local pathLimit = compactPanel and 42 or 78
+
+    local function shorten_text(value, limit)
+        local text = tostring(value or "")
+        limit = math.max(12, tonumber(limit) or textLimit)
+        if #text <= limit then return text end
+
+        local head = math.max(4, math.floor((limit - 3) * 0.58))
+        local tail = math.max(4, limit - 3 - head)
+        return string.sub(text, 1, head) .. "..." .. string.sub(text, -tail)
+    end
+
+    local function bounded_label(label, font, color, height)
+        label:SetFont(font or "DermaDefault")
+        if color then label:SetTextColor(color) end
+        label:SetWrap(true)
+        label:SetAutoStretchVertical(false)
+        label:SetTall(height or (compactPanel and 42 or 52))
+        return label
+    end
+
     local container = vgui.Create("DPanel", panel)
-    container:SetTall(math.max((ScrH and ScrH() or 720) * 1.15, 820))
+    container:SetTall(compactPanel and math.max(screenH * 1.05, 700) or math.max(screenH * 1.15, 820))
     container.Paint = nil
     panel:AddItem(container)
 
@@ -366,10 +394,12 @@ function TOOL.BuildCPanel(panel)
     local audioOffsetSuppress = false
     local selectedMotionLabel = vgui.Create("DLabel")
     selectedMotionLabel:SetText(L("mmd_vmd_npc.ui.selected_motion_none"))
-    selectedMotionLabel:SetFont("DermaLarge")
-    selectedMotionLabel:SetTextColor(Color(105, 205, 255))
-    selectedMotionLabel:SetWrap(true)
-    selectedMotionLabel:SetAutoStretchVertical(true)
+    bounded_label(
+        selectedMotionLabel,
+        compactPanel and "DermaDefaultBold" or "DermaLarge",
+        Color(105, 205, 255),
+        compactPanel and 34 or 54
+    )
     motionTab:AddItem(selectedMotionLabel)
 
     local pauseWarningLabel = vgui.Create("DLabel")
@@ -417,6 +447,7 @@ function TOOL.BuildCPanel(panel)
 
     add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.play_imported_music"), "mmd_vmd_npc_music_enabled", L("mmd_vmd_npc.ui.play_imported_music_help"))
     add_slider(motionTab, L("mmd_vmd_npc.ui.music_volume"), "mmd_vmd_npc_music_volume", 0, 2, 2)
+    add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.loop_playback"), "mmd_vmd_npc_loop_playback", L("mmd_vmd_npc.ui.loop_playback_help"))
 
     local motionList = vgui.Create("DListView")
     motionList:SetTall(145)
@@ -540,23 +571,21 @@ function TOOL.BuildCPanel(panel)
     end)
 
     motionInfo:SetText(L("mmd_vmd_npc.ui.motion_no_metadata"))
-    motionInfo:SetWrap(true)
-    motionInfo:SetAutoStretchVertical(true)
+    bounded_label(motionInfo, "DermaDefault", Color(210, 220, 230), compactPanel and 40 or 52)
     motionTab:AddItem(motionInfo)
 
     section(motionTab, L("mmd_vmd_npc.ui.target"), Color(80, 220, 140))
     targetLabel:SetText(L("mmd_vmd_npc.ui.selected_actor_none"))
-    targetLabel:SetFont("DermaLarge")
-    targetLabel:SetTextColor(Color(100, 235, 150))
-    targetLabel:SetWrap(true)
-    targetLabel:SetAutoStretchVertical(true)
+    bounded_label(
+        targetLabel,
+        compactPanel and "DermaDefaultBold" or "DermaLarge",
+        Color(100, 235, 150),
+        compactPanel and 48 or 64
+    )
     motionTab:AddItem(targetLabel)
 
     assignmentLabel:SetText(L("mmd_vmd_npc.ui.coordinated_npcs_zero"))
-    assignmentLabel:SetFont("DermaDefaultBold")
-    assignmentLabel:SetTextColor(Color(120, 205, 255))
-    assignmentLabel:SetWrap(true)
-    assignmentLabel:SetAutoStretchVertical(true)
+    bounded_label(assignmentLabel, "DermaDefaultBold", Color(120, 205, 255), compactPanel and 34 or 44)
     motionTab:AddItem(assignmentLabel)
 
     colored_button(motionTab, L("mmd_vmd_npc.ui.play_selected_group"), Color(80, 155, 230), function()
@@ -672,7 +701,12 @@ function TOOL.BuildCPanel(panel)
     add_slider(performanceTab, L("mmd_vmd_npc.ui.playback_updates_per_second"), "mmd_vmd_npc_playback_hz", 10, 480, 0)
 
     section(advancedTab, L("mmd_vmd_npc.ui.tab.advanced"), Color(180, 180, 180))
+
+    advancedTab:CheckBox("Q: Show halos", "mmd_vmd_npc_show_halos") -- ADDED
+    -- advancedTab:CheckBox("Q: Transfer PAC", "mmd_vmd_npc_transfer_pac") -- ADDED
+
     advancedTab:CheckBox(L("mmd_vmd_npc.ui.disable_armtwist"), "mmd_vmd_npc_disable_armtwist")
+    advancedTab:CheckBox(L("mmd_vmd_npc.ui.disable_handtwist"), "mmd_vmd_npc_disable_handtwist")
     advancedTab:CheckBox(L("mmd_vmd_npc.ui.disable_eyes"), "mmd_vmd_npc_disable_eyes")
     advancedTab:CheckBox(L("mmd_vmd_npc.ui.disable_spine_pelvis"), "mmd_vmd_npc_disable_spine_pelvis_correction")
 
@@ -702,7 +736,12 @@ function TOOL.BuildCPanel(panel)
         if not IsValid(targetLabel) then return end
         status = status or MMDVMDNPC.TargetStatus or {}
         if status.valid and IsValid(status.ent) then
-            targetLabel:SetText(LF("mmd_vmd_npc.ui.selected_actor_fmt", tostring(status.targetType or "actor"), tostring(status.ent), tostring(status.model or "")))
+            targetLabel:SetText(LF(
+                "mmd_vmd_npc.ui.selected_actor_fmt",
+                shorten_text(status.targetType or "actor", 18),
+                shorten_text(status.ent, compactPanel and 22 or 34),
+                shorten_text(status.model or "", pathLimit)
+            ))
         else
             targetLabel:SetText(L("mmd_vmd_npc.ui.selected_actor_none"))
         end
@@ -740,9 +779,9 @@ function TOOL.BuildCPanel(panel)
         assignmentLabel:SetText(LF(
             "mmd_vmd_npc.ui.coordinated_npcs_fmt",
             count,
-            IsValid(firstEnt) and tostring(firstEnt) or "none",
-            tostring(first and first.motionID or ""),
-            tostring(first and first.status or "")
+            IsValid(firstEnt) and shorten_text(firstEnt, compactPanel and 18 or 28) or "none",
+            shorten_text(first and first.motionID or "", compactPanel and 20 or 34),
+            shorten_text(first and first.status or "", compactPanel and 18 or 28)
         ))
     end
 
@@ -752,7 +791,7 @@ function TOOL.BuildCPanel(panel)
         local motionID = current and current:GetString() or ""
         local meta = MMDVMDNPC.MotionDetails and MMDVMDNPC.MotionDetails[motionID] or nil
         if IsValid(selectedMotionLabel) then
-            selectedMotionLabel:SetText(motionID ~= "" and LF("mmd_vmd_npc.ui.selected_motion_fmt", motion_display_name(meta or motionID)) or L("mmd_vmd_npc.ui.selected_motion_none"))
+            selectedMotionLabel:SetText(motionID ~= "" and LF("mmd_vmd_npc.ui.selected_motion_fmt", shorten_text(motion_display_name(meta or motionID), textLimit)) or L("mmd_vmd_npc.ui.selected_motion_none"))
         end
         if IsValid(audioOffsetSlider) then
             audioOffsetSuppress = true
@@ -762,7 +801,7 @@ function TOOL.BuildCPanel(panel)
         if meta then
             motionInfo:SetText(LF(
                 "mmd_vmd_npc.ui.motion_info_fmt",
-                motion_display_name(meta),
+                shorten_text(motion_display_name(meta), textLimit),
                 tonumber(meta.duration) or 0,
                 tonumber(meta.frameCount) or 0,
                 tonumber(meta.boneCount) or 0,
@@ -771,7 +810,7 @@ function TOOL.BuildCPanel(panel)
                 meta.built and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no")
             ))
         else
-            motionInfo:SetText(motionID ~= "" and LF("mmd_vmd_npc.ui.motion_metadata_missing_fmt", motionID) or L("mmd_vmd_npc.ui.motion_none"))
+            motionInfo:SetText(motionID ~= "" and LF("mmd_vmd_npc.ui.motion_metadata_missing_fmt", shorten_text(motionID, textLimit)) or L("mmd_vmd_npc.ui.motion_none"))
         end
     end
 

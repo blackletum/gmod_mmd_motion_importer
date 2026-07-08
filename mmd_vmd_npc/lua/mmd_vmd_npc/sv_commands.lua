@@ -1,4 +1,5 @@
 MMDVMDNPC = MMDVMDNPC or {}
+
 MMDVMDNPC.DebugTargets = MMDVMDNPC.DebugTargets or {}
 MMDVMDNPC.AssignedActors = MMDVMDNPC.AssignedActors or {}
 MMDVMDNPC.BuildJobs = MMDVMDNPC.BuildJobs or {}
@@ -12,6 +13,9 @@ MMDVMDNPC.EyeTrackCameraTargets = MMDVMDNPC.EyeTrackCameraTargets or {}
 MMDVMDNPC.CVarSuppressions = MMDVMDNPC.CVarSuppressions or {}
 MMDVMDNPC.RPEBodySuppressionToken = MMDVMDNPC.RPEBodySuppressionToken or nil
 MMDVMDNPC.AudioOffsets = MMDVMDNPC.AudioOffsets or nil
+
+MMDVMDNPC.PendingBuildConfirm = MMDVMDNPC.PendingBuildConfirm or {}  
+MMDVMDNPC.PendingAutoPlay = MMDVMDNPC.PendingAutoPlay or {}          
 
 local ZERO_VECTOR = Vector(0, 0, 0)
 local ZERO_ANGLE = Angle(0, 0, 0)
@@ -41,6 +45,10 @@ local clear_all_bone_manipulations
 local clear_all_flex_weights
 local pose_selected_npc_reference
 local require_reference_sequence_for_actor
+
+
+local MAX_NET_MESSAGE_BYTES = 60000
+
 
 local EYE_BONE_LEFT_CANDIDATES = {
     "Eye_LD",
@@ -110,6 +118,27 @@ hook.Add("PlayerDisconnected", "MMDVMDNPCDebugTargetCleanup", function(ply)
     MMDVMDNPC.SelfPlaybackMovementLocks[ply] = nil
     MMDVMDNPC.EyeTrackCameraTargets[ply] = nil
     if update_rpe_body_suppression then update_rpe_body_suppression() end
+
+    MMDVMDNPC.PendingBuildConfirm[ply] = nil
+    MMDVMDNPC.PendingAutoPlay[ply] = nil
+end)
+
+hook.Add("PlayerSay", "MMDVMDNPC_MissingBuildConfirm", function(ply, text)
+    local pending = MMDVMDNPC.PendingBuildConfirm[ply]
+    if not pending then return end  
+
+    text = string.Trim(text or "")
+    if text == "1" then
+        MMDVMDNPC.PendingBuildConfirm[ply] = nil
+        MMDVMDNPC.PendingAutoPlay[ply] = { motionID = pending.motionID, settings = pending.settings }
+        MMDVMDNPC.Chat(ply, "Start build...")
+        MMDVMDNPC.BeginBuildForPlayer(ply, pending.motionID, pending.options, pending.settings)
+        return ""
+    elseif text == "2" then
+        MMDVMDNPC.PendingBuildConfirm[ply] = nil
+        MMDVMDNPC.Chat(ply, "Build cancelled.")
+        return ""
+    end
 end)
 
 hook.Add("PlayerDeath", "MMDVMDNPCSelfProxyDeathCleanup", function(ply)
@@ -205,6 +234,7 @@ local function playback_settings_from_values(startDelay, pelvisZOffset)
         eyeTrackPosLR = MMDVMDNPC.DefaultEyeTrackBonePosLR or EYE_TRACK_BONE_POS_LR,
         musicEnabled = MMDVMDNPC.DefaultMusicEnabled ~= false,
         musicVolume = MMDVMDNPC.DefaultMusicVolume or 1,
+        loopPlayback = MMDVMDNPC.DefaultLoopPlayback == true,
         buildFramesPerBatch = MMDVMDNPC.DefaultBuildFramesPerBatch or BUILD_FRAMES_PER_BATCH,
         playbackHz = MMDVMDNPC.DefaultPlaybackHz or PLAYBACK_HZ,
     }
@@ -224,12 +254,16 @@ local function setting_enabled(value, default)
     if value == nil then return default ~= false end
     if value == true then return true end
     if value == false then return false end
+    if isnumber and isnumber(value) then return value ~= 0 end
     local raw = string.lower(tostring(value))
-    if raw == "0" or raw == "false" or raw == "off" or raw == "no" then return false end
-    return true
+    raw = string.Trim and string.Trim(raw) or string.gsub(raw, "^%s*(.-)%s*$", "%1")
+    if raw == "" then return default ~= false end
+    if raw == "0" or raw == "false" or raw == "off" or raw == "no" or raw == "disabled" then return false end
+    if raw == "1" or raw == "true" or raw == "on" or raw == "yes" or raw == "enabled" then return true end
+    return default ~= false
 end
 
-local function playback_settings_with_eye_track(startDelay, pelvisZOffset, eyeTrackMode, eyeTrackSmooth, eyeTrackMoveBack, eyeTrackPosUD, eyeTrackPosLR, musicEnabled, musicVolume, buildFramesPerBatch, playbackHz)
+local function playback_settings_with_eye_track(startDelay, pelvisZOffset, eyeTrackMode, eyeTrackSmooth, eyeTrackMoveBack, eyeTrackPosUD, eyeTrackPosLR, musicEnabled, musicVolume, buildFramesPerBatch, playbackHz, loopPlayback)
     local settings = playback_settings_from_values(startDelay, pelvisZOffset)
     settings.eyeTrackMode = MMDVMDNPC.NormalizeEyeTrackMode(eyeTrackMode)
     settings.eyeTrackSmooth = math.Clamp(tonumber(eyeTrackSmooth) or settings.eyeTrackSmooth, 0.1, 120)
@@ -240,6 +274,7 @@ local function playback_settings_with_eye_track(startDelay, pelvisZOffset, eyeTr
     settings.musicVolume = math.Clamp(tonumber(musicVolume) or settings.musicVolume, 0, 2)
     settings.buildFramesPerBatch = clamp_build_frames_per_batch(buildFramesPerBatch)
     settings.playbackHz = clamp_playback_hz(playbackHz)
+    settings.loopPlayback = setting_enabled(loopPlayback, settings.loopPlayback)
     return settings
 end
 
@@ -336,18 +371,20 @@ clear_build_job = function(ply)
     MMDVMDNPC.BuildJobs[ply] = nil
 end
 
-local function normalize_options(disableArmTwist, disableEyes, disableSpinePelvisCorrection)
+local function normalize_options(disableArmTwist, disableHandTwist, disableEyes, disableSpinePelvisCorrection)
     return {
         disableArmTwist = disableArmTwist == true,
+        disableHandTwist = disableHandTwist == true,
         disableEyes = disableEyes == true,
         disableSpinePelvisCorrection = disableSpinePelvisCorrection == true,
     }
 end
 
 function MMDVMDNPC.ToolOptions(tool)
-    if not tool then return normalize_options(false, false, false) end
+    if not tool then return normalize_options(false, false, false, false) end
     return normalize_options(
         tonumber(tool:GetClientInfo("disable_armtwist") or 0) == 1,
+        tonumber(tool:GetClientInfo("disable_handtwist") or 0) == 1,
         tonumber(tool:GetClientInfo("disable_eyes") or 0) == 1,
         tonumber(tool:GetClientInfo("disable_spine_pelvis_correction") or 0) == 1
     )
@@ -366,7 +403,8 @@ function MMDVMDNPC.ToolPlaybackSettings(tool)
         tool:GetClientInfo("music_enabled"),
         tool:GetClientInfo("music_volume"),
         tool:GetClientInfo("build_frames_per_batch"),
-        tool:GetClientInfo("playback_hz")
+        tool:GetClientInfo("playback_hz"),
+        tool:GetClientInfo("loop_playback")
     )
 end
 
@@ -530,18 +568,35 @@ local function resolved_flex_name_on_entity(ent, flexName)
     flexName = tostring(flexName or "")
     if flexName == "" then return nil end
 
+    if MMDVMDNPC.FindExactFlexOnEntity then
+        local exactID, exactName = MMDVMDNPC.FindExactFlexOnEntity(ent, flexName)
+        if exactID and exactID >= 0 then
+            return exactName or flexName, exactID
+        end
+    end
+
+    if ent.GetFlexNum and ent.GetFlexName then
+        local maxFlex = ent:GetFlexNum() or 0
+        for flexID = 0, maxFlex - 1 do
+            local current = tostring(ent:GetFlexName(flexID) or "")
+            if current == flexName then
+                return current, flexID
+            end
+        end
+
+        local wantedLower = string.lower(flexName)
+        for flexID = 0, maxFlex - 1 do
+            local current = tostring(ent:GetFlexName(flexID) or "")
+            if string.lower(current) == wantedLower then
+                return current, flexID
+            end
+        end
+    end
+
     if ent.GetFlexIDByName then
         local directID = ent:GetFlexIDByName(flexName)
         if directID and directID >= 0 then
             return ent:GetFlexName(directID) or flexName, directID
-        end
-    end
-
-    local wanted = string.lower(flexName)
-    for flexID = 0, (ent:GetFlexNum() or 0) - 1 do
-        local current = ent:GetFlexName(flexID)
-        if tostring(current or "") == flexName or string.lower(tostring(current or "")) == wanted then
-            return current or flexName, flexID
         end
     end
 
@@ -689,12 +744,7 @@ local function send_motion_details(ply, options)
 end
 
 local function ai_disabled_enabled()
-    local convar = optional_convar("ai_disabled")
-    if not convar then return true end
-    if convar.GetInt and convar:GetInt() ~= 0 then return true end
-    if convar.GetBool and convar:GetBool() == true then return true end
-    local raw = string.lower(tostring(convar.GetString and convar:GetString() or ""))
-    return raw == "1" or raw == "true" or raw == "yes" or raw == "on"
+    return true;
 end
 
 local function ai_disabled_required_message()
@@ -1488,6 +1538,16 @@ end
 
 local start_next_queued_build
 
+local function safe_batch_count(job, requestedBatch)
+    local boneCount = #(job.motion.boneTracks or {})
+    local flexCount = #(job.motion.flexTracks or {})
+    local perFrameBytes = 4 + boneCount * 24 + flexCount * 4  
+    if perFrameBytes <= 0 then return requestedBatch end
+
+    local maxFrames = math.floor((MAX_NET_MESSAGE_BYTES - 64) / perFrameBytes)  
+    return math.max(1, math.min(requestedBatch, maxFrames))
+end
+
 local function send_build_frame_request(ply, job)
     if not IsValid(ply) or not job then return end
     if not ai_disabled_enabled() then
@@ -1504,6 +1564,7 @@ local function send_build_frame_request(ply, job)
     end
 
     local batchCount = math.min(clamp_build_frames_per_batch(job.buildFramesPerBatch), job.endFrame - job.currentFrame + 1)
+    batchCount = safe_batch_count(job, batchCount)
     if batchCount <= 0 then return end
     job.lastRequestedBuildFrames = batchCount
     send_build_progress(
@@ -1639,6 +1700,7 @@ local function finalize_build(ply, job)
         } or nil,
         options = {
             disable_armtwist = job.options.disableArmTwist == true,
+            disable_handtwist = job.options.disableHandTwist == true,
             disable_eyes = job.options.disableEyes == true,
             disable_spine_pelvis_correction = job.options.disableSpinePelvisCorrection == true,
         },
@@ -1655,6 +1717,11 @@ local function finalize_build(ply, job)
 
     send_build_done(ply, true, path, string.format("built %d frame(s)", #job.frames))
     send_play_status(ply, "built", path)
+    local pendingPlay = MMDVMDNPC.PendingAutoPlay[ply]
+    if pendingPlay and pendingPlay.motionID == job.motionID then
+        MMDVMDNPC.PendingAutoPlay[ply] = nil
+        MMDVMDNPC.StartPlaybackForPlayer(ply, job.motionID, job.options, pendingPlay.settings)
+    end
     if start_next_queued_build then start_next_queued_build(ply) end
 end
 
@@ -1666,7 +1733,7 @@ local function load_built_animation(motionID, ent, options)
     if cached then return cached, path end
 
     local raw = file.Read(path, "DATA")
-    if not raw then return nil, "build the animation for this actor model first" end
+    if not raw then return nil, "build the animation for this actor model first", "missing" end
 
     local parsed = util.JSONToTable(raw)
     if not istable(parsed) then return nil, "built animation JSON is invalid" end
@@ -1904,7 +1971,7 @@ function MMDVMDNPC.DeleteMotionForPlayer(ply, motionID)
     send_delete_motion_done(ply, deleted, id, message, removedBuilt, musicPath, musicRemoved)
     send_play_status(ply, deleted and "deleted_motion" or "error", message)
     send_motion_list(ply)
-    send_motion_details(ply, normalize_options(false, false, false))
+    send_motion_details(ply, normalize_options(false, false, false, false))
     return deleted, message
 end
 
@@ -1955,6 +2022,16 @@ local function send_audio_start(state)
         net.WriteFloat(tonumber(state.started) or CurTime())
         net.WriteFloat(math.Clamp(tonumber(state.musicVolume) or MMDVMDNPC.DefaultMusicVolume or 1, 0, 2))
     net.Send(filter)
+end
+
+local function restart_audio_for_loop(state)
+    if not state or state.musicEnabled == false then return end
+    if state.audioStarted then
+        send_audio_stop(state)
+    end
+    state.audioStarted = false
+    state.audioToken = math.random(1, 2147483647)
+    send_audio_start(state)
 end
 
 local function apply_built_sample(ent, frameA, frameB, fraction, pelvisZOffset)
@@ -2148,12 +2225,24 @@ local function start_playback_on_entity(ply, ent, motionID, options, playbackSet
         return fail_ai_disabled_required(ply, false)
     end
 
-    local built, pathOrErr = preparedBuilt, preparedPath
+    local built, pathOrErr, errCode = preparedBuilt, preparedPath, nil
     if not built then
-        built, pathOrErr = load_built_animation(motionID, ent, options)
+        built, pathOrErr, errCode = load_built_animation(motionID, ent, options)
     end
     if not built then
-        send_play_status(ply, "error", pathOrErr)
+        if errCode == "missing" then
+            MMDVMDNPC.PendingBuildConfirm[ply] = {
+                motionID = motionID,
+                options = options,
+                settings = playbackSettings,
+            }
+            send_play_status(ply, "missing_build",
+                pathOrErr .. build_missing_instruction() ..
+                "1 — build + play, 2 — cancel.")
+        else
+            send_play_status(ply, "error", pathOrErr)
+            local pendingPlay = MMDVMDNPC.PendingAutoPlay[ply]
+        end
         return false, pathOrErr
     end
 
@@ -2203,6 +2292,7 @@ local function start_playback_on_entity(ply, ent, motionID, options, playbackSet
         audioToken = math.random(1, 2147483647),
         musicEnabled = playbackSettings.musicEnabled ~= false and suppressMusic ~= true,
         musicVolume = playbackSettings.musicVolume,
+        loopPlayback = playbackSettings.loopPlayback == true,
         playbackHz = clamp_playback_hz(playbackSettings.playbackHz),
         eyeTrackMode = MMDVMDNPC.NormalizeEyeTrackMode(playbackSettings.eyeTrackMode),
         eyeTrackSmooth = playbackSettings.eyeTrackSmooth,
@@ -2235,6 +2325,7 @@ local function copy_playback_settings(settings)
         eyeTrackPosLR = settings.eyeTrackPosLR,
         musicEnabled = settings.musicEnabled,
         musicVolume = settings.musicVolume,
+        loopPlayback = settings.loopPlayback == true,
         buildFramesPerBatch = settings.buildFramesPerBatch,
         playbackHz = settings.playbackHz,
     }
@@ -2311,6 +2402,7 @@ function MMDVMDNPC.StartAssignedGroupPlaybackForPlayer(ply, playbackSettings)
     for index, item in ipairs(prepared) do
         local settings = copy_playback_settings(item.assignment.playbackSettings)
         settings.startDelay = delay
+        settings.loopPlayback = playbackSettings.loopPlayback == true
         local suppressMusic = index ~= 1
 
         local ok = start_playback_on_entity(
@@ -2625,6 +2717,17 @@ local function update_playback_state(ent, state, now)
     local sourceFPS = math.max(1, tonumber(built.fps) or MMDVMDNPC.VMDFPS or 30)
     local sourceFrame = startFrame + (now - (state.started or now)) * sourceFPS
     local finished = sourceFrame >= endFrame
+    if finished and state.loopPlayback == true then
+        local duration = math.max(0, (endFrame - startFrame) / sourceFPS)
+        if duration > 0 then
+            local elapsed = math.max(0, now - (tonumber(state.started) or now))
+            local loops = math.max(1, math.floor(elapsed / duration))
+            state.started = (tonumber(state.started) or now) + loops * duration
+            sourceFrame = startFrame + (now - (state.started or now)) * sourceFPS
+            finished = false
+            restart_audio_for_loop(state)
+        end
+    end
     sourceFrame = math.Clamp(sourceFrame, startFrame, endFrame)
 
     local lowerFrame = math.floor(sourceFrame)
@@ -2639,21 +2742,13 @@ local function update_playback_state(ent, state, now)
     apply_runtime_eye_tracking(ent, state, now)
 
     if finished then
-        MMDVMDNPC.Playbacks[ent] = nil
-        if update_rpe_body_suppression then update_rpe_body_suppression() end
-        send_audio_stop(state)
-        if state.cvarSuppression then
-            end_scoped_cvar_suppression(state.cvarSuppression)
-            state.cvarSuppression = nil
-        end
-        reset_runtime_eye_tracking(ent, state.eyeTrack)
-        if state.selfProxy then
-            cleanup_self_proxy_state(state)
+         
+        if state.selfProxy and IsValid(state.realPlayer) then
+             
+            MMDVMDNPC.ForceResetSelfPlaybackForPlayer(state.realPlayer)
         else
-            freeze_player_target(ent, false)
-        end
-        if IsValid(state.ply) then
-            send_play_status(state.ply, "finished", "playback finished", ent)
+             
+            MMDVMDNPC.StopPlayback(ent, true)
         end
     end
 end
@@ -2750,7 +2845,7 @@ net.Receive("mmdvmd_list_request", function(_, ply)
 end)
 
 net.Receive("mmdvmd_motion_details_request", function(_, ply)
-    local options = normalize_options(net.ReadBool(), net.ReadBool(), net.ReadBool())
+    local options = normalize_options(net.ReadBool(), net.ReadBool(), net.ReadBool(), net.ReadBool())
     send_motion_details(ply, options)
 end)
 
@@ -3070,7 +3165,7 @@ start_next_queued_build = function(ply)
 end
 
 function MMDVMDNPC.BeginBuildForPlayer(ply, motionID, options, playbackSettings)
-    options = normalize_options(options and options.disableArmTwist, options and options.disableEyes, options and options.disableSpinePelvisCorrection)
+    options = normalize_options(options and options.disableArmTwist, options and options.disableHandTwist, options and options.disableEyes, options and options.disableSpinePelvisCorrection)
     playbackSettings = playbackSettings or playback_settings_from_values(nil, nil)
     local ent = MMDVMDNPC.DebugTargets[ply]
     if not is_usable_npc(ent) then
@@ -3226,7 +3321,7 @@ function MMDVMDNPC.AssignActorForPlayer(ply, ent, motionID, options, playbackSet
         return false, message
     end
 
-    options = normalize_options(options and options.disableArmTwist, options and options.disableEyes, options and options.disableSpinePelvisCorrection)
+    options = normalize_options(options and options.disableArmTwist, options and options.disableHandTwist, options and options.disableEyes, options and options.disableSpinePelvisCorrection)
     playbackSettings = playbackSettings or playback_settings_from_values(nil, nil)
     local path = MMDVMDNPC.BuiltPath(id, ent:GetModel() or "", options)
     if not path then
@@ -3264,8 +3359,8 @@ end
 
 net.Receive("mmdvmd_build_begin", function(_, ply)
     local motionID = net.ReadString()
-    local options = normalize_options(net.ReadBool(), net.ReadBool(), net.ReadBool())
-    local settings = playback_settings_with_eye_track(net.ReadFloat(), net.ReadFloat(), net.ReadString(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat())
+    local options = normalize_options(net.ReadBool(), net.ReadBool(), net.ReadBool(), net.ReadBool())
+    local settings = playback_settings_with_eye_track(net.ReadFloat(), net.ReadFloat(), net.ReadString(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool())
     MMDVMDNPC.BeginBuildForPlayer(ply, motionID, options, settings)
 end)
 
@@ -3343,14 +3438,14 @@ end)
 
 net.Receive("mmdvmd_play_request", function(_, ply)
     local motionID = net.ReadString()
-    local options = normalize_options(net.ReadBool(), net.ReadBool(), net.ReadBool())
-    local settings = playback_settings_with_eye_track(net.ReadFloat(), net.ReadFloat(), net.ReadString(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat())
+    local options = normalize_options(net.ReadBool(), net.ReadBool(), net.ReadBool(), net.ReadBool())
+    local settings = playback_settings_with_eye_track(net.ReadFloat(), net.ReadFloat(), net.ReadString(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool())
     local ok, err = MMDVMDNPC.StartPlaybackForPlayer(ply, motionID, options, settings)
     if not ok and err then MMDVMDNPC.Chat(ply, err) end
 end)
 
 net.Receive("mmdvmd_assignment_play_request", function(_, ply)
-    local settings = playback_settings_with_eye_track(net.ReadFloat(), net.ReadFloat(), net.ReadString(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat())
+    local settings = playback_settings_with_eye_track(net.ReadFloat(), net.ReadFloat(), net.ReadString(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool())
     local ok, err = MMDVMDNPC.StartAssignedGroupPlaybackForPlayer(ply, settings)
     if not ok and err then MMDVMDNPC.Chat(ply, err) end
 end)
@@ -3460,7 +3555,7 @@ concommand.Add("mmdvmd_play", function(ply, _, args)
     end
 
     if IsValid(ply) then
-        MMDVMDNPC.StartPlaybackForPlayer(ply, motionID, normalize_options(false, false, false))
+        MMDVMDNPC.StartPlaybackForPlayer(ply, motionID, normalize_options(false, false, false, false))
     else
         print("[MMD VMD] mmdvmd_play must be run by a player with a selected actor.")
     end
