@@ -123,6 +123,8 @@ class PreviewScene:
     fps: int
     flex_count: int
     warnings: list[str] = field(default_factory=list)
+    camera_vmd_path: Path | None = None
+    camera_frames: list[import_vmd.CameraFrame] = field(default_factory=list)
 
 
 class PreviewPMXReader(import_vmd.PMXReader):
@@ -522,6 +524,7 @@ def load_preview_scene(
     body_vmd_path: Path,
     flex_vmd_paths: list[Path] | None = None,
     music_path: Path | None = None,
+    camera_vmd_path: Path | None = None,
 ) -> PreviewScene:
     if not model_path.exists():
         raise FileNotFoundError(model_path)
@@ -530,6 +533,18 @@ def load_preview_scene(
 
     warnings: list[str] = []
     motion = import_vmd.parse_vmd(body_vmd_path)
+
+    camera_frames: list[import_vmd.CameraFrame] = []
+    if camera_vmd_path:
+        if not camera_vmd_path.exists():
+            warnings.append(f"Camera VMD not found: {camera_vmd_path}")
+        else:
+            try:
+                camera_frames = import_vmd.parse_vmd(camera_vmd_path).camera_frames
+                if not camera_frames:
+                    warnings.append(f"No camera frames found in {camera_vmd_path.name}")
+            except Exception as exc:
+                warnings.append(f"Failed to parse camera VMD {camera_vmd_path.name}: {exc}")
     bones, mesh, morphs = _preview_model(model_path, warnings)
     try:
         flex_map = import_vmd.load_flex_mapping()
@@ -576,6 +591,9 @@ def load_preview_scene(
         morph_tracks[morph_index] = PreviewMorphTrack(morph_index, morphs[morph_index].name, frames)
 
     root_tracks = [frames for name, frames in motion.bone_frames.items() if name in ROOT_MOTION_NAMES]
+    # The playback length stays the body motion's: in-game playback also ends
+    # with the body motion and the camera simply clamps at its last key, so a
+    # camera tail past the dance is not previewed either.
     return PreviewScene(
         model_path=model_path,
         body_vmd_path=body_vmd_path,
@@ -594,4 +612,6 @@ def load_preview_scene(
         fps=import_vmd.VMD_FPS,
         flex_count=len(morph_tracks),
         warnings=warnings,
+        camera_vmd_path=camera_vmd_path if camera_frames else None,
+        camera_frames=camera_frames,
     )

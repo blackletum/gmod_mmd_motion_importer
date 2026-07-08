@@ -125,5 +125,10 @@
   "estimate.default_detail": "默认估计",
   "estimate.default_model": "默认估计：Blender 启动 15 秒 + 5000 帧/分钟",
   "estimate.learned_model": "来自 {samples} 次导入的学习估计：time = {slope:.4f} * frames + {intercept:.1f}s",
-  "estimate.parse_error_log": "无法从 VMD 估算烘焙时间：{error}"
+  "estimate.parse_error_log": "无法从 VMD 估算烘焙时间：{error}",
+  "inputs.camera_vmd.label": "镜头 VMD（可选）",
+  "inputs.camera_vmd.hint": "MMD 镜头动作；导出可在 GMod 插件中播放的相机路径。",
+  "preview.follow_camera": "跟随镜头",
+  "preview.follow_camera.tooltip": "设置镜头 VMD 后，预览将通过 MMD 相机视角观看。",
+  "error.camera_vmd_missing": "未找到镜头 VMD：{path}"
 }

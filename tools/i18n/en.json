@@ -125,5 +125,10 @@
   "estimate.default_detail": "default estimate",
   "estimate.default_model": "default estimate: 15s Blender startup + 5000 frames/min",
   "estimate.learned_model": "learned estimate from {samples} import(s): time = {slope:.4f} * frames + {intercept:.1f}s",
-  "estimate.parse_error_log": "Could not estimate bake time from VMD: {error}"
+  "estimate.parse_error_log": "Could not estimate bake time from VMD: {error}",
+  "inputs.camera_vmd.label": "Camera VMD (optional)",
+  "inputs.camera_vmd.hint": "MMD camera motion; exports a camera path the GMod addon can play.",
+  "preview.follow_camera": "Follow camera",
+  "preview.follow_camera.tooltip": "When a camera VMD is set, the preview looks through the MMD camera.",
+  "error.camera_vmd_missing": "Camera VMD not found: {path}"
 }

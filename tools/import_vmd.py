@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -226,12 +226,24 @@ class BoneRetarget:
 
 
 @dataclass
+class CameraFrame:
+    frame: int
+    distance: float
+    position: tuple[float, float, float]
+    rotation: tuple[float, float, float]  # radians, raw VMD values
+    interp: bytes  # 24 bytes: 6 channels (X, Y, Z, rotation, distance, fov) x (x1, x2, y1, y2)
+    fov: float  # vertical field of view in degrees
+    perspective: bool
+
+
+@dataclass
 class ParsedVMD:
     model_name: str
     bone_frames: dict[str, list[BoneFrame]]
     morph_frames: dict[str, list[MorphFrame]]
     property_frames: list[PropertyFrame]
     max_frame: int
+    camera_frames: list[CameraFrame] = field(default_factory=list)
 
 
 def read_exact(handle, size: int) -> bytes:
@@ -261,6 +273,7 @@ def parse_vmd(path: Path) -> ParsedVMD:
     bone_frames: dict[str, list[BoneFrame]] = {}
     morph_frames: dict[str, list[MorphFrame]] = {}
     property_frames: list[PropertyFrame] = []
+    camera_frames: list[CameraFrame] = []
     max_frame = 0
 
     with path.open("rb") as handle:
@@ -296,9 +309,24 @@ def parse_vmd(path: Path) -> ParsedVMD:
             morph_frames.setdefault(name, []).append(MorphFrame(frame, weight))
             max_frame = max(max_frame, frame)
 
-        # Camera, light and self-shadow records are parsed only far enough to reach property frames.
+        # Camera records: frame u32, distance f32, target position 3xf32,
+        # rotation 3xf32 (radians), 24 interpolation bytes, fov u32 (degrees),
+        # perspective-off flag u8 (stored for completeness; orthographic
+        # segments are rare and rendered as perspective downstream).
+        # Camera frames deliberately do NOT extend max_frame: max_frame drives
+        # the body bake/preview length, and a dance VMD with embedded camera
+        # keys past the last bone key must keep its historical imported length.
         for _ in range(read_count_or_zero(handle)):
-            read_exact(handle, 61)
+            frame = read_u32(handle)
+            distance = struct.unpack("<f", read_exact(handle, 4))[0]
+            position = struct.unpack("<fff", read_exact(handle, 12))
+            rotation = struct.unpack("<fff", read_exact(handle, 12))
+            interp = read_exact(handle, 24)
+            fov = float(read_u32(handle))
+            perspective_off = struct.unpack("<B", read_exact(handle, 1))[0]
+            camera_frames.append(CameraFrame(frame, distance, position, rotation, interp, fov, perspective_off == 0))
+
+        # Light and self-shadow records are parsed only far enough to reach property frames.
         for _ in range(read_count_or_zero(handle)):
             read_exact(handle, 28)
         for _ in range(read_count_or_zero(handle)):
@@ -321,8 +349,9 @@ def parse_vmd(path: Path) -> ParsedVMD:
     for frames in morph_frames.values():
         frames.sort(key=lambda item: item.frame)
     property_frames.sort(key=lambda item: item.frame)
+    camera_frames.sort(key=lambda item: item.frame)
 
-    return ParsedVMD(model_name, bone_frames, morph_frames, property_frames, max_frame)
+    return ParsedVMD(model_name, bone_frames, morph_frames, property_frames, max_frame, camera_frames)
 
 
 def extract_literal_dict(path: Path, variable: str) -> dict:
@@ -1428,6 +1457,288 @@ def gmod_sound_output_path(gmod_dir: Path, sound_identifier: str) -> Path:
     return gmod_dir / "garrysmod" / "sound" / GMOD_SOUND_SUBDIR / f"{sound_identifier}.mp3"
 
 
+# --- MMD camera track -------------------------------------------------------
+# Validated at machine precision against Blender mmd_tools (see repo history):
+#   R = RotY(-ry) @ RotX(-rx) @ RotZ(-rz)
+#   eye     = target + R @ (0, 0, distance)   (distance < 0 puts the camera in
+#                                              front of the character; > 0 behind
+#                                              the target plane, same view axis)
+#   forward = R @ (0, 0, 1)                    (NOT normalize(target - eye): a
+#                                              positive distance would flip it)
+#   up      = R @ (0, 1, 0)
+#   fov     = vertical degrees
+# MMD world axes: +X viewer right, +Y up, +Z into screen; the character faces
+# -Z. GMod entity-local axes: +X forward, +Y left, +Z up. The handedness flip
+# maps MMD (x, y, z) -> GMod local (-z, x, y).
+CAMERA_POSITION_SCALE = 41.78 * 0.08  # MMD unit -> Source unit, matches the body pipeline
+CAMERA_TRACK_FORMAT = 1
+# Decimation tolerances: a sampled frame is dropped only when linear
+# interpolation (the exact math the GMod client uses) reproduces it within
+# these bounds.
+CAMERA_DECIMATE_POS_EPS = 0.1     # source units
+CAMERA_DECIMATE_ANG_EPS = 0.05    # degrees
+CAMERA_DECIMATE_FOV_EPS = 0.02    # degrees
+
+
+def camera_bezier_weight(t: float, interp: bytes, channel: int) -> float:
+    """Camera interpolation uses 6 channels (X, Y, Z, rotation, distance, fov)
+    of 4 bytes each laid out (x1, x2, y1, y2) — unlike bone curves."""
+    if t <= 0:
+        return 0.0
+    if t >= 1:
+        return 1.0
+
+    base = channel * 4
+    x1 = interp[base] / 127.0
+    x2 = interp[base + 1] / 127.0
+    y1 = interp[base + 2] / 127.0
+    y2 = interp[base + 3] / 127.0
+
+    if abs(x1 - y1) < 1e-6 and abs(x2 - y2) < 1e-6:
+        return t
+
+    lo, hi = 0.0, 1.0
+    for _ in range(32):
+        mid = (lo + hi) * 0.5
+        if bezier_point(mid, 0.0, x1, x2, 1.0) < t:
+            lo = mid
+        else:
+            hi = mid
+    s = (lo + hi) * 0.5
+    return bezier_point(s, 0.0, y1, y2, 1.0)
+
+
+def sample_camera_frames(frames: list[CameraFrame], frame: float) -> tuple[tuple[float, float, float], tuple[float, float, float], float, float]:
+    """Interpolate (target, rotation, distance, fov) at a fractional frame."""
+    if not frames:
+        return (0.0, 10.0, 0.0), (0.0, 0.0, 0.0), -45.0, 30.0
+
+    if frame <= frames[0].frame:
+        key = frames[0]
+        return key.position, key.rotation, key.distance, key.fov
+    if frame >= frames[-1].frame:
+        key = frames[-1]
+        return key.position, key.rotation, key.distance, key.fov
+
+    lo, hi = 0, len(frames) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if frames[mid].frame <= frame:
+            lo = mid
+        else:
+            hi = mid
+    a, b = frames[lo], frames[hi]
+    span = max(1e-9, float(b.frame - a.frame))
+    t = (frame - a.frame) / span
+
+    wx = camera_bezier_weight(t, b.interp, 0)
+    wy = camera_bezier_weight(t, b.interp, 1)
+    wz = camera_bezier_weight(t, b.interp, 2)
+    wr = camera_bezier_weight(t, b.interp, 3)
+    wd = camera_bezier_weight(t, b.interp, 4)
+    wf = camera_bezier_weight(t, b.interp, 5)
+
+    position = (
+        lerp(a.position[0], b.position[0], wx),
+        lerp(a.position[1], b.position[1], wy),
+        lerp(a.position[2], b.position[2], wz),
+    )
+    # MMD camera rotations are cumulative euler values (can exceed +-pi) and
+    # interpolate component-wise; do not normalize before interpolating.
+    rotation = (
+        lerp(a.rotation[0], b.rotation[0], wr),
+        lerp(a.rotation[1], b.rotation[1], wr),
+        lerp(a.rotation[2], b.rotation[2], wr),
+    )
+    distance = lerp(a.distance, b.distance, wd)
+    fov = lerp(a.fov, b.fov, wf)
+    return position, rotation, distance, fov
+
+
+def mmd_camera_pose(target, rotation, distance):
+    """Eye, forward, up in MMD space for interpolated camera channels."""
+    rx, ry, rz = rotation
+    cx, sx = math.cos(-rx), math.sin(-rx)
+    cy, sy = math.cos(-ry), math.sin(-ry)
+    cz, sz = math.cos(-rz), math.sin(-rz)
+    # R = RotY(-ry) @ RotX(-rx) @ RotZ(-rz), expanded column products.
+    m00 = cy * cz + sy * sx * sz
+    m01 = -cy * sz + sy * sx * cz
+    m02 = sy * cx
+    m10 = cx * sz
+    m11 = cx * cz
+    m12 = -sx
+    m20 = -sy * cz + cy * sx * sz
+    m21 = sy * sz + cy * sx * cz
+    m22 = cy * cx
+
+    eye = (
+        target[0] + m02 * distance,
+        target[1] + m12 * distance,
+        target[2] + m22 * distance,
+    )
+    forward = (m02, m12, m22)
+    up = (m01, m11, m21)
+    return eye, forward, up
+
+
+def _mmd_to_gmod_vec(v):
+    return (-v[2], v[0], v[1])
+
+
+def _source_angles_from_forward_up(forward, up):
+    """Source VectorAngles(forward, pseudo-up) -> (pitch, yaw, roll) degrees."""
+    fx, fy, fz = forward
+    lx = up[1] * fz - up[2] * fy
+    ly = up[2] * fx - up[0] * fz
+    lz = up[0] * fy - up[1] * fx
+    length = math.sqrt(lx * lx + ly * ly + lz * lz)
+    if length > 1e-9:
+        lx, ly, lz = lx / length, ly / length, lz / length
+
+    xy_dist = math.sqrt(fx * fx + fy * fy)
+    if xy_dist > 0.001:
+        yaw = math.atan2(fy, fx)
+        pitch = math.atan2(-fz, xy_dist)
+        up_z = ly * fx - lx * fy
+        roll = math.atan2(lz, up_z)
+    else:
+        yaw = math.atan2(-lx, ly)
+        pitch = math.atan2(-fz, xy_dist)
+        roll = 0.0
+    return math.degrees(pitch), math.degrees(yaw), math.degrees(roll)
+
+
+def sample_camera_gmod(frames: list[CameraFrame], frame: float) -> tuple[float, float, float, float, float, float, float]:
+    """Entity-local GMod camera sample: (px, py, pz, pitch, yaw, roll, vfov)."""
+    target, rotation, distance, fov = sample_camera_frames(frames, frame)
+    eye, forward, up = mmd_camera_pose(target, rotation, distance)
+    px, py, pz = (_mmd_to_gmod_vec(eye)[i] * CAMERA_POSITION_SCALE for i in range(3))
+    pitch, yaw, roll = _source_angles_from_forward_up(_mmd_to_gmod_vec(forward), _mmd_to_gmod_vec(up))
+    return px, py, pz, pitch, yaw, roll, fov
+
+
+def _normalize_angle_deg(value: float) -> float:
+    return ((value + 180.0) % 360.0) - 180.0
+
+
+def _lerp_angle_deg(a: float, b: float, t: float) -> float:
+    return a + _normalize_angle_deg(b - a) * t
+
+
+def _camera_sample_lerp(a, b, t):
+    """Linear interpolation between two decimated samples, matching the Lua
+    playback math exactly (angles take the shortest normalized path)."""
+    return (
+        lerp(a[0], b[0], t),
+        lerp(a[1], b[1], t),
+        lerp(a[2], b[2], t),
+        _lerp_angle_deg(a[3], b[3], t),
+        _lerp_angle_deg(a[4], b[4], t),
+        _lerp_angle_deg(a[5], b[5], t),
+        lerp(a[6], b[6], t),
+    )
+
+
+def _camera_samples_close(a, b) -> bool:
+    for i in range(3):
+        if abs(a[i] - b[i]) > CAMERA_DECIMATE_POS_EPS:
+            return False
+    for i in range(3, 6):
+        if abs(_normalize_angle_deg(a[i] - b[i])) > CAMERA_DECIMATE_ANG_EPS:
+            return False
+    return abs(a[6] - b[6]) <= CAMERA_DECIMATE_FOV_EPS
+
+
+def build_camera_track(camera_vmd_path: Path, progress: ProgressCallback | None = None) -> dict | None:
+    """Parse a camera VMD and produce the GMod-local camera track dict, or None
+    when the file holds no camera frames."""
+    parsed = parse_vmd(camera_vmd_path)
+    frames = parsed.camera_frames
+    if not frames:
+        emit_progress(progress, f"No camera frames found in {camera_vmd_path}")
+        return None
+
+    frame_start = 0
+    frame_end = frames[-1].frame
+    # The frame index is a raw u32; a corrupt file can claim billions of frames
+    # and per-frame sampling would exhaust memory. Same guard class as the body
+    # bake's MAX_BAKE_FRAMES check.
+    if frame_end - frame_start > MAX_BAKE_FRAMES:
+        raise ValueError(
+            f"camera VMD frame range 0..{frame_end} exceeds the {MAX_BAKE_FRAMES}-frame limit; "
+            f"the file may be corrupted: {camera_vmd_path}"
+        )
+    samples = [sample_camera_gmod(frames, f) for f in range(frame_start, frame_end + 1)]
+    # Normalize angles once at the sample level; playback interpolates via
+    # shortest-path deltas so cumulative multi-turn values are unnecessary.
+    samples = [
+        (s[0], s[1], s[2], _normalize_angle_deg(s[3]), _normalize_angle_deg(s[4]), _normalize_angle_deg(s[5]), s[6])
+        for s in samples
+    ]
+
+    # Greedy decimation: keep a sample only when linear interpolation between
+    # the previous kept sample and the candidate fails to reproduce EVERY
+    # intermediate frame within tolerance.
+    kept: list[int] = [0]
+    last = 0
+    index = 1
+    total = len(samples)
+    while index < total - 1:
+        candidate = index + 1
+        span = candidate - last
+        ok = True
+        for mid in range(last + 1, candidate):
+            t = (mid - last) / span
+            approx = _camera_sample_lerp(samples[last], samples[candidate], t)
+            if not _camera_samples_close(approx, samples[mid]):
+                ok = False
+                break
+        if ok:
+            index += 1
+        else:
+            kept.append(index)
+            last = index
+            index += 1
+    if total > 1:
+        kept.append(total - 1)
+
+    # The GMod loader caps camera tracks at 20000 keys; thin uniformly (keeping
+    # the endpoints) rather than letting the addon truncate the tail.
+    max_keys = 20000
+    if len(kept) > max_keys:
+        stride = (len(kept) - 1) / (max_keys - 1)
+        thinned = [kept[round(i * stride)] for i in range(max_keys)]
+        thinned[-1] = kept[-1]
+        kept = thinned
+        emit_progress(progress, f"Camera track thinned to {max_keys} keys to fit the addon limit")
+
+    keys = []
+    for sample_index in kept:
+        s = samples[sample_index]
+        keys.append([
+            frame_start + sample_index,
+            round(s[0], 3), round(s[1], 3), round(s[2], 3),
+            round(s[3], 3), round(s[4], 3), round(s[5], 3),
+            round(s[6], 3),
+        ])
+
+    emit_progress(
+        progress,
+        f"Camera track: {len(frames)} VMD key(s) over frames {frame_start}-{frame_end}, exported {len(keys)} sampled key(s)",
+    )
+    return {
+        "format": CAMERA_TRACK_FORMAT,
+        "fps": VMD_FPS,
+        "frame_start": frame_start,
+        "frame_end": frame_end,
+        "position_scale": round(CAMERA_POSITION_SCALE, 6),
+        "key_count": len(keys),
+        "source": camera_vmd_path.name,
+        "keys": keys,
+    }
+
+
 def atomic_write_text(target: Path, text: str, encoding: str = "utf-8") -> None:
     """Write text via a temp file + os.replace so a crash or kill mid-write can
     never leave a truncated (unparseable) file at the destination path."""
@@ -2200,6 +2511,7 @@ def write_motion_json(
     audio_offset: float | None = None,
     is_addon: bool = False,
     progress: ProgressCallback | None = None,
+    camera_track: dict | None = None,
 ) -> Path:
     if not rotation_json_path.exists():
         raise FileNotFoundError(rotation_json_path)
@@ -2221,6 +2533,8 @@ def write_motion_json(
             emit_progress(progress, f"Warning: {warning}")
     if music:
         parsed["music"] = dict(music)
+    if camera_track:
+        parsed["camera"] = dict(camera_track)
     if audio_offset is not None:
         offset = round(max(-5.0, min(5.0, float(audio_offset))), 3)
         parsed["audio_offset"] = offset
@@ -2274,6 +2588,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--baked-output-dir", type=Path, help="directory for the intermediate baked VMD")
     parser.add_argument("--output-rotation-json", type=Path, help="override parent-corrected rotation JSON output path")
     parser.add_argument("--flex-vmd", type=Path, action="append", default=[], help="additional facial/flex VMD to merge; may be repeated")
+    parser.add_argument("--camera-vmd", type=Path, help="optional camera VMD; exports an entity-anchored camera path for the GMod addon")
     parser.add_argument("--music", type=Path, help="optional music/audio or video file; audio is extracted and converted to GMod MP3 sound")
     parser.add_argument("--audio-offset", type=float, default=0.0, help="default music offset in seconds; positive starts music later, negative starts advanced")
     parser.add_argument("--motion-name", help="optional imported motion name; controls the GMod JSON and music filename")
@@ -2326,6 +2641,11 @@ def main(argv: list[str]) -> int:
         if args.music:
             music_metadata = convert_music_to_gmod_mp3(args.music, gmod_dir, motion_name_source, vmd_path=args.vmd)
             print(f"Wrote music: {music_metadata['sound']}")
+        camera_track = None
+        if args.camera_vmd:
+            if not args.camera_vmd.exists():
+                raise FileNotFoundError(f"camera VMD not found: {args.camera_vmd}")
+            camera_track = build_camera_track(args.camera_vmd, print)
         output = write_motion_json(
             rotation_json_for_cache,
             output_dir,
@@ -2336,6 +2656,7 @@ def main(argv: list[str]) -> int:
             audio_offset=args.audio_offset,
             is_addon=args.export_addon_gma is not None,
             progress=print,
+            camera_track=camera_track,
         )
         print(f"Wrote motion JSON: {output}")
         if args.export_addon_gma:

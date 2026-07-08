@@ -125,5 +125,10 @@
   "estimate.default_detail": "既定推定",
   "estimate.default_model": "既定推定：Blender 起動 15 秒 + 5000 フレーム/分",
   "estimate.learned_model": "{samples} 回のインポートからの学習推定: time = {slope:.4f} * frames + {intercept:.1f}s",
-  "estimate.parse_error_log": "VMD からベイク時間を推定できません: {error}"
+  "estimate.parse_error_log": "VMD からベイク時間を推定できません: {error}",
+  "inputs.camera_vmd.label": "カメラVMD（任意）",
+  "inputs.camera_vmd.hint": "MMDカメラモーション。GModアドオンで再生できるカメラパスを書き出します。",
+  "preview.follow_camera": "カメラに追従",
+  "preview.follow_camera.tooltip": "カメラVMDを指定すると、プレビューがMMDカメラ視点になります。",
+  "error.camera_vmd_missing": "カメラVMDが見つかりません: {path}"
 }

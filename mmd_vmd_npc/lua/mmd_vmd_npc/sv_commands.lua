@@ -202,6 +202,7 @@ hook.Add("PlayerDisconnected", "MMDVMDNPCDebugTargetCleanup", function(ply)
 
     MMDVMDNPC.PendingBuildConfirm[ply] = nil
     MMDVMDNPC.PendingAutoPlay[ply] = nil
+    MMDVMDNPC.CameraDebugCooldown[ply] = nil
 end)
 
 hook.Add("PlayerSay", "MMDVMDNPC_MissingBuildConfirm", function(ply, text)
@@ -801,6 +802,7 @@ local function write_motion_details_entry(meta, built)
     net.WriteString(meta.musicSource or "")
     net.WriteBool(meta.isAddon == true)
     net.WriteBool(built == true)
+    net.WriteBool(meta.hasCamera == true)
 end
 
 local function send_motion_details(ply, options)
@@ -1093,6 +1095,9 @@ local function set_self_player_movement_locked(ply, locked)
         MMDVMDNPC.SelfPlaybackMovementLocks[ply] = nil
         freeze_player_target(ply, false)
     end
+    -- Mirrored to the client so its prediction strips the same buttons the
+    -- server strips in StartCommand (no predicted muzzle flash / fire sound).
+    if ply.SetNWBool then ply:SetNWBool("MMDVMDNPCSelfPlaybackLock", locked == true) end
 end
 
 hook.Add("SetupMove", "MMDVMDNPCSelfPlaybackMovementLock", function(ply, mv, cmd)
@@ -1114,6 +1119,44 @@ hook.Add("SetupMove", "MMDVMDNPCSelfPlaybackMovementLock", function(ply, mv, cmd
             if cmd.SetUpMove then cmd:SetUpMove(0) end
         end
     end
+end)
+
+-- Movement zeroing alone still lets a locked player shoot, +use, reload and
+-- fire the toolgun while their dance proxy performs; strip those buttons from
+-- the usercmd before weapons process it. Jump/duck are stripped too so the
+-- hidden player's hull and eye position stay put under the animated camera.
+local SELF_PLAYBACK_LOCKED_BUTTONS = bit.bor(
+    IN_ATTACK, IN_ATTACK2, IN_USE, IN_RELOAD, IN_JUMP, IN_DUCK, IN_ZOOM
+)
+-- With this addon's own toolgun mode active, the documented in-world controls
+-- must keep working mid-dance: right-click pauses (TOOL:RightClick) and E+R
+-- stops (TOOL:Reload with IN_USE held). Attacks stay blocked for every other
+-- weapon and for the toolgun's left click.
+local SELF_PLAYBACK_TOOL_ALLOWED = bit.bor(IN_ATTACK2, IN_USE, IN_RELOAD)
+
+local function self_playback_locked_mask(ply)
+    local mask = SELF_PLAYBACK_LOCKED_BUTTONS
+    local weapon = ply.GetActiveWeapon and ply:GetActiveWeapon() or nil
+    if IsValid(weapon) and weapon:GetClass() == "gmod_tool"
+        and (ply.GetInfo and ply:GetInfo("gmod_toolmode") or "") == "mmd_vmd_npc" then
+        mask = bit.band(mask, bit.bnot(SELF_PLAYBACK_TOOL_ALLOWED))
+    end
+    -- +use is also how a seated player leaves a vehicle; never trap them.
+    if ply.InVehicle and ply:InVehicle() then
+        mask = bit.band(mask, bit.bnot(IN_USE))
+    end
+    return mask
+end
+
+hook.Add("StartCommand", "MMDVMDNPCSelfPlaybackActionLock", function(ply, cmd)
+    if not MMDVMDNPC.SelfPlaybackMovementLocks[ply] then return end
+    cmd:SetButtons(bit.band(cmd:GetButtons(), bit.bnot(self_playback_locked_mask(ply))))
+end)
+
+hook.Add("PlayerCanPickupWeapon", "MMDVMDNPCSelfPlaybackNoPickup", function(ply)
+    -- A newly picked-up weapon would render next to the hidden player (only
+    -- weapons carried at hide time get SetNoDraw), so block pickups entirely.
+    if MMDVMDNPC.SelfPlaybackMovementLocks[ply] then return false end
 end)
 
 local function set_self_player_hidden(ply, hidden)
@@ -2109,7 +2152,11 @@ local function send_audio_start(state)
     state.audioToken = state.audioToken or math.random(1, 2147483647)
 
     local ply = state.ply
-    local origin = IsValid(ply) and ply:GetPos() or (IsValid(state.ent) and state.ent:GetPos() or vector_origin)
+    -- The DANCER is the audio anchor: clients gate the omni volume (and 3D
+    -- position) on their distance to it, so anchoring on the initiating player
+    -- would pin the initiator's own music at full volume forever.
+    local sourceEnt = IsValid(state.ent) and state.ent or (IsValid(ply) and ply or nil)
+    local origin = sourceEnt and sourceEnt:GetPos() or vector_origin
     local filter = RecipientFilter()
     filter:AddPAS(origin)
     if IsValid(ply) then filter:AddPlayer(ply) end
@@ -2117,7 +2164,10 @@ local function send_audio_start(state)
     net.Start("mmdvmd_audio_start")
         net.WriteUInt(state.audioToken, 32)
         net.WriteString(soundPath)
-        net.WriteEntity(IsValid(ply) and ply or (IsValid(state.ent) and state.ent or NULL))
+        -- Entity index, not an entity handle: recipients outside the dancer's
+        -- PVS would read a permanently NULL handle; an index can be
+        -- re-resolved client-side once the entity is networked to them.
+        net.WriteUInt(sourceEnt and sourceEnt:EntIndex() or 0, 16)
         net.WriteFloat(tonumber(state.audioOffset) or 0)
         net.WriteFloat(tonumber(state.started) or CurTime())
         net.WriteFloat(math.Clamp(tonumber(state.musicVolume) or MMDVMDNPC.DefaultMusicVolume or 1, 0, 2))
@@ -2132,6 +2182,108 @@ local function restart_audio_for_loop(state)
     state.audioStarted = false
     state.audioToken = math.random(1, 2147483647)
     send_audio_start(state)
+end
+
+-- Camera track streaming ------------------------------------------------------
+-- Camera paths live in the motion JSON server-side; the initiating player's
+-- client needs the keys to render the animated view, so they are streamed in
+-- bounded binary chunks (32 bytes/key; chunks stay well under the 64KB cap).
+local CAMERA_KEYS_PER_MESSAGE = 900
+MMDVMDNPC.NextCameraTransferID = MMDVMDNPC.NextCameraTransferID or 1
+
+local function send_camera_track(ply, anchorEnt, motion, opts)
+    if not IsValid(ply) then return false end
+    opts = opts or {}
+    local camera = motion and motion.camera or nil
+    local keys = istable(camera) and camera.keys or nil
+    local total = istable(keys) and math.min(#keys, 65535) or 0
+    if total <= 0 and opts.debug ~= true then return false end
+
+    local transferID = MMDVMDNPC.NextCameraTransferID
+    MMDVMDNPC.NextCameraTransferID = transferID % 1000000 + 1
+
+    net.Start("mmdvmd_camera_begin")
+        net.WriteUInt(transferID, 32)
+        net.WriteUInt(math.max(0, IsValid(anchorEnt) and anchorEnt:EntIndex() or 0), 16)
+        net.WriteString(tostring(motion and motion.id or opts.motionID or ""))
+        net.WriteUInt(math.Clamp(math.floor(istable(camera) and camera.fps or 30), 1, 1000), 16)
+        net.WriteUInt(math.max(0, math.floor(istable(camera) and camera.frameStart or 0)), 32)
+        net.WriteUInt(math.max(0, math.floor(istable(camera) and camera.frameEnd or 0)), 32)
+        net.WriteFloat(tonumber(opts.startAt) or 0)
+        net.WriteBool(opts.loop == true)
+        -- Loop period in SECONDS of the BODY motion: looping restarts follow the
+        -- dance, not the camera's own (possibly shorter) frame range.
+        net.WriteFloat(math.max(0, tonumber(opts.loopSeconds) or 0))
+        net.WriteBool(opts.autoEnter == true)
+        net.WriteBool(opts.debug == true)
+        net.WriteUInt(total, 16)
+    net.Send(ply)
+
+    local function send_chunk(index)
+        local count = math.min(CAMERA_KEYS_PER_MESSAGE, total - index + 1)
+        net.Start("mmdvmd_camera_keys")
+            net.WriteUInt(transferID, 32)
+            net.WriteUInt(index, 16)
+            net.WriteUInt(count, 16)
+            for i = index, index + count - 1 do
+                local key = keys[i]
+                net.WriteUInt(math.max(0, math.floor(key.frame)), 32)
+                net.WriteFloat(key.x)
+                net.WriteFloat(key.y)
+                net.WriteFloat(key.z)
+                net.WriteFloat(key.p)
+                net.WriteFloat(key.yw)
+                net.WriteFloat(key.r)
+                net.WriteFloat(key.fov)
+            end
+        net.Send(ply)
+        return index + count
+    end
+
+    -- Send the first chunks immediately (covers virtually every real track);
+    -- pace any additional ones across ticks so a huge track cannot flood the
+    -- client's reliable channel in a single burst.
+    local index = 1
+    local immediate = 0
+    while index <= total and immediate < 2 do
+        index = send_chunk(index)
+        immediate = immediate + 1
+    end
+    local delay = 0
+    while index <= total do
+        local chunkStart = index
+        delay = delay + 0.1
+        timer.Simple(delay, function()
+            if not IsValid(ply) then return end
+            send_chunk(chunkStart)
+        end)
+        index = index + math.min(CAMERA_KEYS_PER_MESSAGE, total - index + 1)
+    end
+    return total > 0
+end
+
+local function send_camera_stop(ply, anchorEntIndex)
+    if not IsValid(ply) then return end
+    net.Start("mmdvmd_camera_stop")
+        net.WriteUInt(math.max(0, tonumber(anchorEntIndex) or 0), 16)
+    net.Send(ply)
+end
+
+local function send_camera_sync(state)
+    if not state or not state.cameraSent or not IsValid(state.ply) then return end
+    net.Start("mmdvmd_camera_sync")
+        net.WriteUInt(math.max(0, tonumber(state.cameraEntIndex) or 0), 16)
+        net.WriteBool(state.paused == true)
+        net.WriteFloat(tonumber(state.started) or 0)
+    net.Send(state.ply)
+end
+
+local function stop_camera_for_state(state)
+    if not state or not state.cameraSent then return end
+    state.cameraSent = nil
+    if IsValid(state.ply) then
+        send_camera_stop(state.ply, state.cameraEntIndex)
+    end
 end
 
 local function apply_built_sample(ent, frameA, frameB, fraction, pelvisZOffset)
@@ -2265,6 +2417,7 @@ function MMDVMDNPC.StopPlayback(ent, clearPose)
     MMDVMDNPC.Playbacks[ent] = nil
     if update_rpe_body_suppression then update_rpe_body_suppression() end
     if state then send_audio_stop(state) end
+    stop_camera_for_state(state)
     if state and state.cvarSuppression then
         end_scoped_cvar_suppression(state.cvarSuppression)
         state.cvarSuppression = nil
@@ -2311,6 +2464,7 @@ function MMDVMDNPC.StopAllPlaybacksForPlayer(ply)
                     end_scoped_cvar_suppression(state.cvarSuppression)
                     state.cvarSuppression = nil
                 end
+                stop_camera_for_state(state)
                 cleanup_self_proxy_state(state)
             end
         end
@@ -2324,7 +2478,7 @@ function MMDVMDNPC.StopAllPlaybacksForPlayer(ply)
     return stopped, message
 end
 
-local function start_playback_on_entity(ply, ent, motionID, options, playbackSettings, sharedStart, sharedDelayUntil, suppressMusic, preparedBuilt, preparedPath, preparedMotion)
+local function start_playback_on_entity(ply, ent, motionID, options, playbackSettings, sharedStart, sharedDelayUntil, suppressMusic, preparedBuilt, preparedPath, preparedMotion, suppressCamera)
     if not is_usable_npc(ent) then
         local message = actor_select_prompt()
         send_play_status(ply, "error", message)
@@ -2360,6 +2514,11 @@ local function start_playback_on_entity(ply, ent, motionID, options, playbackSet
     local playbackEnt = ent
     local selfProxy = is_playable_player(ent)
     if selfProxy then
+        -- Dance on foot: a seated player would leave the proxy performing at
+        -- the vehicle while the hidden driver could still throttle it away.
+        if ent.InVehicle and ent:InVehicle() and ent.ExitVehicle then
+            ent:ExitVehicle()
+        end
         local proxy, proxyErr = create_self_playback_proxy(ent)
         if not IsValid(proxy) then
             send_play_status(ply, "error", proxyErr or "failed to create self playback model")
@@ -2415,6 +2574,23 @@ local function start_playback_on_entity(ply, ent, motionID, options, playbackSet
         nextTick = 0,
     }
     if update_rpe_body_suppression then update_rpe_body_suppression() end
+
+    -- Stream the motion's camera path (if any) to the initiating player so
+    -- their client can render the animated view anchored to this entity.
+    local state = MMDVMDNPC.Playbacks[playbackEnt]
+    if suppressCamera ~= true and istable(motion.camera) then
+        state.cameraEntIndex = playbackEnt:EntIndex()
+        state.cameraSent = send_camera_track(ply, playbackEnt, motion, {
+            startAt = startAt,
+            loop = state.loopPlayback == true,
+            loopSeconds = math.max(0, ((built.frame_end or 0) - (built.frame_start or 0)) / math.max(1, built.fps or motion.fps or 30)),
+            -- The client decides whether to actually enter via its
+            -- mmd_vmd_npc_camera_auto convar; every playback the player
+            -- started (wheel, self via menu, NPC, group) is eligible.
+            autoEnter = true,
+        })
+    end
+
     send_play_status(ply, "countdown", string.format("%s starts in %.1f seconds", pathOrErr, math.max(0, delayUntil - now)), playbackEnt)
     return true, pathOrErr, MMDVMDNPC.Playbacks[playbackEnt], playbackEnt
 end
@@ -2548,6 +2724,8 @@ function MMDVMDNPC.StartAssignedGroupPlaybackForPlayer(ply, playbackSettings)
         settings.loopPlayback = playbackSettings.loopPlayback == true
         local suppressMusic = index ~= 1
 
+        -- Camera pivots on the first character in the group: only its motion's
+        -- camera path is streamed.
         local ok = start_playback_on_entity(
             ply,
             item.ent,
@@ -2559,7 +2737,8 @@ function MMDVMDNPC.StartAssignedGroupPlaybackForPlayer(ply, playbackSettings)
             suppressMusic,
             item.built,
             item.path,
-            item.motion
+            item.motion,
+            index ~= 1
         )
         if ok then started = started + 1 end
     end
@@ -2700,6 +2879,7 @@ local function set_playback_paused(playbackEnt, state, paused, ply)
         state.pauseStarted = now
         state.nextPausedStatus = 0
         send_audio_pause(state, true)
+        send_camera_sync(state)
         send_play_status(state.ply or ply, "paused", "playback paused", playbackEnt)
         return true
     end
@@ -2715,6 +2895,7 @@ local function set_playback_paused(playbackEnt, state, paused, ply)
     state.nextTick = 0
     state.nextPausedStatus = nil
     send_audio_pause(state, false)
+    send_camera_sync(state)
     send_play_status(state.ply or ply, state.sentPlaying and "playing" or "countdown", "playback resumed", playbackEnt)
     return true
 end
@@ -2778,6 +2959,7 @@ local function update_playback_state(ent, state, now)
             end_scoped_cvar_suppression(state.cvarSuppression)
             state.cvarSuppression = nil
         end
+        stop_camera_for_state(state)
         cleanup_self_proxy_state(state)
         return
     end
@@ -2851,6 +3033,7 @@ local function update_playback_state(ent, state, now)
             end_scoped_cvar_suppression(state.cvarSuppression)
             state.cvarSuppression = nil
         end
+        stop_camera_for_state(state)
         cleanup_self_proxy_state(state)
         return
     end
@@ -2869,6 +3052,7 @@ local function update_playback_state(ent, state, now)
             sourceFrame = startFrame + (now - (state.started or now)) * sourceFPS
             finished = false
             restart_audio_for_loop(state)
+            send_camera_sync(state)
         end
     end
     sourceFrame = math.Clamp(sourceFrame, startFrame, endFrame)
@@ -3648,6 +3832,31 @@ end)
 net.Receive("mmdvmd_assignment_clear_request", function(_, ply)
     local mode = net.ReadString()
     MMDVMDNPC.ClearAssignedActorsForPlayer(ply, mode == "missing" and "missing" or "all")
+end)
+
+-- Debug/preview camera track fetch: streams the camera keys for a motion with
+-- no playback attached (debug flag set, anchored to the player's debug target
+-- when one is selected). Rate limited; a camera-less motion answers with an
+-- empty begin so the client can report "no camera animation".
+MMDVMDNPC.CameraDebugCooldown = MMDVMDNPC.CameraDebugCooldown or {}
+
+net.Receive("mmdvmd_camera_debug_request", function(_, ply)
+    if not IsValid(ply) then return end
+    local now = CurTime()
+    if (MMDVMDNPC.CameraDebugCooldown[ply] or 0) > now then return end
+    MMDVMDNPC.CameraDebugCooldown[ply] = now + 0.5
+
+    local motionID = MMDVMDNPC.NormalizeMotionID(net.ReadString())
+    if not motionID then return end
+    local motion = MMDVMDNPC.LoadMotion(motionID)
+    if not motion then return end
+
+    local anchor = MMDVMDNPC.DebugTargets[ply]
+    send_camera_track(ply, is_usable_npc(anchor) and anchor or nil, motion, {
+        debug = true,
+        motionID = motionID,
+        startAt = 0,
+    })
 end)
 
 net.Receive("mmdvmd_eye_track_camera", function(_, ply)

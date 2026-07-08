@@ -116,6 +116,16 @@ class ImportWorker(QtCore.QThread):
             gmod_dir = Path(str(self.settings["gmod_dir"])) if self.settings.get("gmod_dir") else import_vmd.find_gmod_install()
             self._log(I18N.t("log.using_gmod", path=gmod_dir))
 
+            # Build the camera track BEFORE the multi-minute Blender bake so a
+            # missing or corrupt camera VMD fails fast instead of wasting the bake.
+            camera_track = None
+            camera_path_raw = str(self.settings.get("camera_vmd") or "")
+            if camera_path_raw:
+                camera_path = Path(camera_path_raw)
+                if not camera_path.exists():
+                    raise FileNotFoundError(I18N.t("error.camera_vmd_missing", path=camera_path_raw))
+                camera_track = import_vmd.build_camera_track(camera_path, self._log)
+
             baked_dir = import_vmd.BAKED_OUTPUT_DIR
             model_path = import_vmd.find_default_mmd_model()
             blender_path = Path(str(self.settings["blender_path"])) if self.settings.get("blender_path") else None
@@ -153,6 +163,7 @@ class ImportWorker(QtCore.QThread):
                 audio_offset=audio_offset,
                 is_addon=bool(self.settings.get("export_addon")),
                 progress=self._log,
+                camera_track=camera_track,
             )
             self._log(I18N.t("log.wrote_motion_json", path=output_json))
             addon_gma = ""
@@ -492,10 +503,14 @@ class ImporterWindow(QtWidgets.QMainWindow):
             ("audio_check", "preview.audio"),
             ("bone_overlay_check", "preview.bones"),
             ("bone_names_check", "preview.bone_names"),
+            ("follow_camera_check", "preview.follow_camera"),
         ):
             widget = getattr(self, attr, None)
             if widget is not None:
                 widget.setText(self.tr(key))
+
+        if hasattr(self, "follow_camera_check"):
+            self.follow_camera_check.setToolTip(self.tr("preview.follow_camera.tooltip"))
 
         if hasattr(self, "detect_blender_button"):
             self.detect_blender_button.setToolTip(self.tr("inputs.detect_blender.tooltip"))
@@ -578,7 +593,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.blender_row = self.make_path_row("inputs.blender.label", "file", "filter.blender_executable", required=True, hint_key="inputs.blender.hint")
         self.gmod_row = self.make_path_row("inputs.gmod.label", "dir", required=True, hint_key="inputs.gmod.hint")
         self.music_row = self.make_path_row("inputs.music.label", "file", "filter.media", required=False, hint_key="inputs.music.hint")
-        for row in (self.body_row, self.blender_row, self.gmod_row, self.music_row):
+        self.camera_row = self.make_path_row("inputs.camera_vmd.label", "file", "filter.vmd_motion", required=False, hint_key="inputs.camera_vmd.hint")
+        for row in (self.body_row, self.blender_row, self.gmod_row, self.music_row, self.camera_row):
             layout.addWidget(row)
 
         audio_offset_layout = QtWidgets.QGridLayout()
@@ -730,6 +746,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.bone_overlay_check.setChecked(False)
         self.bone_names_check = QtWidgets.QCheckBox(self.tr("preview.bone_names"))
         self.bone_names_check.setChecked(False)
+        self.follow_camera_check = QtWidgets.QCheckBox(self.tr("preview.follow_camera"))
+        self.follow_camera_check.setChecked(True)
+        self.follow_camera_check.setToolTip(self.tr("preview.follow_camera.tooltip"))
         self.speed_spin = QtWidgets.QDoubleSpinBox()
         self.speed_spin.setRange(0.05, 4.0)
         self.speed_spin.setValue(1.0)
@@ -753,6 +772,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.audio_check.toggled.connect(self.preview.set_audio_enabled)
         self.bone_overlay_check.toggled.connect(self.preview.set_bone_overlay_enabled)
         self.bone_names_check.toggled.connect(self.preview.set_bone_names_enabled)
+        self.follow_camera_check.toggled.connect(self.preview.set_follow_camera)
         self.speed_spin.valueChanged.connect(self.preview.set_speed)
         self.scrubber.sliderMoved.connect(lambda value: self.preview.scrub_to_fraction(value / 1000.0))
         self.audio_offset_slider.valueChanged.connect(self.update_preview_audio_offset)
@@ -766,6 +786,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.audio_check,
             self.bone_overlay_check,
             self.bone_names_check,
+            self.follow_camera_check,
             self.preview_speed_label,
             self.speed_spin,
         ):
@@ -860,6 +881,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         return {
             "body_vmd": self.body_row,
             "music_path": self.music_row,
+            "camera_vmd": self.camera_row,
             "blender_path": self.blender_row,
             "gmod_dir": self.gmod_row,
         }
@@ -926,8 +948,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if self._motion_name_is_autofilled():
             self._motion_name_autofill = candidate
             self.motion_name_edit.setText(candidate)
-        # A genuinely new source motion was chosen: its old music/flex no longer apply.
+        # A genuinely new source motion was chosen: its old music/flex/camera no longer apply.
         self.music_row.set_value("")
+        self.camera_row.set_value("")
         self.flex_list.clear()
         self.save_persisted_settings()
 
@@ -1046,7 +1069,10 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 Path(self.body_row.value()),
                 [Path(path) for path in self.flex_vmd_paths()],
                 Path(self.music_row.value()) if self.music_row.value() else None,
+                Path(self.camera_row.value()) if self.camera_row.value() else None,
             )
+            self.preview.set_follow_camera(self.follow_camera_check.isChecked())
+            self.follow_camera_check.setEnabled(self.preview.has_camera_motion())
             self.tabs.setCurrentWidget(self.preview.parentWidget())
             self.append_log(
                 self.tr(
@@ -1284,6 +1310,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         settings = {
             "body_vmd": self.body_row.value(),
             "music_path": self.music_row.value(),
+            "camera_vmd": self.camera_row.value(),
             "motion_name": self.motion_name_edit.text().strip(),
             "audio_offset": self.current_audio_offset_seconds(),
             "blender_path": self.blender_row.value(),

@@ -112,7 +112,11 @@ TOOL.ClientConVar = {
     eye_track_pos_lr = "0.5",
     music_enabled = "1",
     music_volume = "1",
+    music_omni = "1",
+    music_range = "1500",
+    music_fade = "300",
     loop_playback = "0",
+    camera_auto = "1",
     fast_build = "1",
     build_frames_per_batch = "32",
     playback_hz = "120",
@@ -301,6 +305,29 @@ function TOOL.BuildCPanel(panel)
     panel:ClearControls()
     panel:Help(L("mmd_vmd_npc.ui.tool_help"))
 
+    -- Camera animation hotkey: enters/exits the imported MMD camera view of the
+    -- most recently started dance (see cl_camera.lua).
+    local binderRow = vgui.Create("DPanel", panel)
+    binderRow:SetTall(32)
+    binderRow.Paint = nil
+    local binderLabel = vgui.Create("DLabel", binderRow)
+    binderLabel:Dock(FILL)
+    binderLabel:SetText(L("mmd_vmd_npc.camera.hotkey_label"))
+    binderLabel:SetTextColor(Color(255, 200, 90))
+    binderLabel:SetFont("DermaDefaultBold")
+    local binder = vgui.Create("DBinder", binderRow)
+    binder:Dock(RIGHT)
+    binder:SetWide(130)
+    local cameraKeyCvar = GetConVar("mmd_vmd_npc_camera_key")
+    binder:SetValue(cameraKeyCvar and cameraKeyCvar:GetInt() or 0)
+    binder.OnChange = function(_, num)
+        RunConsoleCommand("mmd_vmd_npc_camera_key", tostring(math.max(0, math.floor(tonumber(num) or 0))))
+    end
+    panel:AddItem(binderRow)
+    panel:Help(L("mmd_vmd_npc.camera.hotkey_help"))
+    panel:CheckBox(L("mmd_vmd_npc.camera.auto_option"), "mmd_vmd_npc_camera_auto")
+    panel:Help(L("mmd_vmd_npc.camera.auto_option_help"))
+
     local screenW = ScrW and ScrW() or 1280
     local screenH = ScrH and ScrH() or 720
     local compactPanel = screenW <= 1366 or screenH <= 760
@@ -448,6 +475,10 @@ function TOOL.BuildCPanel(panel)
 
     add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.play_imported_music"), "mmd_vmd_npc_music_enabled", L("mmd_vmd_npc.ui.play_imported_music_help"))
     add_slider(motionTab, L("mmd_vmd_npc.ui.music_volume"), "mmd_vmd_npc_music_volume", 0, 2, 2)
+    add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.music_omni"), "mmd_vmd_npc_music_omni", L("mmd_vmd_npc.ui.music_omni_help"))
+    add_slider(motionTab, L("mmd_vmd_npc.ui.music_range"), "mmd_vmd_npc_music_range", 100, 5000, 0)
+    add_slider(motionTab, L("mmd_vmd_npc.ui.music_fade"), "mmd_vmd_npc_music_fade", 10, 2000, 0)
+    motionTab:Help(L("mmd_vmd_npc.ui.music_range_help"))
     add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.loop_playback"), "mmd_vmd_npc_loop_playback", L("mmd_vmd_npc.ui.loop_playback_help"))
 
     local motionList = vgui.Create("DListView")

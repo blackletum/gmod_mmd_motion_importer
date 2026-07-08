@@ -3,6 +3,7 @@ MMDVMDNPC = MMDVMDNPC or {}
 if SERVER then
     AddCSLuaFile("mmd_vmd_npc/sh_core.lua")
     AddCSLuaFile("mmd_vmd_npc/cl_radial.lua")
+    AddCSLuaFile("mmd_vmd_npc/cl_camera.lua")
     AddCSLuaFile("mmd_vmd_npc/cl_menu.lua")
 
     util.AddNetworkString("mmdvmd_list_request")
@@ -49,6 +50,11 @@ if SERVER then
     util.AddNetworkString("mmdvmd_audio_stop")
     util.AddNetworkString("mmdvmd_audio_pause")
     util.AddNetworkString("mmdvmd_eye_track_camera")
+    util.AddNetworkString("mmdvmd_camera_begin")
+    util.AddNetworkString("mmdvmd_camera_keys")
+    util.AddNetworkString("mmdvmd_camera_stop")
+    util.AddNetworkString("mmdvmd_camera_sync")
+    util.AddNetworkString("mmdvmd_camera_debug_request")
 end
 
 include("mmd_vmd_npc/sh_core.lua")
@@ -57,5 +63,6 @@ if SERVER then
     include("mmd_vmd_npc/sv_cache.lua")
     include("mmd_vmd_npc/sv_commands.lua")
 else
+    include("mmd_vmd_npc/cl_camera.lua")
     include("mmd_vmd_npc/cl_menu.lua")
 end

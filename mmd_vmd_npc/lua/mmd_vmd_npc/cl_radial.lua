@@ -179,10 +179,22 @@ function PANEL:Init()
     end
 
     self.ToggleBtn = {
-        w = 240,
+        w = 190,
         h = 50,
         hover = 0
     }
+    -- Second button beside FOLLOW: whether playing a motion auto-enters its
+    -- imported camera animation (global mmd_vmd_npc_camera_auto option).
+    self.CameraBtn = {
+        w = 190,
+        h = 50,
+        hover = 0
+    }
+end
+
+local function camera_auto_on()
+    local cvar = GetConVar("mmd_vmd_npc_camera_auto")
+    return not cvar or cvar:GetBool()
 end
 
 function PANEL:Paint(w, h)
@@ -194,15 +206,19 @@ function PANEL:Paint(w, h)
     local outerRadius = self.OuterRadius or 260
     local innerRadius = self.InnerRadius or 80
     local btnW, btnH = self.ToggleBtn.w, self.ToggleBtn.h
-    local btnX = cx - btnW/2
+    local camW, camH = self.CameraBtn.w, self.CameraBtn.h
+    local btnX = cx - btnW - 5
+    local camX = cx + 5
     local btnY = math.min(cy + outerRadius + 20, h - btnH - 10)
     local isOverToggle = mx > btnX and mx < btnX + btnW and my > btnY and my < btnY + btnH
+    local isOverCamera = mx > camX and mx < camX + camW and my > btnY and my < btnY + camH
     self.IsOverToggle = isOverToggle
+    self.IsOverCamera = isOverCamera
 
     -- Choice
     local step = self.Count > 0 and (360 / self.Count) or 0
     self.SelectedIndex = 0
-    if dist > innerRadius and dist < outerRadius and not isOverToggle then
+    if dist > innerRadius and dist < outerRadius and not isOverToggle and not isOverCamera then
         local mouseAngle = math.deg(math.atan2(dy, dx)) + 90
         if mouseAngle < 0 then mouseAngle = mouseAngle + 360 end
         local adjustedAngle = (mouseAngle + step/2) % 360
@@ -241,23 +257,34 @@ function PANEL:Paint(w, h)
         end
     end
 
-    -- 2. Follow ToggleR
+    -- 2. Follow toggle
     self.ToggleBtn.hover = Lerp(FrameTime() * 10, self.ToggleBtn.hover, isOverToggle and 1 or 0)
-    
-    -- BG
-    draw.RoundedBox(8, btnX, btnY, btnW, btnH, Color(15, 15, 15, 220))
 
+    draw.RoundedBox(8, btnX, btnY, btnW, btnH, Color(15, 15, 15, 220))
     if self.ToggleBtn.hover > 0.01 then
         draw.RoundedBox(8, btnX, btnY, btnW, btnH, Color(50, 150, 255, 100 * self.ToggleBtn.hover))
     end
-     
     surface.SetDrawColor(255, 255, 255, 20 + (self.ToggleBtn.hover * 50))
     surface.DrawOutlinedRect(btnX, btnY, btnW, btnH, 1)
 
     local modeName = MMDVMDNPC.CameraTrackMode and "FOLLOW: ON" or "FOLLOW: OFF"
     local modeCol = MMDVMDNPC.CameraTrackMode and Color(100, 255, 100) or Color(255, 100, 100)
-    
-    draw.SimpleText(modeName, "DermaDefaultBold", cx, btnY + btnH/2, modeCol, 1, 1)
+    draw.SimpleText(modeName, "DermaDefaultBold", btnX + btnW/2, btnY + btnH/2, modeCol, 1, 1)
+
+    -- 3. Camera-animation auto-enter toggle
+    self.CameraBtn.hover = Lerp(FrameTime() * 10, self.CameraBtn.hover, isOverCamera and 1 or 0)
+
+    draw.RoundedBox(8, camX, btnY, camW, camH, Color(15, 15, 15, 220))
+    if self.CameraBtn.hover > 0.01 then
+        draw.RoundedBox(8, camX, btnY, camW, camH, Color(50, 150, 255, 100 * self.CameraBtn.hover))
+    end
+    surface.SetDrawColor(255, 255, 255, 20 + (self.CameraBtn.hover * 50))
+    surface.DrawOutlinedRect(camX, btnY, camW, camH, 1)
+
+    local camOn = camera_auto_on()
+    local camName = camOn and "CAMERA: ON" or "CAMERA: OFF"
+    local camCol = camOn and Color(100, 255, 100) or Color(255, 100, 100)
+    draw.SimpleText(camName, "DermaDefaultBold", camX + camW/2, btnY + camH/2, camCol, 1, 1)
 
     surface.SetDrawColor(255, 255, 255, 50)
     surface.DrawRect(cx-1, cy-1, 2, 2)
@@ -267,10 +294,21 @@ function PANEL:OnMousePressed(mouseCode)
     if mouseCode == MOUSE_LEFT then
         if self.IsOverToggle then
             self:ToggleCameraMode()
+        elseif self.IsOverCamera then
+            self:ToggleCameraAuto()
         elseif self.SelectedIndex > 0 then
             self:ExecuteSelection(self.SelectedIndex)
         end
     end
+end
+
+function PANEL:ToggleCameraAuto()
+    local turnOn = not camera_auto_on()
+    RunConsoleCommand("mmd_vmd_npc_camera_auto", turnOn and "1" or "0")
+    local label = (MMDVMDNPC.L and MMDVMDNPC.L("mmd_vmd_npc.camera.auto_option", "Enter camera animation automatically"))
+        or "Enter camera animation automatically"
+    notification.AddLegacy(label .. ": " .. (turnOn and "ON" or "OFF"), NOTIFY_HINT, 3)
+    surface.PlaySound("buttons/lightswitch2.wav")
 end
 
 function PANEL:ToggleCameraMode()

@@ -96,6 +96,9 @@ CreateClientConVar("mmd_vmd_npc_eye_track_pos_ud", tostring(MMDVMDNPC.DefaultEye
 CreateClientConVar("mmd_vmd_npc_eye_track_pos_lr", tostring(MMDVMDNPC.DefaultEyeTrackBonePosLR or 0.5), true, false, L("mmd_vmd_npc.ui.eye_pos_lr"))
 CreateClientConVar("mmd_vmd_npc_music_enabled", "1", true, false, L("mmd_vmd_npc.ui.play_imported_music"))
 CreateClientConVar("mmd_vmd_npc_music_volume", tostring(MMDVMDNPC.DefaultMusicVolume or 1), true, false, L("mmd_vmd_npc.ui.music_volume"))
+CreateClientConVar("mmd_vmd_npc_music_omni", "1", true, false, L("mmd_vmd_npc.ui.music_omni"))
+CreateClientConVar("mmd_vmd_npc_music_range", "1500", true, false, L("mmd_vmd_npc.ui.music_range"))
+CreateClientConVar("mmd_vmd_npc_music_fade", "300", true, false, L("mmd_vmd_npc.ui.music_fade"))
 CreateClientConVar("mmd_vmd_npc_loop_playback", "0", true, false, L("mmd_vmd_npc.ui.loop_playback"))
 CreateClientConVar("mmd_vmd_npc_build_frames_per_batch", tostring(MMDVMDNPC.DefaultBuildFramesPerBatch or 16), true, false, L("mmd_vmd_npc.ui.build_frames_per_batch"))
 CreateClientConVar("mmd_vmd_npc_playback_hz", tostring(MMDVMDNPC.DefaultPlaybackHz or 120), true, false, L("mmd_vmd_npc.ui.playback_updates_per_second"))
@@ -387,6 +390,7 @@ net.Receive("mmdvmd_motion_details_response", function()
             musicSource = net.ReadString(),
             isAddon = net.ReadBool(),
             built = net.ReadBool(),
+            hasCamera = net.ReadBool(),
         }
         details[id] = meta
         ordered[#ordered + 1] = meta
@@ -1638,7 +1642,55 @@ local function play_audio_preview(soundPath, offset, volume)
     end)
 end
 
-local function play_synced_audio(token, soundPath, sourceEnt, offset, startTime, volume)
+-- Music spatialization. In the default omnidirectional mode the channel is 2D
+-- (equal in both ears — the engine's audio listener follows the animated
+-- camera, and a swooping camera makes true 3D audio swirl around the head) and
+-- the volume is driven manually from the PLAYER's distance to the dancer:
+-- full volume inside mmd_vmd_npc_music_range, then a sharp quadratic fade to
+-- silence across mmd_vmd_npc_music_fade. Unchecking the option restores true
+-- 3D positional audio using the same range/fade values.
+local function music_omni_enabled()
+    local cvar = GetConVar("mmd_vmd_npc_music_omni")
+    if not cvar then return true end
+    return cvar:GetBool()
+end
+
+local function music_range_settings()
+    local rangeCvar = GetConVar("mmd_vmd_npc_music_range")
+    local fadeCvar = GetConVar("mmd_vmd_npc_music_fade")
+    local range = math.max(0, rangeCvar and rangeCvar:GetFloat() or 1500)
+    local fade = math.max(10, fadeCvar and fadeCvar:GetFloat() or 300)
+    return range, fade
+end
+
+-- The dancer arrives as an entity index (not an entity handle): a client can
+-- receive the start message before the entity is networked to it (PAS is wider
+-- than PVS), and a handle read then would stay NULL forever. Re-resolving the
+-- index lets the source become valid as soon as the entity appears.
+local function audio_source_entity(state)
+    local index = tonumber(state.sourceEntIndex) or 0
+    if index <= 0 then return nil end
+    local ent = Entity(index)
+    if IsValid(ent) then return ent end
+    return nil
+end
+
+local function omni_volume_factor(state)
+    local ply = LocalPlayer()
+    if not IsValid(ply) then return 1 end
+    local src = audio_source_entity(state)
+    -- Unresolvable dancer (not networked to us / removed): gate closed. Full
+    -- volume here would play the song map-wide for players who were merely in
+    -- the potentially-audible set when it started.
+    if not src then return 0 end
+    local range, fade = music_range_settings()
+    local dist = ply:GetPos():Distance(src:GetPos())
+    if dist <= range then return 1 end
+    local t = 1 - math.Clamp((dist - range) / fade, 0, 1)
+    return t * t
+end
+
+local function play_synced_audio(token, soundPath, sourceEntIndex, offset, startTime, volume)
     token = tonumber(token) or 0
     if token <= 0 or tostring(soundPath or "") == "" then return end
 
@@ -1653,14 +1705,17 @@ local function play_synced_audio(token, soundPath, sourceEnt, offset, startTime,
     local state = {
         token = token,
         soundPath = soundPath,
-        sourceEnt = sourceEnt,
+        sourceEntIndex = tonumber(sourceEntIndex) or 0,
         timerName = timerName,
+        baseVolume = volume,
     }
     MMDVMDNPC.AudioChannels[token] = state
 
     timer.Create(timerName, wait, 1, function()
         if MMDVMDNPC.AudioChannels[token] ~= state then return end
-        play_audio_file_candidates(soundPath, "3d noplay", function(channel, errID, errName, filename)
+        local omni = music_omni_enabled()
+        state.omni = omni
+        play_audio_file_candidates(soundPath, omni and "noplay" or "3d noplay", function(channel, errID, errName, filename)
             if not IsValid(channel) then
                 print("[MMD VMD] " .. LF("mmd_vmd_npc.console.failed_play_music_fmt", filename, tostring(errName or errID or L("mmd_vmd_npc.ui.unknown", "unknown"))))
                 return
@@ -1672,12 +1727,21 @@ local function play_synced_audio(token, soundPath, sourceEnt, offset, startTime,
                 return
             end
             state.channel = channel
-            if channel.Set3DFadeDistance then channel:Set3DFadeDistance(350, 1500) end
-            if channel.SetPos and IsValid(state.sourceEnt) then channel:SetPos(state.sourceEnt:GetPos()) end
+            local src = audio_source_entity(state)
+            if omni then
+                if channel.SetVolume then channel:SetVolume(volume * omni_volume_factor(state)) end
+            else
+                local range, fade = music_range_settings()
+                if channel.Set3DFadeDistance then channel:Set3DFadeDistance(range, range + fade) end
+                if channel.SetPos and src then channel:SetPos(src:GetPos()) end
+                if channel.SetVolume then channel:SetVolume(volume) end
+            end
             local seek = math.max(0, -offset) + math.max(0, CurTime() - audibleStart)
             if seek > 0 and channel.SetTime then channel:SetTime(seek) end
-            if channel.SetVolume then channel:SetVolume(volume) end
-            if not state.paused then channel:Play() end
+            if not state.paused then
+                channel:Play()
+                state.playedOnce = true
+            end
         end)
     end)
 end
@@ -1686,7 +1750,7 @@ net.Receive("mmdvmd_audio_start", function()
     play_synced_audio(
         net.ReadUInt(32),
         net.ReadString(),
-        net.ReadEntity(),
+        net.ReadUInt(16),
         net.ReadFloat(),
         net.ReadFloat(),
         net.ReadFloat()
@@ -1710,21 +1774,45 @@ net.Receive("mmdvmd_audio_pause", function()
     if state.paused then
         if channel.Pause then channel:Pause() end
     else
-        if channel.Play then channel:Play() end
+        if channel.Play then
+            channel:Play()
+            state.playedOnce = true
+        end
     end
 end)
 
 hook.Add("Think", "MMDVMDNPCAudioFollow", function()
     for token, state in pairs(MMDVMDNPC.AudioChannels or {}) do
-        if state.channel and state.channel.SetPos and IsValid(state.sourceEnt) then
-            state.channel:SetPos(state.sourceEnt:GetPos())
-        elseif state.channel and state.channel.GetState and state.channel:GetState() == GMOD_CHANNEL_STOPPED then
-            stop_audio_channel(token)
+        local channel = state.channel
+        if channel and channel.GetState and channel:GetState() == GMOD_CHANNEL_STOPPED then
+            -- A "noplay" channel reports STOPPED until its first Play(); a
+            -- channel deliberately held back because the playback was paused
+            -- before the file finished loading must not be reaped, or the
+            -- later resume finds nothing and the music never plays.
+            if state.playedOnce and not state.paused then
+                stop_audio_channel(token)
+            end
+        elseif channel then
+            if state.omni then
+                -- Volume tracks the player-to-dancer distance every frame so
+                -- range/fade convar tweaks apply live to running music.
+                if channel.SetVolume then
+                    channel:SetVolume((state.baseVolume or 1) * omni_volume_factor(state))
+                end
+            else
+                local src = audio_source_entity(state)
+                if channel.SetPos and src then
+                    channel:SetPos(src:GetPos())
+                end
+            end
         end
     end
 end)
 
 hook.Add("CalcView", "MMDVMDNPCSelfThirdPerson", function(ply, pos, angles, fov)
+    -- The imported camera animation view (cl_camera.lua) takes precedence.
+    if MMDVMDNPC.CameraAnimActive then return end
+    if MMDVMDNPC.CameraDebugPreviewRenderable and MMDVMDNPC.CameraDebugPreviewRenderable() then return end
     if not MMDVMDNPC.SelfThirdPersonActive then return end
     
     local target = MMDVMDNPC.SelfPlaybackCameraEnt
@@ -1772,6 +1860,7 @@ hook.Add("CalcView", "MMDVMDNPCSelfThirdPerson", function(ply, pos, angles, fov)
 end)
 
 hook.Add("InputMouseApply", "MMDVMDNPCSelfProxyCameraOrbit", function(cmd, x, y, ang)
+    if MMDVMDNPC.CameraAnimActive then return end
     if not MMDVMDNPC.SelfThirdPersonActive then return end
 
     local scale = 0.005
@@ -1820,6 +1909,34 @@ end)
 
 hook.Add("PreDrawViewModel", "MMDVMDNPCHideSelfProxyViewModel", function()
     if MMDVMDNPC.SelfThirdPersonActive then return true end
+end)
+
+-- Client half of the self-playback action lock: the server strips these
+-- buttons in StartCommand; stripping them here too keeps prediction in sync so
+-- no muzzle flash / fire sound plays locally while the dance proxy performs.
+-- The exemptions mirror the server exactly: the addon's own toolgun keeps its
+-- documented right-click pause and E+R stop, and +use stays available inside
+-- vehicles so the player can dismount.
+local SELF_PLAYBACK_LOCKED_BUTTONS = bit.bor(
+    IN_ATTACK, IN_ATTACK2, IN_USE, IN_RELOAD, IN_JUMP, IN_DUCK, IN_ZOOM
+)
+local SELF_PLAYBACK_TOOL_ALLOWED = bit.bor(IN_ATTACK2, IN_USE, IN_RELOAD)
+
+hook.Add("StartCommand", "MMDVMDNPCSelfPlaybackActionLock", function(ply, cmd)
+    if ply ~= LocalPlayer() then return end
+    if not ply.GetNWBool or not ply:GetNWBool("MMDVMDNPCSelfPlaybackLock", false) then return end
+
+    local mask = SELF_PLAYBACK_LOCKED_BUTTONS
+    local weapon = ply.GetActiveWeapon and ply:GetActiveWeapon() or nil
+    local toolMode = GetConVar("gmod_toolmode")
+    if IsValid(weapon) and weapon:GetClass() == "gmod_tool"
+        and toolMode and toolMode:GetString() == "mmd_vmd_npc" then
+        mask = bit.band(mask, bit.bnot(SELF_PLAYBACK_TOOL_ALLOWED))
+    end
+    if ply.InVehicle and ply:InVehicle() then
+        mask = bit.band(mask, bit.bnot(IN_USE))
+    end
+    cmd:SetButtons(bit.band(cmd:GetButtons(), bit.bnot(mask)))
 end)
 
 local function selected_eye_track_mode()
@@ -1876,7 +1993,11 @@ hook.Add("Think", "MMDVMDNPCEyeTrackCameraBridge", function()
     if now < (MMDVMDNPC.EyeTrackCameraNextSend or 0) then return end
     MMDVMDNPC.EyeTrackCameraNextSend = now + 0.05
     MMDVMDNPC.EyeTrackCameraBridgeActive = true
-    local viewOrigin = MMDVMDNPC.SelfThirdPersonActive and MMDVMDNPC.EyeTrackCameraOrigin or EyePos()
+    -- Eye tracking looks at whatever the player is actually seeing through:
+    -- the animated MMD camera when active, else the orbit camera, else the eyes.
+    local viewOrigin = (MMDVMDNPC.CameraAnimActive and MMDVMDNPC.CameraAnimViewOrigin)
+        or (MMDVMDNPC.SelfThirdPersonActive and MMDVMDNPC.EyeTrackCameraOrigin)
+        or EyePos()
     send_eye_track_camera(true, viewOrigin or EyePos())
 end)
 
@@ -2502,6 +2623,169 @@ local function start_debug_preview_playback(frame)
     MMDVMDNPC.OpenDebugMenu(frame.MotionID, math.Clamp(math.floor(nextFrame), startFrame, endFrame))
 end
 
+-- Camera animation debug panel -------------------------------------------------
+-- Shows the imported camera's entity-local position/rotation/fov at the debug
+-- window's current frame, previews it through CalcView (anchored on the debug
+-- target), and exposes the global camera transform tuning convars.
+
+function MMDVMDNPC.CloseCameraDebugPanel()
+    MMDVMDNPC.CameraDebugPreview = nil
+    local panel = MMDVMDNPC.CameraDebugPanel
+    MMDVMDNPC.CameraDebugPanel = nil
+    if IsValid(panel) then panel:Remove() end
+end
+
+function MMDVMDNPC.OpenCameraDebugPanel(debugFrame)
+    if not IsValid(debugFrame) then return end
+    MMDVMDNPC.CloseCameraDebugPanel()
+
+    local motionID = tostring(debugFrame.MotionID or "")
+    if motionID == "" then return end
+
+    -- Fetch the camera keys for this motion (no playback attached).
+    local function request_camera_track()
+        net.Start("mmdvmd_camera_debug_request")
+            net.WriteString(motionID)
+        net.SendToServer()
+    end
+    request_camera_track()
+
+    MMDVMDNPC.CameraDebugPreview = { motionID = motionID }
+
+    local panel = vgui.Create("DFrame")
+    MMDVMDNPC.CameraDebugPanel = panel
+    -- Distinguish "no reply yet" from "the motion has no camera": the server
+    -- answers camera-less motions with an empty begin, which fires this hook
+    -- with a nil track. Retry a few times in case the request hit the server's
+    -- rate-limit cooldown.
+    panel.ReplyReceived = false
+    panel.RequestsSent = 1
+    panel.NextRequestAt = SysTime() + 2
+    local hookID = "MMDVMDNPCCameraDebugReply" .. tostring(panel)
+    hook.Add("MMDVMDNPCCameraDebugTrackUpdated", hookID, function(replyMotionID)
+        if tostring(replyMotionID or "") == motionID and IsValid(panel) then
+            panel.ReplyReceived = true
+        end
+    end)
+    panel.OnRemove = function()
+        hook.Remove("MMDVMDNPCCameraDebugTrackUpdated", hookID)
+    end
+    panel:SetTitle(LF("mmd_vmd_npc.camera.debug_title_fmt", motionID))
+    panel:SetSize(math.min(420, ScrW() - 40), math.min(430, ScrH() - 40))
+    panel:SetPos(24, math.floor(ScrH() * 0.2))
+    panel:SetSizable(true)
+    panel:SetDeleteOnClose(true)
+    panel.OnClose = function()
+        MMDVMDNPC.CameraDebugPreview = nil
+        MMDVMDNPC.CameraDebugPanel = nil
+        if IsValid(debugFrame) and IsValid(debugFrame.CameraPreview) then
+            debugFrame.CameraPreview:SetValue(0)
+        end
+    end
+
+    local values = vgui.Create("DLabel", panel)
+    values:Dock(TOP)
+    values:DockMargin(8, 4, 8, 4)
+    values:SetTall(84)
+    values:SetWrap(true)
+    values:SetAutoStretchVertical(false)
+    values:SetText(L("mmd_vmd_npc.camera.debug_waiting"))
+
+    local help = vgui.Create("DLabel", panel)
+    help:Dock(TOP)
+    help:DockMargin(8, 0, 8, 4)
+    help:SetTall(48)
+    help:SetWrap(true)
+    help:SetText(L("mmd_vmd_npc.camera.debug_help"))
+
+    local scroll = vgui.Create("DScrollPanel", panel)
+    scroll:Dock(FILL)
+
+    local function add_slider(labelKey, cvarName, minValue, maxValue, decimals)
+        local slider = vgui.Create("DNumSlider", scroll)
+        slider:Dock(TOP)
+        slider:DockMargin(8, 0, 8, 2)
+        slider:SetTall(30)
+        slider:SetText(L(labelKey))
+        slider:SetMin(minValue)
+        slider:SetMax(maxValue)
+        slider:SetDecimals(decimals)
+        slider:SetConVar(cvarName)
+        return slider
+    end
+
+    add_slider("mmd_vmd_npc.camera.scale", "mmd_vmd_npc_cam_scale", 0.25, 4, 2)
+    add_slider("mmd_vmd_npc.camera.offset_x", "mmd_vmd_npc_cam_offset_x", -200, 200, 1)
+    add_slider("mmd_vmd_npc.camera.offset_y", "mmd_vmd_npc_cam_offset_y", -200, 200, 1)
+    add_slider("mmd_vmd_npc.camera.offset_z", "mmd_vmd_npc_cam_offset_z", -200, 200, 1)
+    add_slider("mmd_vmd_npc.camera.yaw", "mmd_vmd_npc_cam_yaw", -180, 180, 1)
+    add_slider("mmd_vmd_npc.camera.pitch", "mmd_vmd_npc_cam_pitch", -89, 89, 1)
+    add_slider("mmd_vmd_npc.camera.fov_offset", "mmd_vmd_npc_cam_fov", -30, 30, 1)
+
+    local reset = vgui.Create("DButton", scroll)
+    reset:Dock(TOP)
+    reset:DockMargin(8, 4, 8, 8)
+    reset:SetTall(26)
+    reset:SetText(L("mmd_vmd_npc.camera.reset_transform"))
+    reset.DoClick = function()
+        RunConsoleCommand("mmd_vmd_npc_cam_scale", "1")
+        RunConsoleCommand("mmd_vmd_npc_cam_offset_x", "0")
+        RunConsoleCommand("mmd_vmd_npc_cam_offset_y", "0")
+        RunConsoleCommand("mmd_vmd_npc_cam_offset_z", "0")
+        RunConsoleCommand("mmd_vmd_npc_cam_yaw", "0")
+        RunConsoleCommand("mmd_vmd_npc_cam_pitch", "0")
+        RunConsoleCommand("mmd_vmd_npc_cam_fov", "0")
+    end
+
+    panel.Think = function(self)
+        -- Follow the debug window's lifetime; it is a singleton that can be
+        -- retargeted to another motion, in which case this panel is stale.
+        if not IsValid(debugFrame) or tostring(debugFrame.MotionID or "") ~= motionID then
+            self:Close()
+            return
+        end
+        if not IsValid(values) then return end
+
+        local now = SysTime()
+        if (self.NextValueUpdate or 0) > now then return end
+        self.NextValueUpdate = now + 0.1
+
+        local track = MMDVMDNPC.CameraDebugTrackFor and MMDVMDNPC.CameraDebugTrackFor(motionID) or nil
+        if not track then
+            if self.ReplyReceived then
+                values:SetText(L("mmd_vmd_npc.camera.debug_none"))
+            else
+                values:SetText(L("mmd_vmd_npc.camera.debug_waiting"))
+                -- The request may have been eaten by the server-side cooldown;
+                -- retry a few times before giving up.
+                if now >= (self.NextRequestAt or 0) and (self.RequestsSent or 0) < 5 then
+                    self.RequestsSent = (self.RequestsSent or 0) + 1
+                    self.NextRequestAt = now + 2
+                    request_camera_track()
+                end
+            end
+            return
+        end
+
+        local frame = math.max(0, tonumber(debugFrame.ActiveFrame) or 0)
+        local sample = MMDVMDNPC.CameraDebugSample(motionID, frame)
+        if not sample then
+            values:SetText(L("mmd_vmd_npc.camera.debug_none"))
+            return
+        end
+
+        local anchor = MMDVMDNPC.TargetStatus and MMDVMDNPC.TargetStatus.ent or nil
+        values:SetText(LF(
+            "mmd_vmd_npc.camera.debug_values_fmt",
+            frame,
+            sample.x, sample.y, sample.z,
+            sample.p, sample.yw, sample.r,
+            sample.fov,
+            IsValid(anchor) and tostring(anchor) or L("mmd_vmd_npc.ui.none")
+        ))
+    end
+end
+
 function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
     motionID = tostring(motionID or "")
     if motionID == "" then return end
@@ -2709,6 +2993,21 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
         frame.DisableSpinePelvis:SizeToContents()
         frame.DisableSpinePelvis.OnChange = function()
             MMDVMDNPC.OpenDebugMenu(frame.MotionID, frame.ActiveFrame or frame.RequestedFrame or 0)
+        end
+
+        frame.CameraPreview = vgui.Create("DCheckBoxLabel", options)
+        frame.CameraPreview:Dock(LEFT)
+        frame.CameraPreview:DockMargin(8, 0, 0, 0)
+        frame.CameraPreview:SetWide(240)
+        frame.CameraPreview:SetText(L("mmd_vmd_npc.camera.debug_preview"))
+        frame.CameraPreview:SetValue(0)
+        frame.CameraPreview:SizeToContents()
+        frame.CameraPreview.OnChange = function(_, checked)
+            if checked then
+                MMDVMDNPC.OpenCameraDebugPanel(frame)
+            else
+                MMDVMDNPC.CloseCameraDebugPanel()
+            end
         end
 
         local controls = vgui.Create("DPanel", frame)
@@ -3635,7 +3934,7 @@ local function open_motion_browser()
     local list = vgui.Create("DListView", frame)
     list:Dock(FILL)
     list:SetZPos(100)
-    -- Min widths (not fixed) so the eight columns always share the available
+    -- Min widths (not fixed) so the ten columns always share the available
     -- width instead of summing past the frame and clipping the rightmost ones;
     -- DListView has no horizontal scrollbar.
     local columns = {
@@ -3645,6 +3944,7 @@ local function open_motion_browser()
         { list:AddColumn(L("mmd_vmd_npc.manager.column_bones")), 56 },
         { list:AddColumn(L("mmd_vmd_npc.manager.column_flexes")), 56 },
         { list:AddColumn(L("mmd_vmd_npc.manager.column_music")), 56 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_camera")), 56 },
         { list:AddColumn(L("mmd_vmd_npc.manager.column_addon")), 72 },
         { list:AddColumn(L("mmd_vmd_npc.manager.column_built")), 66 },
         { list:AddColumn(L("mmd_vmd_npc.manager.column_wheel")), 60 },
@@ -3684,6 +3984,14 @@ local function open_motion_browser()
     musicToggle:SetConVar("mmd_vmd_npc_music_enabled")
     set_manager_font(musicToggle.Label, "MMDVMDNPCManagerText")
 
+    local omniToggle = vgui.Create("DCheckBoxLabel", audioOptionsPanel)
+    omniToggle:Dock(LEFT)
+    omniToggle:SetWide(330)
+    omniToggle:SetText(L("mmd_vmd_npc.ui.music_omni"))
+    omniToggle:SetConVar("mmd_vmd_npc_music_omni")
+    omniToggle:SetTooltip(L("mmd_vmd_npc.ui.music_omni_help"))
+    set_manager_font(omniToggle.Label, "MMDVMDNPCManagerText")
+
     local volumeSlider = vgui.Create("DNumSlider", audioOptionsPanel)
     volumeSlider:Dock(FILL)
     volumeSlider:SetText(L("mmd_vmd_npc.manager.volume"))
@@ -3692,6 +4000,39 @@ local function open_motion_browser()
     volumeSlider:SetDecimals(2)
     volumeSlider:SetConVar("mmd_vmd_npc_music_volume")
     set_manager_font(volumeSlider.Label, "MMDVMDNPCManagerText")
+
+    -- Camera auto-enter + music distance behavior: applies to any playback the
+    -- player starts, whichever UI (wheel, this menu, the tool) started it.
+    local playbackOptionsPanel = vgui.Create("DPanel", frame)
+    playbackOptionsPanel:Dock(BOTTOM)
+    playbackOptionsPanel:SetTall(52)
+
+    local cameraAutoToggle = vgui.Create("DCheckBoxLabel", playbackOptionsPanel)
+    cameraAutoToggle:Dock(LEFT)
+    cameraAutoToggle:SetWide(350)
+    cameraAutoToggle:SetText(L("mmd_vmd_npc.camera.auto_option"))
+    cameraAutoToggle:SetConVar("mmd_vmd_npc_camera_auto")
+    cameraAutoToggle:SetTooltip(L("mmd_vmd_npc.camera.auto_option_help"))
+    set_manager_font(cameraAutoToggle.Label, "MMDVMDNPCManagerText")
+
+    local rangeSlider = vgui.Create("DNumSlider", playbackOptionsPanel)
+    rangeSlider:Dock(LEFT)
+    rangeSlider:SetWide(300)
+    rangeSlider:SetText(L("mmd_vmd_npc.ui.music_range"))
+    rangeSlider:SetMin(100)
+    rangeSlider:SetMax(5000)
+    rangeSlider:SetDecimals(0)
+    rangeSlider:SetConVar("mmd_vmd_npc_music_range")
+    set_manager_font(rangeSlider.Label, "MMDVMDNPCManagerText")
+
+    local fadeSlider = vgui.Create("DNumSlider", playbackOptionsPanel)
+    fadeSlider:Dock(FILL)
+    fadeSlider:SetText(L("mmd_vmd_npc.ui.music_fade"))
+    fadeSlider:SetMin(10)
+    fadeSlider:SetMax(2000)
+    fadeSlider:SetDecimals(0)
+    fadeSlider:SetConVar("mmd_vmd_npc_music_fade")
+    set_manager_font(fadeSlider.Label, "MMDVMDNPCManagerText")
 
     local offsetEntry = vgui.Create("DNumberWang", audioPanel)
     offsetEntry:Dock(LEFT)
@@ -3762,6 +4103,7 @@ local function open_motion_browser()
                     tostring(meta.boneCount or 0),
                     tostring(meta.flexCount or 0),
                     (meta.musicSound and meta.musicSound ~= "") and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
+                    meta.hasCamera and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
                     meta.isAddon and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
                     meta.built and L("mmd_vmd_npc.ui.built") or L("mmd_vmd_npc.ui.missing"),
                     inWheel and ("★ " .. L("mmd_vmd_npc.ui.yes")) or L("mmd_vmd_npc.ui.no")
@@ -3808,6 +4150,7 @@ local function open_motion_browser()
             tostring(meta.boneCount or 0),
             tostring(meta.flexCount or 0),
             tostring(meta.musicSound or "") ~= "" and tostring(meta.musicSound) or L("mmd_vmd_npc.ui.none"),
+            meta.hasCamera and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
             tostring(meta.sourceName or "")
         ))
         offsetEntry:SetValue(tonumber(MMDVMDNPC.AudioOffsets[selectedMotion or ""]) or 0)

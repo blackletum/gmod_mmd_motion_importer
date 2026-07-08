@@ -356,6 +356,42 @@ function MMDVMDNPC.ResolveFlexID(ent, sourceName, mmdName)
     return -1, ""
 end
 
+-- Optional MMD camera track exported by the importer: entity-local eye
+-- position (source units), local view angles (degrees) and vertical fov per
+-- sampled key. Invalid tracks are dropped silently so old motions keep loading.
+local MAX_CAMERA_KEYS = 20000
+
+local function normalize_camera_track(raw)
+    if not istable(raw) or not istable(raw.keys) then return nil end
+
+    local keys = {}
+    for _, rawKey in ipairs(raw.keys) do
+        if istable(rawKey) then
+            keys[#keys + 1] = {
+                frame = math.max(0, math.floor(number_or(rawKey[1], 0))),
+                x = number_or(rawKey[2], 0),
+                y = number_or(rawKey[3], 0),
+                z = number_or(rawKey[4], 0),
+                p = number_or(rawKey[5], 0),
+                yw = number_or(rawKey[6], 0),
+                r = number_or(rawKey[7], 0),
+                fov = math.Clamp(number_or(rawKey[8], 30), 1, 179),
+            }
+            if #keys >= MAX_CAMERA_KEYS then break end
+        end
+    end
+    if #keys <= 0 then return nil end
+
+    table.sort(keys, function(a, b) return a.frame < b.frame end)
+    return {
+        fps = math.max(1, math.floor(number_or(raw.fps, MMDVMDNPC.VMDFPS or 30))),
+        frameStart = math.floor(number_or(raw.frame_start, keys[1].frame)),
+        frameEnd = math.floor(number_or(raw.frame_end, keys[#keys].frame)),
+        keyCount = #keys,
+        keys = keys,
+    }
+end
+
 local function motion_file_info(motionID)
     local path, id = MMDVMDNPC.MotionPath(motionID)
     if not path or not id then return nil end
@@ -435,6 +471,7 @@ local function read_motion_file(info)
         defaultAudioOffset = number_or(parsed.audio_offset, istable(parsed.music) and number_or(parsed.music.offset or parsed.music.default_offset, 0) or 0),
         boneTracks = {},
         flexTracks = {},
+        camera = normalize_camera_track(parsed.camera),
     }
     motion.duration = math.max(0, (motion.frameEnd - motion.frameStart) / motion.fps)
 
@@ -492,6 +529,7 @@ function MMDVMDNPC.MotionMetadata(motionID)
         musicSource = motion.music and motion.music.source or "",
         musicSampleRate = motion.music and motion.music.sampleRate or 0,
         musicOffset = motion.defaultAudioOffset or (motion.music and motion.music.offset) or 0,
+        hasCamera = motion.camera ~= nil,
     }
 end
 

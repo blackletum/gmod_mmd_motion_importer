@@ -185,6 +185,7 @@ class PreviewWidget(QOpenGLWidget):
         self._view_pitch = 0.0
         self._view_zoom = 1.0
         self._view_pan = QtCore.QPointF(0.0, 0.0)
+        self._follow_camera = True
         self._last_mouse_pos: QtCore.QPoint | None = None
         self._show_bone_overlay = False
         self._show_bone_names = False
@@ -217,8 +218,9 @@ class PreviewWidget(QOpenGLWidget):
         body_vmd_path: Path,
         flex_vmd_paths: list[Path] | None = None,
         music_path: Path | None = None,
+        camera_vmd_path: Path | None = None,
     ) -> PreviewScene:
-        self.scene_data = load_preview_scene(model_path, body_vmd_path, flex_vmd_paths, music_path)
+        self.scene_data = load_preview_scene(model_path, body_vmd_path, flex_vmd_paths, music_path, camera_vmd_path)
         self._prepare_scene_cache()
         self.reset_front_view()
         self.current_frame = float(self.scene_data.frame_start)
@@ -248,6 +250,13 @@ class PreviewWidget(QOpenGLWidget):
         self._audio_offset_seconds = float(seconds or 0.0)
         if self.scene_data and self.scene_data.music_path:
             self._sync_audio_to_frame(force=True, play_if_ready=self.playing)
+
+    def set_follow_camera(self, enabled: bool) -> None:
+        self._follow_camera = bool(enabled)
+        self.update()
+
+    def has_camera_motion(self) -> bool:
+        return bool(self.scene_data and self.scene_data.camera_frames)
 
     def set_bone_overlay_enabled(self, enabled: bool) -> None:
         self._show_bone_overlay = bool(enabled)
@@ -847,7 +856,59 @@ class PreviewWidget(QOpenGLWidget):
         # clip-space w row.
         GL.glLoadMatrixf(np.ascontiguousarray(matrix.T, dtype=np.float32))
 
+    def _camera_projection_view(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Perspective look-through matrices for the MMD camera at the current
+        frame, or None when no camera motion is loaded.
+
+        The right vector uses the left-handed cross product (up x forward)
+        because PMX/VMD data is left-handed and rendered here as-is; this keeps
+        the camera framing un-mirrored, matching MMD and the in-game camera.
+        """
+        scene = self.scene_data
+        if not self._follow_camera or not scene or not scene.camera_frames:
+            return None
+
+        target, rotation, distance, fov = import_vmd.sample_camera_frames(scene.camera_frames, self.current_frame)
+        eye, forward, up = import_vmd.mmd_camera_pose(target, rotation, distance)
+        eye = np.array(eye, dtype=np.float64)
+        f = np.array(forward, dtype=np.float64)
+        f /= max(1e-9, np.linalg.norm(f))
+        u = np.array(up, dtype=np.float64)
+        s = np.cross(u, f)  # left-handed: screen-right
+        s /= max(1e-9, np.linalg.norm(s))
+        u = np.cross(f, s)
+        u /= max(1e-9, np.linalg.norm(u))
+
+        view = np.identity(4, dtype=np.float64)
+        view[0, :3] = s
+        view[1, :3] = u
+        view[2, :3] = -f
+        view[0, 3] = -np.dot(s, eye)
+        view[1, 3] = -np.dot(u, eye)
+        view[2, 3] = np.dot(f, eye)
+
+        width = max(1, self.width())
+        height = max(1, self.height())
+        aspect = width / height
+        near = max(0.05, self._scene_extent * 0.01)
+        far = max(4000.0, self._scene_extent * 40.0)
+        t = 1.0 / math.tan(math.radians(max(1.0, min(179.0, fov))) * 0.5)
+        proj = np.array(
+            [
+                [t / aspect, 0.0, 0.0, 0.0],
+                [0.0, t, 0.0, 0.0],
+                [0.0, 0.0, -(far + near) / (far - near), -2.0 * far * near / (far - near)],
+                [0.0, 0.0, -1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        return proj, view
+
     def _projection_view_matrices(self) -> tuple[np.ndarray, np.ndarray]:
+        camera = self._camera_projection_view()
+        if camera is not None:
+            return camera
+
         width = max(1, self.width())
         height = max(1, self.height())
         aspect = width / height
@@ -891,6 +952,14 @@ class PreviewWidget(QOpenGLWidget):
         w = clip[:, 3]
         safe_w = np.where(np.abs(w) <= 1e-8, 1.0, w)
         ndc = clip[:, :3] / safe_w[:, None]
+        # Points behind a perspective camera have negative clip-space w; the
+        # division mirrors them onto the screen. Push them far offscreen and
+        # behind the depth range so overlays never draw ghost bones.
+        behind = w <= 1e-8
+        if behind.any():
+            ndc[behind, 0] = -1e6
+            ndc[behind, 1] = -1e6
+            ndc[behind, 2] = 2.0
         x = self.width() * (0.5 + ndc[:, 0] * 0.5)
         y = self.height() * (0.5 - ndc[:, 1] * 0.5)
         return [QtCore.QPointF(float(px), float(py)) for px, py in zip(x, y)], ndc[:, 2]
@@ -908,7 +977,7 @@ class PreviewWidget(QOpenGLWidget):
         if bone_world is None:
             bone_world = np.array([bone.position for bone in scene.bones], dtype=np.float64)
 
-        points = [self._project_point(bone_world[index]) for index in range(len(scene.bones))]
+        points, _ = self._project_np(np.asarray(bone_world[: len(scene.bones)], dtype=np.float64))
         if self._show_bone_overlay:
             painter.setPen(QtGui.QPen(QtGui.QColor(80, 170, 255, 170), 1))
             for index, bone in enumerate(scene.bones):
