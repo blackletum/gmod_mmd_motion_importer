@@ -1,4 +1,5 @@
 # GMod MMD Motion Importer
+Visit: https://steamcommunity.com/sharedfiles/filedetails/?id=3718373357
 
 Qt-based Windows importer for converting MMD `.vmd` motions into motion JSON files used by the `mmd_vmd_npc` Garry's Mod addon. The importer can preview PMX/VMD motion, bake IK through Blender, merge optional face/flex VMDs, convert audio/video to GMod MP3 sound, and optionally package an imported motion as a `.gma` addon.
 
