@@ -4,7 +4,7 @@ local DATA_FILE = "mmdvmd_favorites.json"
 
 function MMDVMDNPC.ToggleFavorite(name)
     if not name or name == "" or name == "stop_playback" then return end
-    
+
     local found = false
     for k, v in ipairs(MMDVMDNPC.RadialFavorites) do
         if v == name then
@@ -13,13 +13,24 @@ function MMDVMDNPC.ToggleFavorite(name)
             break
         end
     end
-    
+
     if not found then
         table.insert(MMDVMDNPC.RadialFavorites, name)
     end
-    
+
     MMDVMDNPC.SaveRadial()
     return not found
+end
+
+-- Whether a motion id is currently on the wheel (used by the Motion Manager to
+-- show wheel membership and label the add/remove button).
+function MMDVMDNPC.IsFavorite(name)
+    name = tostring(name or "")
+    if name == "" then return false end
+    for _, v in ipairs(MMDVMDNPC.RadialFavorites or {}) do
+        if v == name then return true end
+    end
+    return false
 end
 
 -- Load
@@ -59,23 +70,67 @@ end
 
 local PANEL = {}
 
+local function WrapWord(word, maxWidth)
+    -- Break a single space-free word (e.g. a CJK motion title) into chunks that
+    -- fit maxWidth, iterating by UTF-8 codepoint so multibyte characters are
+    -- never split mid-sequence.
+    local chunks = {}
+    local current = ""
+    local iter = (utf8 and utf8.codes) and utf8.codes or nil
+    if iter then
+        for _, code in iter(word) do
+            local char = utf8.char(code)
+            local test = current .. char
+            local w = surface.GetTextSize(test)
+            if w > maxWidth and current ~= "" then
+                chunks[#chunks + 1] = current
+                current = char
+            else
+                current = test
+            end
+        end
+    else
+        current = word
+    end
+    if current ~= "" then chunks[#chunks + 1] = current end
+    if #chunks == 0 then chunks[1] = word end
+    return chunks
+end
+
 local function WrapText(text, font, maxWidth)
     surface.SetFont(font)
     local words = string.Explode(" ", text)
     local lines = {}
     local currentLine = ""
 
-    for _, word in ipairs(words) do
-        local testLine = currentLine == "" and word or currentLine .. " " .. word
-        local w, h = surface.GetTextSize(testLine)
-        if w > maxWidth and currentLine ~= "" then
-            table.insert(lines, currentLine)
-            currentLine = word
-        else
-            currentLine = testLine
+    local function flush()
+        if currentLine ~= "" then
+            lines[#lines + 1] = currentLine
+            currentLine = ""
         end
     end
-    table.insert(lines, currentLine)
+
+    for _, word in ipairs(words) do
+        local wordWidth = surface.GetTextSize(word)
+        if wordWidth > maxWidth then
+            -- A single word wider than the box: flush what we have and split it.
+            flush()
+            for _, chunk in ipairs(WrapWord(word, maxWidth)) do
+                lines[#lines + 1] = chunk
+            end
+        else
+            local testLine = currentLine == "" and word or currentLine .. " " .. word
+            local w = surface.GetTextSize(testLine)
+            if w > maxWidth and currentLine ~= "" then
+                lines[#lines + 1] = currentLine
+                currentLine = word
+            else
+                currentLine = testLine
+            end
+        end
+    end
+    flush()
+    if #lines == 0 then lines[1] = text end
     return lines
 end
 
@@ -83,31 +138,41 @@ function PANEL:Init()
     self:SetSize(ScrW(), ScrH())
     self:Center()
     self:MakePopup()
+    -- MakePopup grabs keyboard focus, which can swallow the wheel bind's key-up
+    -- so -mmd_wheel never fires. The wheel is mouse-driven, so release keyboard
+    -- capture and keep only mouse input.
+    self:SetKeyboardInputEnabled(false)
     self:SetAlpha(0)
     self:AlphaTo(255, 0.1)
-    
+
     self.Favorites = {}
     for _, v in ipairs(MMDVMDNPC.RadialFavorites) do
         if v ~= "toggle_cam_mode" then
             table.insert(self.Favorites, v)
         end
     end
-    
+
     self.Count = #self.Favorites
     self.SelectedIndex = 0
     self.Segments = {}
     self.LerpAlpha = {}
     self.PrecachedNames = {}
-    
+
+    -- Derive the geometry from the viewport so the ring and the FOLLOW toggle
+    -- below it stay on screen at low resolutions (e.g. 800x600).
+    self.OuterRadius = math.min(260, ScrH() * 0.40)
+    self.InnerRadius = self.OuterRadius * 0.31
+    self.TextRadius = self.OuterRadius * 0.65
+
     local cx, cy = ScrW()/2, ScrH()/2
     local step = self.Count > 0 and (360 / self.Count) or 0
     local font = "DermaDefaultBold"
     local maxTextWidth = 120
-    
+
     for i = 1, self.Count do
         local startAng = (i - 1) * step - 90 - (step / 2)
         local endAng = startAng + step
-        self.Segments[i] = GetArcPoly(cx, cy, startAng, endAng, 260, 80, 30)
+        self.Segments[i] = GetArcPoly(cx, cy, startAng, endAng, self.OuterRadius, self.InnerRadius, 30)
         self.LerpAlpha[i] = 0
         local rawName = MMDVMDNPC.GetNiceName(self.Favorites[i] or "Unknown")
         self.PrecachedNames[i] = WrapText(rawName, font, maxTextWidth)
@@ -126,15 +191,18 @@ function PANEL:Paint(w, h)
     local dx, dy = mx - cx, my - cy
     local dist = math.sqrt(dx*dx + dy*dy)
     
+    local outerRadius = self.OuterRadius or 260
+    local innerRadius = self.InnerRadius or 80
     local btnW, btnH = self.ToggleBtn.w, self.ToggleBtn.h
-    local btnX, btnY = cx - btnW/2, cy + 280 
+    local btnX = cx - btnW/2
+    local btnY = math.min(cy + outerRadius + 20, h - btnH - 10)
     local isOverToggle = mx > btnX and mx < btnX + btnW and my > btnY and my < btnY + btnH
-    self.IsOverToggle = isOverToggle  
+    self.IsOverToggle = isOverToggle
 
     -- Choice
     local step = self.Count > 0 and (360 / self.Count) or 0
     self.SelectedIndex = 0
-    if dist > 80 and dist < 280 and not isOverToggle then
+    if dist > innerRadius and dist < outerRadius and not isOverToggle then
         local mouseAngle = math.deg(math.atan2(dy, dx)) + 90
         if mouseAngle < 0 then mouseAngle = mouseAngle + 360 end
         local adjustedAngle = (mouseAngle + step/2) % 360
@@ -157,8 +225,9 @@ function PANEL:Paint(w, h)
         end
 
         local textAng = math.rad((i - 1) * step - 90)
-        local tx = cx + math.cos(textAng) * 170
-        local ty = cy + math.sin(textAng) * 170
+        local textRadius = self.TextRadius or 170
+        local tx = cx + math.cos(textAng) * textRadius
+        local ty = cy + math.sin(textAng) * textRadius
         
         local lines = self.PrecachedNames[i]
         local font = "DermaDefaultBold"
@@ -219,27 +288,29 @@ function PANEL:ToggleCameraMode()
 end
 
 function PANEL:ExecuteSelection(index)
+    -- Guard against a double fire: a mouse click executes and starts the close
+    -- fade, then the key-up (-mmd_wheel) would execute the same selection again.
+    -- CloseMenu (called below) sets self.Closed, so this entry guard blocks the
+    -- second call. Do NOT set self.Closed here or CloseMenu becomes a no-op and
+    -- the wheel never disappears.
+    if self.Closed then return end
     local act = self.Favorites[index]
     if not act then return end
 
     if act == "stop_playback" then
         MMDVMDNPC.RequestStopSelectedMotion()
-    else
-        net.Start("mmdvmd_select_target")
-            net.WriteEntity(LocalPlayer())
-        net.SendToServer()
-
-        RunConsoleCommand("mmd_vmd_npc_motion", act)
-
-        timer.Simple(0.1, function()
-            MMDVMDNPC.RequestPlaySelectedMotion()
-        end)
+    elseif MMDVMDNPC.RequestPlaySelfAuto then
+        -- Play the chosen motion on the player, auto-building first if the
+        -- playermodel has no cache for it yet.
+        MMDVMDNPC.RequestPlaySelfAuto(act)
     end
-    
+
     self:CloseMenu()
 end
 
 function PANEL:CloseMenu()
+    if self.Closed then return end
+    self.Closed = true
     self:AlphaTo(0, 0.1, 0, function()
         self:Remove()
         gui.EnableScreenClicker(false)
@@ -252,18 +323,29 @@ vgui.Register("MMD_RadialMenu", PANEL, "EditablePanel")
 
 local radialMenuInstance = nil
 
+local function radial_empty_message()
+    return (MMDVMDNPC.L and MMDVMDNPC.L("mmd_vmd_npc.radial.empty", "Favorites wheel is empty!"))
+        or "Favorites wheel is empty!"
+end
+
 concommand.Add("+mmd_wheel", function()
-    if #MMDVMDNPC.RadialFavorites == 0 then 
-        notification.AddLegacy("Колесо пусто!", NOTIFY_ERROR, 3)
-        return 
+    -- Count only entries the wheel will actually show (Init drops
+    -- "toggle_cam_mode"), so an all-filtered list does not open an empty wheel.
+    local playable = 0
+    for _, v in ipairs(MMDVMDNPC.RadialFavorites) do
+        if v ~= "toggle_cam_mode" then playable = playable + 1 end
     end
-    
+    if playable == 0 then
+        notification.AddLegacy(radial_empty_message(), NOTIFY_ERROR, 3)
+        return
+    end
+
     if IsValid(radialMenuInstance) then radialMenuInstance:Remove() end
     radialMenuInstance = vgui.Create("MMD_RadialMenu")
 end)
 
 concommand.Add("-mmd_wheel", function()
-    if IsValid(radialMenuInstance) then
+    if IsValid(radialMenuInstance) and not radialMenuInstance.Closed then
         if radialMenuInstance.SelectedIndex > 0 then
             radialMenuInstance:ExecuteSelection(radialMenuInstance.SelectedIndex)
         else

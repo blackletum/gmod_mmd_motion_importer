@@ -20,7 +20,64 @@ local ZERO_VECTOR = Vector(0, 0, 0)
 local ZERO_ANGLE = Angle(0, 0, 0)
 local ONE_SCALE = Vector(1, 1, 1)
 local BUILD_PACKET_LIMIT = 4096
+-- Hard ceiling on how many frames a single build may accumulate. A build with
+-- more source frames than this is rejected up front; without it, a client could
+-- stream an unbounded number of frames into job.frames and blow up server RAM
+-- and the on-disk JSON.
+local BUILD_MAX_FRAMES = 200000
+-- Seconds to wait for a client batch reply before re-requesting, and how many
+-- re-requests before the stuck job is aborted.
+local BUILD_STALL_SECONDS = 8
+local BUILD_MAX_RETRIES = 3
 local BUILD_FRAMES_PER_BATCH = 64
+
+-- Replace NaN/Inf coming off the wire with 0 so a malformed client cannot write
+-- non-finite numbers into the built-cache JSON (which util.JSONToTable then
+-- refuses to parse, permanently bricking the cache).
+local function finite_number(value)
+    value = tonumber(value) or 0
+    if value ~= value or value == math.huge or value == -math.huge then
+        return 0
+    end
+    return value
+end
+
+-- BuiltCache holds the fully decoded per-frame tables of every built animation.
+-- Each entry can be tens of MB, and the JSON always stays on disk, so keep only
+-- a bounded MRU set in memory. Entries referenced by an active playback are
+-- never evicted (playback also holds its own reference, so eviction is safe —
+-- a later playback just re-reads from disk).
+MMDVMDNPC.BuiltCacheOrder = MMDVMDNPC.BuiltCacheOrder or {}
+local BUILT_CACHE_MAX_ENTRIES = 16
+
+local function built_cache_path_in_use(path)
+    for _, state in pairs(MMDVMDNPC.Playbacks or {}) do
+        if state and state.path == path then return true end
+    end
+    return false
+end
+
+local function store_built_cache(path, built)
+    if not path or path == "" then return end
+    MMDVMDNPC.BuiltCache[path] = built
+
+    local order = MMDVMDNPC.BuiltCacheOrder
+    for i = #order, 1, -1 do
+        if order[i] == path then table.remove(order, i) end
+    end
+    order[#order + 1] = path
+
+    local index = 1
+    while #order > BUILT_CACHE_MAX_ENTRIES and index <= #order do
+        local candidate = order[index]
+        if candidate ~= path and not built_cache_path_in_use(candidate) then
+            MMDVMDNPC.BuiltCache[candidate] = nil
+            table.remove(order, index)
+        else
+            index = index + 1
+        end
+    end
+end
 local PLAYBACK_HZ = 120
 local SOURCE_PELVIS = "ValveBiped.Bip01_Pelvis"
 local SOURCE_RIGHT_UPPER_ARM = "ValveBiped.Bip01_R_UpperArm"
@@ -106,6 +163,31 @@ end
 
 local function LF(key, ...)
     return MMDVMDNPC.LFormat and MMDVMDNPC.LFormat(key, ...) or string.format(L(key, key), ...)
+end
+
+-- Who may mutate/delete shared server content (motions, built caches, flex
+-- overrides, audio offsets). "admin" (default) restricts it to admins; set to
+-- "all" to let any player edit. Singleplayer and listen hosts are admins, so
+-- the default does not affect solo use — it only blocks non-admin clients on
+-- dedicated servers from wiping content for everyone.
+local EDIT_PERMISSION_CVAR = CreateConVar(
+    "mmd_vmd_npc_edit_permission",
+    "admin",
+    FCVAR_ARCHIVE + FCVAR_NOTIFY,
+    "Who may delete/modify shared MMD VMD content: 'admin' or 'all'."
+)
+
+local function player_can_edit_content(ply)
+    if not IsValid(ply) then return true end -- console / server-side callers
+    if string.lower(EDIT_PERMISSION_CVAR:GetString()) == "all" then return true end
+    if game.SinglePlayer() then return true end
+    return ply:IsAdmin()
+end
+
+local function deny_edit_permission(ply)
+    if IsValid(ply) then
+        MMDVMDNPC.Chat(ply, L("mmd_vmd_npc.status.edit_permission_denied", "only admins may modify or delete shared MMD VMD content on this server"))
+    end
 end
 
 hook.Add("PlayerDisconnected", "MMDVMDNPCDebugTargetCleanup", function(ply)
@@ -501,13 +583,18 @@ local function send_target_status(ply, message)
     net.Send(ply)
 end
 
-local function send_build_done(ply, ok, path, message)
+-- buildID identifies the client-side streaming job this result belongs to.
+-- 0 means "notification not tied to an in-flight build" (cache already exists,
+-- invalid request, queue message); the client must not tear down a running
+-- build for those. Only finalize/abort paths for the active job pass job.id.
+local function send_build_done(ply, ok, path, message, buildID)
     if not IsValid(ply) then return end
 
     net.Start("mmdvmd_build_done")
         net.WriteBool(ok == true)
         net.WriteString(tostring(path or ""))
         net.WriteString(tostring(message or ""))
+        net.WriteUInt(math.max(0, tonumber(buildID) or 0), 32)
     net.Send(ply)
 end
 
@@ -1303,6 +1390,22 @@ local function lerp_value(a, b, fraction)
     return (a or 0) + ((b or 0) - (a or 0)) * fraction
 end
 
+-- Largest index i with keys[i].frame <= frame. Keys are sorted ascending on
+-- load (sv_cache normalize_track), so builds sampling thousands of baked
+-- keyframes stay O(log n) per sample instead of scanning the whole track.
+local function track_span_index(keys, frame)
+    local low, high = 1, #keys
+    while low < high do
+        local mid = math.floor((low + high + 1) / 2)
+        if keys[mid].frame <= frame then
+            low = mid
+        else
+            high = mid - 1
+        end
+    end
+    return low
+end
+
 local function sample_track(track, frame)
     local keys = track and track.keys or {}
     if #keys <= 0 then return 0, 0, 0, 0, 0, 0 end
@@ -1316,23 +1419,17 @@ local function sample_track(track, frame)
         return key.x, key.y, key.z, key.px, key.py, key.pz
     end
 
-    for i = 1, #keys - 1 do
-        local a = keys[i]
-        local b = keys[i + 1]
-        if frame >= a.frame and frame <= b.frame then
-            local span = math.max(0.000001, b.frame - a.frame)
-            local fraction = (frame - a.frame) / span
-            return lerp_value(a.x, b.x, fraction),
-                lerp_value(a.y, b.y, fraction),
-                lerp_value(a.z, b.z, fraction),
-                lerp_value(a.px, b.px, fraction),
-                lerp_value(a.py, b.py, fraction),
-                lerp_value(a.pz, b.pz, fraction)
-        end
-    end
-
-    local key = keys[#keys]
-    return key.x, key.y, key.z, key.px, key.py, key.pz
+    local index = track_span_index(keys, frame)
+    local a = keys[index]
+    local b = keys[index + 1] or a
+    local span = math.max(0.000001, b.frame - a.frame)
+    local fraction = (frame - a.frame) / span
+    return lerp_value(a.x, b.x, fraction),
+        lerp_value(a.y, b.y, fraction),
+        lerp_value(a.z, b.z, fraction),
+        lerp_value(a.px, b.px, fraction),
+        lerp_value(a.py, b.py, fraction),
+        lerp_value(a.pz, b.pz, fraction)
 end
 
 local function sample_flex_track(track, frame)
@@ -1346,17 +1443,12 @@ local function sample_flex_track(track, frame)
         return keys[#keys].weight or 0
     end
 
-    for i = 1, #keys - 1 do
-        local a = keys[i]
-        local b = keys[i + 1]
-        if frame >= a.frame and frame <= b.frame then
-            local span = math.max(0.000001, b.frame - a.frame)
-            local fraction = (frame - a.frame) / span
-            return math.Clamp(lerp_value(a.weight, b.weight, fraction), 0, 1)
-        end
-    end
-
-    return keys[#keys].weight or 0
+    local index = track_span_index(keys, frame)
+    local a = keys[index]
+    local b = keys[index + 1] or a
+    local span = math.max(0.000001, b.frame - a.frame)
+    local fraction = (frame - a.frame) / span
+    return math.Clamp(lerp_value(a.weight, b.weight, fraction), 0, 1)
 end
 
 local function clamp_frame(motion, requestedFrame)
@@ -1540,10 +1632,17 @@ local start_next_queued_build
 local function safe_batch_count(job, requestedBatch)
     local boneCount = #(job.motion.boneTracks or {})
     local flexCount = #(job.motion.flexTracks or {})
-    local perFrameBytes = 4 + boneCount * 24 + flexCount * 4  
+    -- Bound the batch by BOTH message directions. The server->client request is
+    -- 4 + 24*bones + 4*flexes bytes/frame; the client->server reply is larger
+    -- per resolved track (a bone entry is ~26 B, a flex entry 6 B, plus 8 B of
+    -- per-frame overhead vs 4). A batch that only fits the request can overflow
+    -- the 64KB reply and stall the build, so size against the worst of the two.
+    local requestPerFrame = 4 + boneCount * 24 + flexCount * 4
+    local replyPerFrame = 8 + boneCount * 26 + flexCount * 6
+    local perFrameBytes = math.max(requestPerFrame, replyPerFrame)
     if perFrameBytes <= 0 then return requestedBatch end
 
-    local maxFrames = math.floor((MAX_NET_MESSAGE_BYTES - 64) / perFrameBytes)  
+    local maxFrames = math.floor((MAX_NET_MESSAGE_BYTES - 64) / perFrameBytes)
     return math.max(1, math.min(requestedBatch, maxFrames))
 end
 
@@ -1556,8 +1655,9 @@ local function send_build_frame_request(ply, job)
         return
     end
     if not is_usable_npc(job.ent) then
+        local abortedID = job.id
         clear_build_job(ply)
-        send_build_done(ply, false, "", "selected actor is no longer valid")
+        send_build_done(ply, false, "", "selected actor is no longer valid", abortedID)
         if start_next_queued_build then start_next_queued_build(ply) end
         return
     end
@@ -1566,6 +1666,7 @@ local function send_build_frame_request(ply, job)
     batchCount = safe_batch_count(job, batchCount)
     if batchCount <= 0 then return end
     job.lastRequestedBuildFrames = batchCount
+    job.lastRequestAt = CurTime()
     send_build_progress(
         ply,
         "building",
@@ -1710,11 +1811,11 @@ local function finalize_build(ply, job)
 
     file.CreateDir(MMDVMDNPC.BuiltRoot)
     file.Write(path, util.TableToJSON(built, false))
-    MMDVMDNPC.BuiltCache[path] = built
+    store_built_cache(path, built)
     clear_build_job(ply)
     send_assignment_status(ply)
 
-    send_build_done(ply, true, path, string.format("built %d frame(s)", #job.frames))
+    send_build_done(ply, true, path, string.format("built %d frame(s)", #job.frames), job.id)
     send_play_status(ply, "built", path)
     local pendingPlay = MMDVMDNPC.PendingAutoPlay[ply]
     if pendingPlay and pendingPlay.motionID == job.motionID then
@@ -1743,7 +1844,7 @@ local function load_built_animation(motionID, ent, options)
         return nil, "built animation model does not match selected actor"
     end
 
-    MMDVMDNPC.BuiltCache[path] = parsed
+    store_built_cache(path, parsed)
     return parsed, path
 end
 
@@ -2200,7 +2301,18 @@ function MMDVMDNPC.StopAllPlaybacksForPlayer(ply)
             MMDVMDNPC.StopPlayback(ent, true)
             stopped = stopped + 1
         elseif not is_usable_npc(ent) then
+            -- Tear the state down the same way update_playback_state does for an
+            -- invalidated entity: otherwise a self-proxy whose realPlayer is
+            -- still valid leaves that player permanently hidden/movement-locked.
             MMDVMDNPC.Playbacks[ent] = nil
+            if state then
+                send_audio_stop(state)
+                if state.cvarSuppression then
+                    end_scoped_cvar_suppression(state.cvarSuppression)
+                    state.cvarSuppression = nil
+                end
+                cleanup_self_proxy_state(state)
+            end
         end
     end
     if update_rpe_body_suppression then update_rpe_body_suppression() end
@@ -2310,6 +2422,38 @@ end
 function MMDVMDNPC.StartPlaybackForPlayer(ply, motionID, options, playbackSettings)
     local ent = MMDVMDNPC.DebugTargets[ply]
     return start_playback_on_entity(ply, ent, motionID, options, playbackSettings)
+end
+
+-- One-shot "play this motion on myself" used by the radial wheel: select the
+-- player as the target, then play if a built cache already exists for their
+-- playermodel+options, otherwise build it and auto-play the instant it finishes
+-- (no chat confirmation, unlike the manual play path).
+function MMDVMDNPC.PlayOrBuildSelfForPlayer(ply, motionID, options, playbackSettings)
+    if not IsValid(ply) then return false, L("mmd_vmd_npc.status.invalid_player", "invalid player") end
+
+    options = normalize_options(options and options.disableArmTwist, options and options.disableHandTwist, options and options.disableEyes, options and options.disableSpinePelvisCorrection)
+    playbackSettings = playbackSettings or playback_settings_from_values(nil, nil)
+
+    local ok, err = MMDVMDNPC.SelectTargetForPlayer(ply, ply)
+    if not ok then
+        if err then MMDVMDNPC.Chat(ply, err) end
+        return false, err
+    end
+
+    if MMDVMDNPC.HasBuiltAnimationForPlayer(ply, motionID, options) then
+        return MMDVMDNPC.StartPlaybackForPlayer(ply, motionID, options, playbackSettings)
+    end
+
+    MMDVMDNPC.PendingAutoPlay[ply] = {
+        motionID = MMDVMDNPC.NormalizeMotionID(motionID) or tostring(motionID or ""),
+        settings = playbackSettings,
+    }
+    send_play_status(ply, "building", "building this motion for your playermodel, then playing automatically")
+    local buildOK, buildErr = MMDVMDNPC.BeginBuildForPlayer(ply, motionID, options, playbackSettings)
+    if not buildOK then
+        MMDVMDNPC.PendingAutoPlay[ply] = nil
+    end
+    return buildOK, buildErr
 end
 
 local function copy_playback_settings(settings)
@@ -2762,18 +2906,20 @@ local function update_build_job(ply, job, now)
         return
     end
     if not is_usable_npc(job.ent) then
+        local abortedID = job.id
         clear_build_job(ply)
         freeze_player_target(job.ent, false)
-        send_build_done(ply, false, "", "selected actor is no longer valid")
+        send_build_done(ply, false, "", "selected actor is no longer valid", abortedID)
         if start_next_queued_build then start_next_queued_build(ply) end
         return
     end
     local referenceInfo, referenceErr = lookup_required_reference_sequence_info(job.ent)
     if not referenceInfo then
         local message = referenceErr or missing_reference_sequence_message()
+        local abortedID = job.id
         clear_build_job(ply)
         freeze_player_target(job.ent, false)
-        send_build_done(ply, false, "", message)
+        send_build_done(ply, false, "", message, abortedID)
         send_play_status(ply, "error", message, job.ent)
         MMDVMDNPC.Chat(ply, message)
         if start_next_queued_build then start_next_queued_build(ply) end
@@ -2801,6 +2947,28 @@ local function update_build_job(ply, job, now)
         send_build_plan(ply, job)
         send_build_progress(ply, "building", job, "starting hidden-model build")
         send_play_status(ply, "building", "starting hidden-model build")
+        send_build_frame_request(ply, job)
+        return
+    end
+
+    -- Progress otherwise depends entirely on the client answering each batch.
+    -- If it never replies (Lua error, dropped request, oversized reply), the job
+    -- would sit here forever holding cvar suppression and the frozen actor.
+    -- Re-request the pending batch a few times, then abort so the queue and
+    -- suppressed cvars are released.
+    local lastRequestAt = tonumber(job.lastRequestAt) or now
+    if now - lastRequestAt >= BUILD_STALL_SECONDS then
+        job.buildRetries = (tonumber(job.buildRetries) or 0) + 1
+        if job.buildRetries > BUILD_MAX_RETRIES then
+            local abortedID = job.id
+            clear_build_job(ply)
+            freeze_player_target(job.ent, false)
+            send_build_done(ply, false, "", "build timed out waiting for the client; try again", abortedID)
+            send_play_status(ply, "error", "build timed out waiting for the client", job.ent)
+            if start_next_queued_build then start_next_queued_build(ply) end
+            return
+        end
+        send_build_progress(ply, "building", job, string.format("client stalled; retrying batch (%d/%d)", job.buildRetries, BUILD_MAX_RETRIES))
         send_build_frame_request(ply, job)
     end
 end
@@ -2860,6 +3028,7 @@ net.Receive("mmdvmd_audio_settings_save", function(_, ply)
     local id = MMDVMDNPC.NormalizeMotionID(net.ReadString())
     local offset = math.Clamp(net.ReadFloat(), -5, 5)
     if not id then return end
+    if not player_can_edit_content(ply) then return deny_edit_permission(ply) end
 
     local offsets = load_audio_offsets()
     offsets[id] = offset
@@ -2916,6 +3085,7 @@ net.Receive("mmdvmd_flex_override_save", function(_, ply)
     local flexName = net.ReadString()
 
     if not is_usable_npc(ent) or MMDVMDNPC.DebugTargets[ply] ~= ent then return end
+    if not player_can_edit_content(ply) then return deny_edit_permission(ply) end
     local resolvedName = resolved_flex_name_on_entity(ent, flexName)
     if not resolvedName then
         send_play_status(ply, "error", "selected model flex was not found", ent)
@@ -2944,6 +3114,7 @@ net.Receive("mmdvmd_flex_override_clear", function(_, ply)
     local sourceName = net.ReadString()
 
     if not is_usable_npc(ent) or MMDVMDNPC.DebugTargets[ply] ~= ent then return end
+    if not player_can_edit_content(ply) then return deny_edit_permission(ply) end
     if not MMDVMDNPC.ClearFlexOverrideForModel or not MMDVMDNPC.ClearFlexOverrideForModel(ent:GetModel() or "", mmdName, sourceName) then
         send_play_status(ply, "error", "no saved flex mapping was found", ent)
         return
@@ -2966,6 +3137,7 @@ net.Receive("mmdvmd_flex_override_unassign", function(_, ply)
     local sourceName = net.ReadString()
 
     if not is_usable_npc(ent) or MMDVMDNPC.DebugTargets[ply] ~= ent then return end
+    if not player_can_edit_content(ply) then return deny_edit_permission(ply) end
     if not MMDVMDNPC.SetFlexUnassignedForModel or not MMDVMDNPC.SetFlexUnassignedForModel(ent:GetModel() or "", mmdName, sourceName) then
         send_play_status(ply, "error", "failed to unassign flex mapping", ent)
         return
@@ -3028,6 +3200,9 @@ local function start_build_for_entity(ply, ent, motionID, options, playbackSetti
     end
 
     local _, startFrame, endFrame = clamp_frame(motion, motion.frameStart or 0)
+    if (endFrame - startFrame + 1) > BUILD_MAX_FRAMES then
+        return false, string.format("motion is too long to build (%d frames, max %d)", endFrame - startFrame + 1, BUILD_MAX_FRAMES)
+    end
     local path, normalizedID = MMDVMDNPC.BuiltPath(motionID, ent:GetModel() or "", options)
     if not path then
         return false, "invalid motion id"
@@ -3372,6 +3547,10 @@ net.Receive("mmdvmd_build_frame_result", function(_, ply)
     local resultCount = net.ReadUInt(8)
     local job = MMDVMDNPC.BuildJobs[ply]
     if not job or job.id ~= buildID then return end
+    -- Reject frame results that arrive before a batch was actually requested:
+    -- without a matching request a client could fabricate and persist a whole
+    -- built animation with no client-side retargeting pass.
+    if not job.sentPlan or not job.lastRequestedBuildFrames then return end
     resultCount = math.Clamp(resultCount, 0, math.min(clamp_build_frames_per_batch(job.buildFramesPerBatch), tonumber(job.lastRequestedBuildFrames) or 255))
     if not ai_disabled_enabled() then
         clear_build_job(ply)
@@ -3380,19 +3559,27 @@ net.Receive("mmdvmd_build_frame_result", function(_, ply)
         return
     end
     if not is_usable_npc(job.ent) then
+        local abortedID = job.id
         clear_build_job(ply)
-        send_build_done(ply, false, "", "selected actor is no longer valid")
+        send_build_done(ply, false, "", "selected actor is no longer valid", abortedID)
         if start_next_queued_build then start_next_queued_build(ply) end
         return
     end
 
+    -- The client can only legitimately report as many tracks as the motion has;
+    -- bound the per-frame counts to the motion so a malicious client cannot
+    -- inflate every frame to 4096 tracks and exhaust server memory/disk.
+    local maxBoneCount = math.min(BUILD_PACKET_LIMIT, #(job.motion.boneTracks or {}))
+    local maxFlexCount = math.min(BUILD_PACKET_LIMIT, #(job.motion.flexTracks or {}))
+
     local expectedFrame = job.currentFrame
     for _ = 1, resultCount do
         local frame = net.ReadUInt(32)
-        local boneCount = math.Clamp(net.ReadUInt(16), 0, BUILD_PACKET_LIMIT)
+        local boneCount = math.Clamp(net.ReadUInt(16), 0, maxBoneCount)
         if frame ~= expectedFrame then
+            local abortedID = job.id
             clear_build_job(ply)
-            send_build_done(ply, false, "", "build frame order mismatch")
+            send_build_done(ply, false, "", "build frame order mismatch", abortedID)
             if start_next_queued_build then start_next_queued_build(ply) end
             return
         end
@@ -3405,17 +3592,17 @@ net.Receive("mmdvmd_build_frame_result", function(_, ply)
         for _ = 1, boneCount do
             local bone = net.ReadUInt(16)
             local ang = net.ReadAngle()
-            local pos = Vector(net.ReadFloat(), net.ReadFloat(), net.ReadFloat())
-            frameData.bones[#frameData.bones + 1] = { bone, ang.p or 0, ang.y or 0, ang.r or 0, pos.x or 0, pos.y or 0, pos.z or 0 }
+            local pos = Vector(finite_number(net.ReadFloat()), finite_number(net.ReadFloat()), finite_number(net.ReadFloat()))
+            frameData.bones[#frameData.bones + 1] = { bone, finite_number(ang.p), finite_number(ang.y), finite_number(ang.r), pos.x, pos.y, pos.z }
             if not job.bones[bone] then
                 job.bones[bone] = job.ent.GetBoneName and (job.ent:GetBoneName(bone) or "") or ""
             end
         end
 
-        local flexCount = math.Clamp(net.ReadUInt(16), 0, BUILD_PACKET_LIMIT)
+        local flexCount = math.Clamp(net.ReadUInt(16), 0, maxFlexCount)
         for _ = 1, flexCount do
             local flexID = net.ReadInt(16)
-            local weight = math.Clamp(net.ReadFloat(), 0, 1)
+            local weight = math.Clamp(finite_number(net.ReadFloat()), 0, 1)
             frameData.flexes[#frameData.flexes + 1] = { flexID, weight }
             if flexID >= 0 and not job.flexes[flexID] then
                 job.flexes[flexID] = job.ent.GetFlexName and (job.ent:GetFlexName(flexID) or "") or ""
@@ -3427,6 +3614,7 @@ net.Receive("mmdvmd_build_frame_result", function(_, ply)
     end
 
     job.currentFrame = expectedFrame
+    job.buildRetries = 0
     if job.currentFrame > job.endFrame then
         finalize_build(ply, job)
     else
@@ -3440,6 +3628,14 @@ net.Receive("mmdvmd_play_request", function(_, ply)
     local options = normalize_options(net.ReadBool(), net.ReadBool(), net.ReadBool(), net.ReadBool())
     local settings = playback_settings_with_eye_track(net.ReadFloat(), net.ReadFloat(), net.ReadString(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool())
     local ok, err = MMDVMDNPC.StartPlaybackForPlayer(ply, motionID, options, settings)
+    if not ok and err then MMDVMDNPC.Chat(ply, err) end
+end)
+
+net.Receive("mmdvmd_play_self_auto", function(_, ply)
+    local motionID = net.ReadString()
+    local options = normalize_options(net.ReadBool(), net.ReadBool(), net.ReadBool(), net.ReadBool())
+    local settings = playback_settings_with_eye_track(net.ReadFloat(), net.ReadFloat(), net.ReadString(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool(), net.ReadFloat(), net.ReadFloat(), net.ReadFloat(), net.ReadBool())
+    local ok, err = MMDVMDNPC.PlayOrBuildSelfForPlayer(ply, motionID, options, settings)
     if not ok and err then MMDVMDNPC.Chat(ply, err) end
 end)
 
@@ -3509,11 +3705,13 @@ end)
 net.Receive("mmdvmd_clear_built_request", function(_, ply)
     local motionID = net.ReadString()
     local scope = net.ReadString()
+    if not player_can_edit_content(ply) then return deny_edit_permission(ply) end
     MMDVMDNPC.ClearBuiltForPlayer(ply, motionID, scope)
 end)
 
 net.Receive("mmdvmd_delete_motion_request", function(_, ply)
     local motionID = net.ReadString()
+    if not player_can_edit_content(ply) then return deny_edit_permission(ply) end
     MMDVMDNPC.DeleteMotionForPlayer(ply, motionID)
 end)
 

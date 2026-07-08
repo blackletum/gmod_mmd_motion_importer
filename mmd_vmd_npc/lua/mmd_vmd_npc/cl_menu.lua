@@ -261,6 +261,29 @@ function MMDVMDNPC.RequestPlayAssignedGroup()
     net.SendToServer()
 end
 
+-- Play a motion on the local player, building it first if the playermodel has no
+-- cache yet. Used by the radial wheel so a single selection always results in
+-- playback without a manual build step.
+function MMDVMDNPC.RequestPlaySelfAuto(motionID)
+    motionID = tostring(motionID or "")
+    if motionID == "" then
+        local current = GetConVar("mmd_vmd_npc_motion")
+        motionID = current and current:GetString() or ""
+    end
+    if motionID == "" then
+        play_ui_cue("blocked")
+        print("[MMD VMD] " .. L("mmd_vmd_npc.error.select_motion"))
+        return
+    end
+
+    RunConsoleCommand("mmd_vmd_npc_motion", motionID)
+    net.Start("mmdvmd_play_self_auto")
+        net.WriteString(motionID)
+        write_selected_options()
+        write_selected_playback_settings()
+    net.SendToServer()
+end
+
 function MMDVMDNPC.RequestStopSelectedMotion()
     net.Start("mmdvmd_stop_request")
     net.SendToServer()
@@ -1042,10 +1065,16 @@ local function destroy_build_dummy()
     end_build_dummy_cvar_suppression()
 end
 
-local function build_dummy_for_target(target)
-    if not IsValid(target) then return nil end
+-- Build a hidden dummy for the given model. The optional target only supplies a
+-- world angle; retargeting produces bone-local manipulation angles that are
+-- invariant to the dummy's overall yaw, so a NULL/never-networked target (e.g.
+-- an NPC outside the builder's PVS) still yields a correct build from the model
+-- string alone. Returns nil only when the model itself cannot be instantiated.
+local function build_dummy_for_model(model, target)
+    model = tostring(model or "")
+    if IsValid(target) and model == "" then model = target:GetModel() or "" end
+    if model == "" then return nil end
 
-    local model = target:GetModel() or ""
     local dummy = MMDVMDNPC.BuildDummy
     if not IsValid(dummy) or dummy:GetModel() ~= model then
         destroy_build_dummy()
@@ -1063,6 +1092,11 @@ local function build_dummy_for_target(target)
     if dummy.SetColor then dummy:SetColor(Color(255, 255, 255, 0)) end
     setup_bones_now(dummy)
     return dummy
+end
+
+local function build_dummy_for_target(target)
+    if not IsValid(target) then return nil end
+    return build_dummy_for_model(target:GetModel() or "", target)
 end
 
 local function clear_local_playback_pose(ent, built)
@@ -1631,6 +1665,12 @@ local function play_synced_audio(token, soundPath, sourceEnt, offset, startTime,
                 print("[MMD VMD] " .. LF("mmd_vmd_npc.console.failed_play_music_fmt", filename, tostring(errName or errID or L("mmd_vmd_npc.ui.unknown", "unknown"))))
                 return
             end
+            -- A stop that raced the async file load already removed this state;
+            -- do not let the finished channel play forever as an orphan.
+            if MMDVMDNPC.AudioChannels[token] ~= state then
+                if channel.Stop then channel:Stop() end
+                return
+            end
             state.channel = channel
             if channel.Set3DFadeDistance then channel:Set3DFadeDistance(350, 1500) end
             if channel.SetPos and IsValid(state.sourceEnt) then channel:SetPos(state.sourceEnt:GetPos()) end
@@ -1906,6 +1946,244 @@ local function scaled_flex_weight(row)
     return math.Clamp(raw * scale, 0, 1)
 end
 
+-- Fast build path -----------------------------------------------------------
+-- The legacy build path (rebuild_debug_preview) re-poses the hidden dummy and
+-- calls SetupBones once per bone per frame to read each baseline back from the
+-- engine. Those baselines are deterministic: a bone's oriented baseline is its
+-- reference-pose orientation re-parented through the nearest already-applied
+-- ancestor. The fast path captures the reference skeleton once per build job
+-- and computes every baseline in closed form, so a frame needs one SetupBones
+-- (for the spine correction readback and self-verification) instead of one per
+-- bone. Every frame is verified against the engine result; on any mismatch the
+-- job permanently falls back to the legacy path, so output is always
+-- equivalent to the legacy build within FAST_BUILD_VERIFY_EPSILON degrees.
+local FAST_BUILD_VERIFY_EPSILON = 0.5
+
+local function fast_build_enabled()
+    return convar_bool("mmd_vmd_npc_fast_build", true)
+end
+
+local function angle_error_degrees(a, b)
+    local dot = math.min(a:Forward():Dot(b:Forward()), a:Up():Dot(b:Up()))
+    return math.deg(math.acos(math.Clamp(dot, -1, 1)))
+end
+
+local function fast_skeleton_for_dummy(job, dummy)
+    local model = dummy:GetModel() or ""
+    local cache = job.fastSkeleton
+    if cache and cache.ent == dummy and cache.model == model then return cache end
+
+    local _, referenceInfo = force_reference_pose(dummy)
+    referenceInfo = referenceInfo or lookup_reference_sequence_info(dummy)
+    clear_all_bone_manipulations(dummy)
+
+    cache = {
+        ent = dummy,
+        model = model,
+        referenceInfo = referenceInfo,
+        restLocal = {},
+        bySource = {},
+    }
+
+    local captureAng = dummy:GetAngles()
+    local boneCount = dummy.GetBoneCount and dummy:GetBoneCount() or 0
+    for bone = 0, boneCount - 1 do
+        local matrix = dummy.GetBoneMatrix and dummy:GetBoneMatrix(bone) or nil
+        if matrix then
+            local _, localAng = WorldToLocal(ZERO_VECTOR, matrix:GetAngles(), ZERO_VECTOR, captureAng)
+            cache.restLocal[bone] = localAng
+        end
+    end
+
+    cache.pelvisBone = dummy.LookupBone and dummy:LookupBone(SOURCE_PELVIS) or nil
+    cache.spineBone = dummy.LookupBone and dummy:LookupBone(SOURCE_SPINE) or nil
+    if cache.pelvisBone and cache.spineBone then
+        cache.referenceSpineVector = bone_world_position(dummy, cache.spineBone) - bone_world_position(dummy, cache.pelvisBone)
+    end
+
+    job.fastSkeleton = cache
+    return cache
+end
+
+local function fast_annotate_rows(cache, dummy, rows)
+    local bySource = cache.bySource
+    for index, row in ipairs(rows) do
+        local source = row.source or ""
+        local info = bySource[source]
+        if info == nil then
+            local bone = dummy.LookupBone and dummy:LookupBone(source) or nil
+            info = {
+                bone = bone or false,
+                depth = bone and bone_depth(dummy, bone) or 999999,
+            }
+            bySource[source] = info
+        end
+        row.index = index
+        row.bone = info.bone or nil
+        row.depth = info.depth
+        row.resolved = info.bone ~= false and info.bone ~= nil
+        row.p = 0
+        row.localYaw = 0
+        row.r = 0
+    end
+
+    if not cache.ancByBone then
+        local tracked = {}
+        for _, row in ipairs(rows) do
+            if row.resolved then tracked[row.bone] = true end
+        end
+
+        local ancByBone = {}
+        local relByBone = {}
+        for bone in pairs(tracked) do
+            if not cache.restLocal[bone] then return false end
+            local parent = dummy.GetBoneParent and dummy:GetBoneParent(bone) or -1
+            local guard = 0
+            while parent and parent >= 0 and guard < 512 do
+                if tracked[parent] then break end
+                parent = dummy:GetBoneParent(parent)
+                guard = guard + 1
+            end
+            if parent and parent >= 0 and tracked[parent] then
+                if not cache.restLocal[parent] then return false end
+                ancByBone[bone] = parent
+                local _, rel = WorldToLocal(ZERO_VECTOR, cache.restLocal[bone], ZERO_VECTOR, cache.restLocal[parent])
+                relByBone[bone] = rel
+            end
+        end
+        cache.ancByBone = ancByBone
+        cache.relByBone = relByBone
+    end
+
+    for _, row in ipairs(rows) do
+        if row.resolved and not cache.restLocal[row.bone] then return false end
+    end
+    return true
+end
+
+local function fast_build_frame(job, dummy, rows, flexRows)
+    local cache = fast_skeleton_for_dummy(job, dummy)
+    if not cache then return nil end
+    if not fast_annotate_rows(cache, dummy, rows) then
+        job.fastUnsafe = true
+        return nil
+    end
+
+    table.sort(rows, function(a, b)
+        if a.resolved ~= b.resolved then return a.resolved end
+        if a.depth ~= b.depth then return a.depth < b.depth end
+        if (a.bone or 999999) ~= (b.bone or 999999) then return (a.bone or 999999) < (b.bone or 999999) end
+        return (a.index or 0) < (b.index or 0)
+    end)
+
+    local referenceInfo = cache.referenceInfo
+    local entAngles = dummy:GetAngles()
+    local packed = {}
+    local packedByBone = {}
+    local appliedAngles = {}
+    local appliedPositions = {}
+    local curWorld = {}
+    local function remember_packet(bone, ang, pos)
+        local packet = packedByBone[bone]
+        if not packet then
+            packet = { bone = bone, ang = ZERO_ANGLE, pos = ZERO_VECTOR }
+            packedByBone[bone] = packet
+            packed[#packed + 1] = packet
+        end
+        packet.ang = clean_angle(ang or ZERO_ANGLE)
+        packet.pos = copy_vector(pos or ZERO_VECTOR)
+    end
+
+    for _, row in ipairs(rows) do
+        if row.resolved then
+            local bone = row.bone
+            local anc = cache.ancByBone[bone]
+            local baseline
+            if anc ~= nil and curWorld[anc] then
+                local _, out = LocalToWorld(ZERO_VECTOR, cache.relByBone[bone], ZERO_VECTOR, curWorld[anc])
+                baseline = out
+            else
+                local _, out = LocalToWorld(ZERO_VECTOR, cache.restLocal[bone], ZERO_VECTOR, entAngles)
+                baseline = out
+            end
+
+            row.disabled = transforms_disabled_for_source(row.source)
+            if row.disabled then
+                curWorld[bone] = baseline
+                if dummy.ManipulateBonePosition then dummy:ManipulateBonePosition(bone, ZERO_VECTOR) end
+                if dummy.ManipulateBoneAngles then dummy:ManipulateBoneAngles(bone, ZERO_ANGLE, false) end
+            else
+                local degrees = raw_axis_to_model_axis_degrees(row.x, row.y, row.z, referenceInfo)
+                local position = transform_reference_vector_to_sequence_basis(Vector(row.px or 0, row.py or 0, row.pz or 0), referenceInfo)
+                if spine_pelvis_correction_enabled() and row_uses_runtime_spine_position(row) then
+                    position = Vector(0, 0, 0)
+                    row.runtimePosition = true
+                end
+
+                local desired = rotate_angle_around_sequential_model_axes(baseline, entAngles, degrees)
+                local _, localManip = WorldToLocal(ZERO_VECTOR, desired, ZERO_VECTOR, baseline)
+                local manip = clean_angle(localManip)
+                curWorld[bone] = desired
+
+                row.p = manip.p or 0
+                row.localYaw = manip.y or 0
+                row.r = manip.r or 0
+                appliedAngles[bone] = manip
+                appliedPositions[bone] = position
+                remember_packet(bone, manip, position)
+
+                if dummy.ManipulateBonePosition then dummy:ManipulateBonePosition(bone, position) end
+                if dummy.ManipulateBoneAngles then dummy:ManipulateBoneAngles(bone, manip, false) end
+            end
+        end
+    end
+
+    setup_bones_now(dummy)
+
+    local maxError = 0
+    for bone, desired in pairs(curWorld) do
+        local matrix = dummy.GetBoneMatrix and dummy:GetBoneMatrix(bone) or nil
+        if matrix then
+            local err = angle_error_degrees(matrix:GetAngles(), desired)
+            if err > maxError then maxError = err end
+        end
+    end
+    if maxError > FAST_BUILD_VERIFY_EPSILON then
+        job.fastUnsafe = true
+        print(string.format(
+            "[MMD VMD] fast build verification failed on %s (%.3f deg deviation); falling back to the legacy build path for this job",
+            cache.model, maxError
+        ))
+        return nil
+    end
+
+    if spine_pelvis_correction_enabled() and cache.pelvisBone and cache.spineBone and cache.referenceSpineVector and dummy.ManipulateBonePosition then
+        local frameSpineVector = bone_world_position(dummy, cache.spineBone) - bone_world_position(dummy, cache.pelvisBone)
+        local correctionWorld = (frameSpineVector - cache.referenceSpineVector) * -0.5
+        if not is_zero_vector(correctionWorld) then
+            local correctionLocal = world_vector_to_entity_local(dummy, correctionWorld)
+            local pelvisPosition = copy_vector(appliedPositions[cache.pelvisBone]) + correctionLocal
+            local pelvisAngle = appliedAngles[cache.pelvisBone] or ZERO_ANGLE
+
+            dummy:ManipulateBonePosition(cache.pelvisBone, pelvisPosition)
+            remember_packet(cache.pelvisBone, pelvisAngle, pelvisPosition)
+        end
+    end
+
+    local flexPacked = {}
+    for _, row in ipairs(flexRows or {}) do
+        local weight = scaled_flex_weight(row)
+        if row.resolved and row.flexID and row.flexID >= 0 then
+            flexPacked[#flexPacked + 1] = {
+                flexID = row.flexID,
+                weight = weight,
+            }
+        end
+    end
+
+    return packed, flexPacked
+end
+
 local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServer, targetOverride)
     local target = targetOverride or (targetEntIndex and targetEntIndex > 0 and Entity(targetEntIndex) or nil)
     if not IsValid(target) or not target.GetBoneCount then
@@ -2036,6 +2314,14 @@ local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServe
         send_debug_pose(target, packed, flexPacked)
     end
     return packed, flexPacked
+end
+
+local function compute_build_frame(job, dummy, rows, flexRows, targetEntIndex)
+    if job and IsValid(dummy) and not job.fastUnsafe and fast_build_enabled() then
+        local packed, flexPacked = fast_build_frame(job, dummy, rows, flexRows)
+        if packed then return packed, flexPacked end
+    end
+    return rebuild_debug_preview(rows, flexRows, targetEntIndex, false, dummy)
 end
 
 local function debug_flex_choice_label(row, index)
@@ -2251,6 +2537,9 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
 
         frame.Rows = vgui.Create("DListView", frame)
         frame.Rows:Dock(FILL)
+        -- Dock last (highest ZPos) so the bone list fills the space left after
+        -- the five BOTTOM strips reserve theirs, instead of underlapping them.
+        frame.Rows:SetZPos(100)
         frame.Rows:AddColumn(L("mmd_vmd_npc.debug.column_mmd_bone"))
         frame.Rows:AddColumn(L("mmd_vmd_npc.debug.column_source_bone"))
         frame.Rows:AddColumn(L("mmd_vmd_npc.debug.column_role"))
@@ -2292,43 +2581,51 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
         local flexOverrideRow = vgui.Create("DPanel", flexOverride)
         flexOverrideRow:Dock(FILL)
 
+        -- Responsive layout: the morph combo takes a fixed left slot, the three
+        -- action buttons dock right, and the model combo fills the remainder, so
+        -- the row never sums past a narrow (800px) debug window and clips the
+        -- Clear button off-screen.
         frame.UnresolvedMorphCombo = vgui.Create("DComboBox", flexOverrideRow)
         frame.UnresolvedMorphCombo:Dock(LEFT)
-        frame.UnresolvedMorphCombo:SetWide(360)
+        frame.UnresolvedMorphCombo:SetZPos(1)
+        frame.UnresolvedMorphCombo:SetWide(200)
         frame.UnresolvedMorphCombo:SetTooltip(L("mmd_vmd_npc.debug.motion_flex"))
 
-        frame.ModelFlexCombo = vgui.Create("DComboBox", flexOverrideRow)
-        frame.ModelFlexCombo:Dock(LEFT)
-        frame.ModelFlexCombo:DockMargin(6, 0, 0, 0)
-        frame.ModelFlexCombo:SetWide(360)
-        frame.ModelFlexCombo:SetTooltip(L("mmd_vmd_npc.debug.model_flex"))
-
         frame.AssignFlexOverride = vgui.Create("DButton", flexOverrideRow)
-        frame.AssignFlexOverride:Dock(LEFT)
+        frame.AssignFlexOverride:Dock(RIGHT)
+        frame.AssignFlexOverride:SetZPos(2)
         frame.AssignFlexOverride:DockMargin(6, 0, 0, 0)
-        frame.AssignFlexOverride:SetWide(130)
+        frame.AssignFlexOverride:SetWide(110)
         frame.AssignFlexOverride:SetText(L("mmd_vmd_npc.debug.assign_flex"))
         frame.AssignFlexOverride.DoClick = function()
             request_flex_override(frame, "save")
         end
 
         frame.UnassignFlexOverride = vgui.Create("DButton", flexOverrideRow)
-        frame.UnassignFlexOverride:Dock(LEFT)
+        frame.UnassignFlexOverride:Dock(RIGHT)
+        frame.UnassignFlexOverride:SetZPos(3)
         frame.UnassignFlexOverride:DockMargin(6, 0, 0, 0)
-        frame.UnassignFlexOverride:SetWide(130)
+        frame.UnassignFlexOverride:SetWide(110)
         frame.UnassignFlexOverride:SetText(L("mmd_vmd_npc.debug.unassign_flex"))
         frame.UnassignFlexOverride.DoClick = function()
             request_flex_override(frame, "unassign")
         end
 
         frame.ClearFlexOverride = vgui.Create("DButton", flexOverrideRow)
-        frame.ClearFlexOverride:Dock(LEFT)
+        frame.ClearFlexOverride:Dock(RIGHT)
+        frame.ClearFlexOverride:SetZPos(4)
         frame.ClearFlexOverride:DockMargin(6, 0, 0, 0)
-        frame.ClearFlexOverride:SetWide(130)
+        frame.ClearFlexOverride:SetWide(110)
         frame.ClearFlexOverride:SetText(L("mmd_vmd_npc.debug.clear_flex_mapping"))
         frame.ClearFlexOverride.DoClick = function()
             request_flex_override(frame, "clear")
         end
+
+        frame.ModelFlexCombo = vgui.Create("DComboBox", flexOverrideRow)
+        frame.ModelFlexCombo:Dock(FILL)
+        frame.ModelFlexCombo:SetZPos(100)
+        frame.ModelFlexCombo:DockMargin(6, 0, 6, 0)
+        frame.ModelFlexCombo:SetTooltip(L("mmd_vmd_npc.debug.model_flex"))
 
         local flexScalePanel = vgui.Create("DPanel", frame)
         flexScalePanel:Dock(BOTTOM)
@@ -2726,7 +3023,17 @@ net.Receive("mmdvmd_build_compact_request", function()
     if not job then return end
 
     local visibleTarget = job.target
-    local dummy = build_dummy_for_target(visibleTarget)
+    -- Build from the plan's model string so a NULL/never-networked target does
+    -- not yield an empty (all-bones-dropped) build that the server would cache.
+    local dummy = build_dummy_for_model(job.model, visibleTarget)
+    if not IsValid(dummy) then
+        MMDVMDNPC.ClientBuildJobs[buildID] = nil
+        destroy_build_dummy()
+        net.Start("mmdvmd_build_cancel_request")
+        net.SendToServer()
+        print("[MMD VMD] " .. LF("mmd_vmd_npc.console.build_failed_fmt", "could not create a hidden model for '" .. tostring(job.model or "") .. "'"))
+        return
+    end
     local results = {}
     local lastFrame = job.frame_start or 0
 
@@ -2762,7 +3069,7 @@ net.Receive("mmdvmd_build_compact_request", function()
         end
 
         local targetEntIndex = IsValid(visibleTarget) and visibleTarget:EntIndex() or 0
-        local packed, flexPacked = rebuild_debug_preview(rows, flexRows, targetEntIndex, false, dummy)
+        local packed, flexPacked = compute_build_frame(job, dummy, rows, flexRows, targetEntIndex)
         job.frames[#job.frames + 1] = packet_to_frame_data(activeFrame, packed, flexPacked)
 
         for _, row in ipairs(rows) do
@@ -2983,9 +3290,15 @@ net.Receive("mmdvmd_build_done", function()
     local ok = net.ReadBool()
     local path = net.ReadString()
     local message = net.ReadString()
+    local buildID = net.ReadUInt(32)
 
-    if ok then
-        for buildID, job in pairs(MMDVMDNPC.ClientBuildJobs or {}) do
+    -- buildID == 0 (or an id we do not track) is a notification unrelated to any
+    -- in-flight streaming build (cache already exists, invalid request, queue
+    -- message). It must NOT tear down a running build or the streaming job stalls
+    -- and its partial frames get miscached under the wrong path.
+    local job = buildID ~= 0 and MMDVMDNPC.ClientBuildJobs and MMDVMDNPC.ClientBuildJobs[buildID] or nil
+    if job then
+        if ok then
             table.sort(job.frames, function(a, b) return (a.frame or 0) < (b.frame or 0) end)
             MMDVMDNPC.ClientBuiltCache[path] = {
                 format = MMDVMDNPC.BuiltFormat,
@@ -2998,13 +3311,15 @@ net.Receive("mmdvmd_build_done", function()
                 flexes = sorted_client_metadata(job.flexesByID),
                 frames = job.frames,
             }
-            MMDVMDNPC.ClientBuildJobs[buildID] = nil
-            break
         end
-    else
-        MMDVMDNPC.ClientBuildJobs = {}
+        MMDVMDNPC.ClientBuildJobs[buildID] = nil
     end
-    destroy_build_dummy()
+
+    -- Only drop the hidden dummy once no client build jobs remain, so an
+    -- unrelated notification during a build does not destroy the working dummy.
+    if not next(MMDVMDNPC.ClientBuildJobs or {}) then
+        destroy_build_dummy()
+    end
 
     update_build_status({
         ok = ok,
@@ -3056,7 +3371,16 @@ net.Receive("mmdvmd_play_status", function()
             activate_self_proxy_camera(playbackEnt)
         end
     elseif status == "stopped" or status == "finished" or status == "error" then
-        stop_local_playback(status == "stopped" or status == "error", playbackEnt)
+        local clearPose = status == "stopped" or status == "error"
+        if IsValid(playbackEnt) then
+            stop_local_playback(clearPose, playbackEnt)
+        else
+            -- Per-entity stop whose entity is already gone: only drop dead local
+            -- playbacks, never the player's other concurrent dances.
+            for ent in pairs(MMDVMDNPC.LocalPlaybacks or {}) do
+                if not IsValid(ent) then stop_one_local_playback(ent, clearPose) end
+            end
+        end
     elseif status == "stopped_all" then
         stop_local_playback(true)
     elseif status == "self_reset" then
@@ -3288,13 +3612,9 @@ local function open_motion_browser()
     top:Dock(TOP)
     top:SetTall(48)
 
-    local search = vgui.Create("DTextEntry", top)
-    search:Dock(FILL)
-    search:SetPlaceholderText(L("mmd_vmd_npc.manager.search_placeholder"))
-    set_manager_font(search, "MMDVMDNPCManagerText")
-
     local refresh = vgui.Create("DButton", top)
     refresh:Dock(RIGHT)
+    refresh:SetZPos(1)
     style_manager_button(refresh, 150)
     refresh:SetText(L("mmd_vmd_npc.manager.refresh"))
     refresh.DoClick = function()
@@ -3302,21 +3622,36 @@ local function open_motion_browser()
         request_motion_details()
     end
 
+    -- FILL panels must dock after their edge-docked siblings; docking order in
+    -- Derma follows ZPos, so the search box and list get a higher ZPos than the
+    -- buttons/strips they share space with. Otherwise the FILL area is computed
+    -- before the edges reserve space and the panels overlap.
+    local search = vgui.Create("DTextEntry", top)
+    search:Dock(FILL)
+    search:SetZPos(10)
+    search:SetPlaceholderText(L("mmd_vmd_npc.manager.search_placeholder"))
+    set_manager_font(search, "MMDVMDNPCManagerText")
+
     local list = vgui.Create("DListView", frame)
     list:Dock(FILL)
+    list:SetZPos(100)
+    -- Min widths (not fixed) so the eight columns always share the available
+    -- width instead of summing past the frame and clipping the rightmost ones;
+    -- DListView has no horizontal scrollbar.
     local columns = {
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_motion_id")), 290 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_duration")), 105 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_frames")), 105 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_bones")), 95 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_flexes")), 95 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_music")), 95 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_addon")), 130 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_built")), 115 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_motion_id")), 150 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_duration")), 66 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_frames")), 66 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_bones")), 56 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_flexes")), 56 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_music")), 56 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_addon")), 72 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_built")), 66 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_wheel")), 60 },
     }
     for _, columnInfo in ipairs(columns) do
         local column, width = columnInfo[1], columnInfo[2]
-        if IsValid(column) and column.SetFixedWidth then column:SetFixedWidth(width) end
+        if IsValid(column) and column.SetMinWidth then column:SetMinWidth(width) end
     end
     if list.SetDataHeight then list:SetDataHeight(30) end
     if IsValid(list.Header) and list.Header.SetTall then list.Header:SetTall(32) end
@@ -3395,9 +3730,11 @@ local function open_motion_browser()
 
     local selectedMotion = nil
     local selectedMeta = nil
+    local update_wheel_button -- assigned after the wheel button is created
 
     local function populate(motions)
         if not IsValid(list) then return end
+        local previouslySelected = selectedMotion
         list:Clear()
         local query = string.lower(search:GetValue() or "")
         local rows = MMDVMDNPC.MotionDetailsOrdered or {}
@@ -3407,6 +3744,7 @@ local function open_motion_browser()
             end
         end
 
+        local reselectLine = nil
         for _, meta in ipairs(rows) do
             local displayName = motion_display_name(meta)
             local haystack = string.lower(table.concat({
@@ -3416,6 +3754,7 @@ local function open_motion_browser()
                 meta.musicSound or "",
             }, " "))
             if query == "" or string.find(haystack, query, 1, true) then
+                local inWheel = MMDVMDNPC.IsFavorite and MMDVMDNPC.IsFavorite(meta.id) or false
                 local line = list:AddLine(
                     displayName,
                     string.format("%.2fs", tonumber(meta.duration) or 0),
@@ -3424,11 +3763,27 @@ local function open_motion_browser()
                     tostring(meta.flexCount or 0),
                     (meta.musicSound and meta.musicSound ~= "") and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
                     meta.isAddon and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
-                    meta.built and L("mmd_vmd_npc.ui.built") or L("mmd_vmd_npc.ui.missing")
+                    meta.built and L("mmd_vmd_npc.ui.built") or L("mmd_vmd_npc.ui.missing"),
+                    inWheel and ("★ " .. L("mmd_vmd_npc.ui.yes")) or L("mmd_vmd_npc.ui.no")
                 )
                 line.MotionID = meta.id
                 line.Meta = meta
                 style_manager_list_line(line)
+                if previouslySelected and tostring(meta.id) == tostring(previouslySelected) then
+                    reselectLine = line
+                end
+            end
+        end
+
+        -- Re-select the same motion after a rebuild (the list Clears on every
+        -- status hook); if it is gone, drop the stale selection and details.
+        if reselectLine then
+            list:SelectItem(reselectLine)
+        elseif previouslySelected then
+            selectedMotion = nil
+            selectedMeta = nil
+            if IsValid(details) then
+                details:SetText(L("mmd_vmd_npc.manager.select_motion_details"))
             end
         end
     end
@@ -3456,6 +3811,7 @@ local function open_motion_browser()
             tostring(meta.sourceName or "")
         ))
         offsetEntry:SetValue(tonumber(MMDVMDNPC.AudioOffsets[selectedMotion or ""]) or 0)
+        if update_wheel_button then update_wheel_button() end
     end
 
     list.OnRowSelected = function(_, _, line)
@@ -3511,23 +3867,35 @@ local function open_motion_browser()
 
     local star = vgui.Create("DButton", controls)
     star:Dock(LEFT)
-    style_manager_button(star, 150)  
-    star:SetText("⭐ +FAV")
-     
-    
+    style_manager_button(star, 190)
+
+    update_wheel_button = function()
+        if not IsValid(star) then return end
+        local inWheel = selectedMotion and selectedMotion ~= ""
+            and MMDVMDNPC.IsFavorite and MMDVMDNPC.IsFavorite(selectedMotion)
+        if inWheel then
+            star:SetText(L("mmd_vmd_npc.manager.wheel_remove", "★ Remove From Wheel"))
+        else
+            star:SetText(L("mmd_vmd_npc.manager.wheel_add", "☆ Add To Wheel"))
+        end
+    end
+    update_wheel_button()
+
     star.DoClick = function()
         if selectedMotion and selectedMotion ~= "" then
             local isAdded = MMDVMDNPC.ToggleFavorite(selectedMotion)
-            
+
             if isAdded then
-                surface.PlaySound("garrysmod/content_downloaded.wav")  
-                notification.AddLegacy("Added to wheel!", NOTIFY_GENERIC, 3)
+                surface.PlaySound("garrysmod/content_downloaded.wav")
+                notification.AddLegacy(L("mmd_vmd_npc.manager.wheel_added", "Added to wheel!"), NOTIFY_GENERIC, 3)
             else
-                surface.PlaySound("buttons/button15.wav")  
-                notification.AddLegacy("Removed from wheel", NOTIFY_CLEANUP, 3)
+                surface.PlaySound("buttons/button15.wav")
+                notification.AddLegacy(L("mmd_vmd_npc.manager.wheel_removed", "Removed from wheel"), NOTIFY_CLEANUP, 3)
             end
+            update_wheel_button()
+            if IsValid(list) then populate() end
         else
-            notification.AddLegacy("First choice motion from the list!", NOTIFY_ERROR, 3)
+            notification.AddLegacy(L("mmd_vmd_npc.manager.wheel_select_first", "Select a motion from the list first."), NOTIFY_ERROR, 3)
         end
     end
 

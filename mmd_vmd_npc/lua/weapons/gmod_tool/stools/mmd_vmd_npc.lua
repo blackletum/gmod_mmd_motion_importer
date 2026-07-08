@@ -113,7 +113,8 @@ TOOL.ClientConVar = {
     music_enabled = "1",
     music_volume = "1",
     loop_playback = "0",
-    build_frames_per_batch = "16",
+    fast_build = "1",
+    build_frames_per_batch = "32",
     playback_hz = "120",
 }
 
@@ -570,6 +571,9 @@ function TOOL.BuildCPanel(panel)
         end
     end)
 
+    section(motionTab, L("mmd_vmd_npc.ui.radial_wheel"), Color(255, 200, 90))
+    motionTab:Help(L("mmd_vmd_npc.ui.radial_wheel_help"))
+
     motionInfo:SetText(L("mmd_vmd_npc.ui.motion_no_metadata"))
     bounded_label(motionInfo, "DermaDefault", Color(210, 220, 230), compactPanel and 40 or 52)
     motionTab:AddItem(motionInfo)
@@ -694,11 +698,14 @@ function TOOL.BuildCPanel(panel)
 
     section(performanceTab, L("mmd_vmd_npc.ui.build_performance"), Color(255, 190, 80))
     performanceTab:Help(L("mmd_vmd_npc.ui.build_performance_help"))
+    add_checkbox_with_help(performanceTab, L("mmd_vmd_npc.ui.fast_build"), "mmd_vmd_npc_fast_build", L("mmd_vmd_npc.ui.fast_build_help"))
     add_slider(performanceTab, L("mmd_vmd_npc.ui.build_frames_per_batch"), "mmd_vmd_npc_build_frames_per_batch", 1, 128, 0)
 
     section(performanceTab, L("mmd_vmd_npc.ui.playback_performance"), Color(100, 190, 255))
     performanceTab:Help(L("mmd_vmd_npc.ui.playback_performance_help"))
-    add_slider(performanceTab, L("mmd_vmd_npc.ui.playback_updates_per_second"), "mmd_vmd_npc_playback_hz", 10, 480, 0)
+    -- Cap the slider at the value every consumer actually clamps to, so the UI
+    -- cannot display a rate (up to 480) that is silently reduced to 240.
+    add_slider(performanceTab, L("mmd_vmd_npc.ui.playback_updates_per_second"), "mmd_vmd_npc_playback_hz", MMDVMDNPC.MinPlaybackHz or 10, MMDVMDNPC.MaxPlaybackHz or 240, 0)
 
     section(advancedTab, L("mmd_vmd_npc.ui.tab.advanced"), Color(180, 180, 180))
 

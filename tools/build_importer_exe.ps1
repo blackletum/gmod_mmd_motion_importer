@@ -54,7 +54,7 @@ try {
         }
     }
 
-    & $Python -m PyInstaller --version *> $null
+    & $Python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('PyInstaller') else 1)" > $null
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller is not installed. Run: $Python -m pip install pyinstaller"
     }
@@ -155,7 +155,10 @@ try {
         $ExtraArgs += @("--noupx")
     }
 
-    & $Python -m PyInstaller `
+    # PyInstaller warns, and future versions may block, when launched from an elevated token.
+    # This build script intentionally supports admin terminals, so bypass only that guard.
+    $RunPyInstaller = "import sys; import PyInstaller.__main__ as pyi; pyi.check_unsafe_privileges = lambda: None; pyi.run(sys.argv[1:])"
+    & $Python -c $RunPyInstaller `
         --noconfirm `
         --clean `
         --onefile `

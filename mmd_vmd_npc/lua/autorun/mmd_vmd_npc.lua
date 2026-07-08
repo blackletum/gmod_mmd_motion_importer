@@ -2,6 +2,7 @@ MMDVMDNPC = MMDVMDNPC or {}
 
 if SERVER then
     AddCSLuaFile("mmd_vmd_npc/sh_core.lua")
+    AddCSLuaFile("mmd_vmd_npc/cl_radial.lua")
     AddCSLuaFile("mmd_vmd_npc/cl_menu.lua")
 
     util.AddNetworkString("mmdvmd_list_request")
@@ -32,6 +33,7 @@ if SERVER then
     util.AddNetworkString("mmdvmd_build_progress")
     util.AddNetworkString("mmdvmd_build_cancel_request")
     util.AddNetworkString("mmdvmd_play_request")
+    util.AddNetworkString("mmdvmd_play_self_auto")
     util.AddNetworkString("mmdvmd_stop_request")
     util.AddNetworkString("mmdvmd_stop_npc_playbacks_request")
     util.AddNetworkString("mmdvmd_force_self_reset_request")

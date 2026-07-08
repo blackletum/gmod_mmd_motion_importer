@@ -45,6 +45,9 @@ DEFAULT_MMD_MODEL_DIR = SOURCE_MODELS / "mmd_model"
 DEFAULT_MMD_MODEL_NAME = "李织烟.pmx"
 DEFAULT_SOURCE_SMD = SOURCE_MODELS / "mmd_model_source_format" / "Body.smd"
 BLENDER_BAKE_SCRIPT = ROOT / "tools" / "blender_bake_vmd.py"
+# Upper bound on the bake range (~2.3 hours at 30fps); anything larger is almost
+# certainly a corrupt VMD frame count rather than a real motion.
+MAX_BAKE_FRAMES = 250000
 BAKED_OUTPUT_DIR = ROOT / "build" / "mmd_vmd_npc" / "baked"
 PARENT_CORRECTED_ROTATION_JSON = "bone_parent_corrected_rotation_degrees.json"
 STEAM_BLENDER_APP_ID = "365670"
@@ -262,9 +265,18 @@ def parse_vmd(path: Path) -> ParsedVMD:
 
     with path.open("rb") as handle:
         signature = read_exact(handle, 30)
-        if not signature.startswith(b"Vocaloid Motion Data"):
+        # VMD v2 ("...0002") stores a 20-byte model name; the legacy v1
+        # ("...file") stores only 10 bytes. Reading 20 for a v1 file would
+        # desync every subsequent field, so pick the width from the signature.
+        if signature.startswith(b"Vocaloid Motion Data 0002"):
+            model_name = decode_cp932(read_exact(handle, 20))
+        elif signature.startswith(b"Vocaloid Motion Data file"):
+            model_name = decode_cp932(read_exact(handle, 10))
+        elif signature.startswith(b"Vocaloid Motion Data"):
+            # Unknown minor version: assume the modern 20-byte layout.
+            model_name = decode_cp932(read_exact(handle, 20))
+        else:
             raise ValueError(f"{path} is not a VMD file")
-        model_name = decode_cp932(read_exact(handle, 20))
 
         for _ in range(read_u32(handle)):
             name = decode_cp932(read_exact(handle, 15))
@@ -500,16 +512,20 @@ def bezier_point(t: float, p0: float, p1: float, p2: float, p3: float) -> float:
     return inv * inv * inv * p0 + 3 * inv * inv * t * p1 + 3 * inv * t * t * p2 + t * t * t * p3
 
 
-def bezier_weight(x: float, interp: bytes, base: int) -> float:
+def bezier_weight(x: float, interp: bytes, axis: int) -> float:
+    # VMD stores the four control-point bytes of each axis strided by 4, not
+    # contiguously: for axis a (0=X, 1=Y, 2=Z, 3=rotation) the parameters are
+    # x1=interp[a], y1=interp[a+4], x2=interp[a+8], y2=interp[a+12]. Reading four
+    # contiguous bytes instead mixes other axes' curves into this one.
     if x <= 0:
         return 0.0
     if x >= 1:
         return 1.0
 
-    x1 = interp[base] / 127.0
-    y1 = interp[base + 1] / 127.0
-    x2 = interp[base + 2] / 127.0
-    y2 = interp[base + 3] / 127.0
+    x1 = interp[axis] / 127.0
+    y1 = interp[axis + 4] / 127.0
+    x2 = interp[axis + 8] / 127.0
+    y2 = interp[axis + 12] / 127.0
 
     if abs(x1 - y1) < 1e-6 and abs(x2 - y2) < 1e-6:
         return x
@@ -1080,9 +1096,9 @@ def sample_bone(
         return convert_position(a.location), convert_rotation_for_source_bone(a.rotation, source_name, role, retarget)
 
     tx = bezier_weight(t, b.interp, 0)
-    ty = bezier_weight(t, b.interp, 16)
-    tz = bezier_weight(t, b.interp, 32)
-    tr = bezier_weight(t, b.interp, 48)
+    ty = bezier_weight(t, b.interp, 1)
+    tz = bezier_weight(t, b.interp, 2)
+    tr = bezier_weight(t, b.interp, 3)
     loc = (
         lerp(a.location[0], b.location[0], tx),
         lerp(a.location[1], b.location[1], ty),
@@ -1404,12 +1420,30 @@ def emit_progress(callback: ProgressCallback | None, message: str) -> None:
         callback(message)
 
 
-def gmod_sound_relative_path(motion_name_source: Path | str) -> str:
-    return f"{GMOD_SOUND_SUBDIR}/{slugify(motion_name_source)}.mp3"
+def gmod_sound_relative_path(sound_identifier: str) -> str:
+    return f"{GMOD_SOUND_SUBDIR}/{sound_identifier}.mp3"
 
 
-def gmod_sound_output_path(gmod_dir: Path, motion_name_source: Path | str) -> Path:
-    return gmod_dir / "garrysmod" / "sound" / GMOD_SOUND_SUBDIR / f"{slugify(motion_name_source)}.mp3"
+def gmod_sound_output_path(gmod_dir: Path, sound_identifier: str) -> Path:
+    return gmod_dir / "garrysmod" / "sound" / GMOD_SOUND_SUBDIR / f"{sound_identifier}.mp3"
+
+
+def atomic_write_text(target: Path, text: str, encoding: str = "utf-8") -> None:
+    """Write text via a temp file + os.replace so a crash or kill mid-write can
+    never leave a truncated (unparseable) file at the destination path."""
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def safe_relative_path(value: str) -> Path:
@@ -1494,7 +1528,19 @@ def export_motion_addon_gma(
         if output_gma_path.exists():
             output_gma_path.unlink()
         emit_progress(progress, f"Packaging GMod addon: {output_gma_path}")
-        completed = subprocess.run(command, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            completed = subprocess.run(
+                command,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"gmad packaging timed out after {exc.timeout:.0f}s") from exc
         if completed.returncode != 0:
             raise RuntimeError(f"gmad failed with exit code {completed.returncode}\n{completed.stdout}")
         if not output_gma_path.exists():
@@ -1521,11 +1567,16 @@ def convert_music_to_gmod_mp3(
     gmod_dir: Path,
     motion_name_source: Path | str,
     progress: ProgressCallback | None = None,
+    vmd_path: Path | str | None = None,
 ) -> dict[str, object]:
     if not music_path.exists():
         raise FileNotFoundError(f"music file not found: {music_path}")
 
-    output = gmod_sound_output_path(gmod_dir, motion_name_source)
+    # Name the sound with the same slug+content-hash identifier the motion JSON
+    # uses, so two motions imported from same-named source files own distinct
+    # MP3s instead of the second silently overwriting the first's audio.
+    sound_identifier = motion_id_with_vmd_hash(motion_name_source, vmd_path)
+    output = gmod_sound_output_path(gmod_dir, sound_identifier)
     output.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg = find_ffmpeg_executable()
     command = [
@@ -1543,14 +1594,26 @@ def convert_music_to_gmod_mp3(
         str(output),
     ]
     emit_progress(progress, f"Converting music to MP3: {music_path}")
-    completed = subprocess.run(command, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"ffmpeg music conversion timed out after {exc.timeout:.0f}s: {music_path}") from exc
     if completed.returncode != 0:
         raise RuntimeError(f"ffmpeg music conversion failed with exit code {completed.returncode}\n{completed.stdout}")
     if not output.exists():
         raise RuntimeError(f"ffmpeg completed but did not write {output}\n{completed.stdout}")
     emit_progress(progress, f"Wrote GMod sound: {output}")
     return {
-        "sound": gmod_sound_relative_path(motion_name_source),
+        "sound": gmod_sound_relative_path(sound_identifier),
         "sample_rate": MUSIC_SAMPLE_RATE,
         "source": music_path.name,
     }
@@ -1727,14 +1790,26 @@ def find_steam_blender_executable() -> Path | None:
     return None
 
 
-def find_blender_executable() -> Path:
-    steam_blender = find_steam_blender_executable()
-    if steam_blender:
-        return steam_blender
+def blender_path_version_key(path: Path) -> tuple[int, int, int]:
+    """Best-effort numeric version parsed from a Blender install path so that,
+    e.g., 'Blender 4.10' sorts above 'Blender 4.3' (a lexicographic sort does
+    not). Returns (0, 0, 0) when no version-like segment is present."""
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", str(path))
+    if not match:
+        return (0, 0, 0)
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
 
+
+def find_blender_executable() -> Path:
+    # An explicit override wins over auto-detection; otherwise the documented
+    # BLENDER_EXE is silently ignored whenever any Steam Blender exists.
     env = os.environ.get("BLENDER_EXE")
     if env and Path(env).exists():
         return Path(env)
+
+    steam_blender = find_steam_blender_executable()
+    if steam_blender:
+        return steam_blender
 
     candidates: list[Path] = []
     if os.name == "nt":
@@ -1758,7 +1833,8 @@ def find_blender_executable() -> Path:
 
     existing = [path for path in candidates if path.exists()]
     if existing:
-        return sorted(existing, key=lambda path: str(path).lower())[-1]
+        # Prefer the highest actual version, not the lexicographically-last path.
+        return sorted(existing, key=blender_path_version_key)[-1]
 
     raise FileNotFoundError("could not locate Blender; set BLENDER_EXE or pass --blender")
 
@@ -1882,6 +1958,14 @@ def bake_vmd_with_blender(
     frame_end = parsed.max_frame if frame_end is None else frame_end
     if frame_end < frame_start:
         raise ValueError("frame_end must be greater than or equal to frame_start")
+    # A corrupt VMD can report a garbage max frame (the field is a raw u32).
+    # Baking that range would spin Blender for effectively forever, so reject an
+    # implausibly long range up front with a clear message.
+    if (frame_end - frame_start) > MAX_BAKE_FRAMES:
+        raise ValueError(
+            f"VMD frame range {frame_start}..{frame_end} exceeds the {MAX_BAKE_FRAMES}-frame limit; "
+            "the file may be corrupted, or pass an explicit --frame-end"
+        )
 
     output_dir = output_dir or BAKED_OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2157,11 +2241,30 @@ def write_motion_json(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / f"{parsed['motion_id']}.json"
-    output.write_text(json.dumps(parsed, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    atomic_write_text(output, json.dumps(parsed, ensure_ascii=False, separators=(",", ":")))
     return output
 
 
+def configure_output_streams() -> None:
+    """Keep progress printing alive on narrow console codepages.
+
+    Motion, model, and music paths routinely contain CJK characters that a
+    Windows console codepage such as cp932/cp936 cannot encode; without this,
+    a fully successful bake dies on the final progress print.
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv: list[str]) -> int:
+    configure_output_streams()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("vmd", type=Path, nargs="?", help="VMD file to import")
     parser.add_argument("--cache", action="store_true", help="write compact parent-corrected motion JSON for GMod")
@@ -2221,7 +2324,7 @@ def main(argv: list[str]) -> int:
         music_metadata = None
         motion_name_source = args.motion_name or vmd_for_cache or rotation_json_for_cache
         if args.music:
-            music_metadata = convert_music_to_gmod_mp3(args.music, gmod_dir, motion_name_source)
+            music_metadata = convert_music_to_gmod_mp3(args.music, gmod_dir, motion_name_source, vmd_path=args.vmd)
             print(f"Wrote music: {music_metadata['sound']}")
         output = write_motion_json(
             rotation_json_for_cache,

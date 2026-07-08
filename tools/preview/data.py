@@ -495,9 +495,9 @@ def sample_bone_motion(
         return a.location, import_vmd.normalize_quat(a.rotation)
 
     tx = import_vmd.bezier_weight(t, b.interp, 0)
-    ty = import_vmd.bezier_weight(t, b.interp, 16)
-    tz = import_vmd.bezier_weight(t, b.interp, 32)
-    tr = import_vmd.bezier_weight(t, b.interp, 48)
+    ty = import_vmd.bezier_weight(t, b.interp, 1)
+    tz = import_vmd.bezier_weight(t, b.interp, 2)
+    tr = import_vmd.bezier_weight(t, b.interp, 3)
     loc = (
         import_vmd.lerp(a.location[0], b.location[0], tx),
         import_vmd.lerp(a.location[1], b.location[1], ty),

@@ -140,7 +140,7 @@ class ImportWorker(QtCore.QThread):
             music_path_raw = str(self.settings.get("music_path") or "")
             motion_name_source = motion_name or motion_for_cache
             if music_path_raw:
-                music_metadata = import_vmd.convert_music_to_gmod_mp3(Path(music_path_raw), gmod_dir, motion_name_source, self._log)
+                music_metadata = import_vmd.convert_music_to_gmod_mp3(Path(music_path_raw), gmod_dir, motion_name_source, self._log, vmd_path=body_vmd)
 
             output_dir = gmod_dir / "garrysmod" / "data" / "mmd_vmd_npc" / "motions"
             output_json = import_vmd.write_motion_json(
@@ -182,6 +182,8 @@ class ImportWorker(QtCore.QThread):
 
 
 class PathRow(QtWidgets.QWidget):
+    pathBrowsed = QtCore.Signal(str)
+
     def __init__(
         self,
         label: str,
@@ -207,6 +209,10 @@ class PathRow(QtWidgets.QWidget):
         self.badge.setObjectName("requiredBadge" if required else "optionalBadge")
         self.hint = QtWidgets.QLabel(hint)
         self.hint.setObjectName("fieldHint")
+        # Wrap long (translated) hints instead of forcing the whole form wider;
+        # ignore the hint's width preference so it never inflates the min size.
+        self.hint.setWordWrap(True)
+        self.hint.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
         self.edit = QtWidgets.QLineEdit(default)
         self.button = QtWidgets.QPushButton(browse_text)
         layout = QtWidgets.QGridLayout(self)
@@ -234,6 +240,7 @@ class PathRow(QtWidgets.QWidget):
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, self.select_file_title, self.value(), self.file_filter)
         if path:
             self.set_value(path)
+            self.pathBrowsed.emit(path)
 
     def retranslate(
         self,
@@ -262,7 +269,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.settings_store = QtCore.QSettings("MMDVMDNPC", "Importer")
         self.i18n = I18N
         stored_language = str(self.settings_store.value("language", "", str) or "").strip()
-        self.i18n.set_language(stored_language or self.system_language_code())
+        initial_language = stored_language or self.system_language_code()
+        self.i18n.set_language(initial_language)
+        self._apply_layout_direction(initial_language)
         self.setWindowTitle(self.tr("app.title"))
         self.apply_startup_geometry()
         self._loading_settings = False
@@ -406,11 +415,23 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.language_combo.currentIndexChanged.connect(self.change_language)
         return self.language_group
 
+    def _apply_layout_direction(self, code: str) -> None:
+        # Arabic (and any future RTL catalog) needs a right-to-left UI; without
+        # this the whole layout renders mirrored-wrong left-to-right.
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+        rtl = str(code or "").lower() in {"ar", "he", "fa", "ur"}
+        app.setLayoutDirection(
+            QtCore.Qt.LayoutDirection.RightToLeft if rtl else QtCore.Qt.LayoutDirection.LeftToRight
+        )
+
     def change_language(self) -> None:
         if not hasattr(self, "language_combo"):
             return
         code = str(self.language_combo.currentData() or "en")
         self.i18n.set_language(code)
+        self._apply_layout_direction(code)
         self.settings_store.setValue("language", code)
         self.settings_store.sync()
         self.retranslate_ui()
@@ -874,24 +895,38 @@ class ImporterWindow(QtWidgets.QMainWindow):
         for row in self._path_rows().values():
             row.edit.textChanged.connect(lambda _value: self.save_persisted_settings())
         self.body_row.edit.textChanged.connect(self.on_body_vmd_changed)
+        # Wiping music/flex is destructive, so only do it when the user actually
+        # picks a new body VMD via Browse — not on every keystroke of a typed path.
+        self.body_row.pathBrowsed.connect(self.on_body_vmd_selected)
         self.motion_name_edit.textChanged.connect(lambda _value: self.save_persisted_settings())
         self.export_addon_check.toggled.connect(lambda _value: self.save_persisted_settings())
+
+    def _motion_name_is_autofilled(self) -> bool:
+        current = self.motion_name_edit.text().strip()
+        return current == "" or current == (self._motion_name_autofill or "")
 
     def on_body_vmd_changed(self, value: str) -> None:
         if self._loading_settings:
             return
 
+        # textChanged fires on every keystroke; only refresh the auto-filled
+        # motion name (never a name the user typed themselves), and never touch
+        # the music/flex selections here.
         candidate = Path(str(value or "")).stem.strip()
-        if not candidate:
-            self._motion_name_autofill = ""
-            self.motion_name_edit.clear()
-            self.music_row.set_value("")
-            self.flex_list.clear()
-            self.save_persisted_settings()
+        if self._motion_name_is_autofilled():
+            self._motion_name_autofill = candidate
+            self.motion_name_edit.setText(candidate)
+        self.save_persisted_settings()
+
+    def on_body_vmd_selected(self, value: str) -> None:
+        if self._loading_settings:
             return
 
-        self._motion_name_autofill = candidate
-        self.motion_name_edit.setText(candidate)
+        candidate = Path(str(value or "")).stem.strip()
+        if self._motion_name_is_autofilled():
+            self._motion_name_autofill = candidate
+            self.motion_name_edit.setText(candidate)
+        # A genuinely new source motion was chosen: its old music/flex no longer apply.
         self.music_row.set_value("")
         self.flex_list.clear()
         self.save_persisted_settings()
@@ -1273,6 +1308,18 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.worker.cancel()
             self.append_log(self.tr("log.cancel_requested"))
 
+    def closeEvent(self, event) -> None:
+        # Destroying a still-running QThread makes Qt qFatal (hard crash). Ask the
+        # running import to stop and wait for it to actually finish first.
+        worker = self.worker
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            if not worker.wait(5000):
+                # The bake only polls cancel between Blender output lines; keep
+                # waiting rather than tearing the thread down mid-run.
+                worker.wait()
+        super().closeEvent(event)
+
     def import_done(self, result: dict) -> None:
         self.import_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
@@ -1302,7 +1349,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
     def show_error(self, title: str, message: str) -> None:
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(title)
-        dialog.resize(820, 540)
+        # Clamp to the available screen so the dialog never extends past a small
+        # display's edges (apply_startup_geometry supports widths down to 760).
+        screen = self.screen() or QtWidgets.QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else None
+        width = min(820, avail.width() - 40) if avail else 820
+        height = min(540, avail.height() - 80) if avail else 540
+        dialog.resize(max(360, width), max(240, height))
         layout = QtWidgets.QVBoxLayout(dialog)
         text = QtWidgets.QPlainTextEdit(message)
         text.setReadOnly(True)

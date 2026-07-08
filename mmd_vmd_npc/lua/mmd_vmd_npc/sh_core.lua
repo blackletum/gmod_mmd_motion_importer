@@ -28,7 +28,7 @@ MMDVMDNPC.DefaultEyeTrackBonePosLR = 0.5
 MMDVMDNPC.DefaultMusicEnabled = true
 MMDVMDNPC.DefaultMusicVolume = 1
 MMDVMDNPC.DefaultLoopPlayback = false
-MMDVMDNPC.DefaultBuildFramesPerBatch = 16
+MMDVMDNPC.DefaultBuildFramesPerBatch = 32
 MMDVMDNPC.MinBuildFramesPerBatch = 1
 MMDVMDNPC.MaxBuildFramesPerBatch = 128
 MMDVMDNPC.DefaultPlaybackHz = 120
@@ -339,6 +339,7 @@ MMDVMDNPC.I18N.en = {
     ["mmd_vmd_npc.status.invalid_player"] = "invalid player",
     ["mmd_vmd_npc.status.selected_actor_fmt"] = "selected %s %s",
     ["mmd_vmd_npc.status.ai_disabled_required"] = "AI thinking must be disabled: run ai_disabled 1 before building or playing MMD VMD animations",
+    ["mmd_vmd_npc.status.edit_permission_denied"] = "only admins may modify or delete shared MMD VMD content on this server (mmd_vmd_npc_edit_permission)",
     ["mmd_vmd_npc.status.build_missing_instruction"] = " Use Shift + left click to build the selected NPC animation(s).",
     ["mmd_vmd_npc.status.built_cache_missing_options"] = "built cache missing for selected model/options.",
     ["mmd_vmd_npc.status.build_missing_group_fmt"] = "build missing before coordinated playback: %s.",
@@ -403,6 +404,8 @@ MMDVMDNPC.I18N.en = {
     ["mmd_vmd_npc.ui.column.addon"] = "From Addon",
     ["mmd_vmd_npc.ui.loading"] = "loading",
     ["mmd_vmd_npc.ui.missing"] = "missing",
+    ["mmd_vmd_npc.ui.radial_wheel"] = "Radial Motion Wheel",
+    ["mmd_vmd_npc.ui.radial_wheel_help"] = "Bind a key to the wheel in console: bind <key> +mmd_wheel (for example: bind v +mmd_wheel). Hold the key to open the wheel, point at a motion, then release or click to play it on yourself — it builds automatically first if your playermodel has no cache yet. Add or remove motions from the wheel in the Motion Manager below (the Wheel column shows which motions are on it).",
     ["mmd_vmd_npc.ui.open_motion_manager"] = "Open Motion Manager",
     ["mmd_vmd_npc.ui.refresh_motion_list"] = "Refresh Motion List",
     ["mmd_vmd_npc.ui.motion_no_metadata"] = "Motion: no metadata loaded",
@@ -449,6 +452,8 @@ MMDVMDNPC.I18N.en = {
     ["mmd_vmd_npc.ui.build_performance"] = "Build Performance",
     ["mmd_vmd_npc.ui.build_performance_help"] = "Higher build batch values finish builds faster, but can briefly stall the client while the hidden model computes more frames at once.",
     ["mmd_vmd_npc.ui.build_frames_per_batch"] = "Build frames per batch",
+    ["mmd_vmd_npc.ui.fast_build"] = "Fast animation build (recommended)",
+    ["mmd_vmd_npc.ui.fast_build_help"] = "Computes bone retargeting in closed form with one skeleton update per frame instead of one per bone, making builds many times faster. Every frame is verified against the engine result; incompatible models automatically fall back to the legacy build path.",
     ["mmd_vmd_npc.ui.playback_performance"] = "Playback Performance",
     ["mmd_vmd_npc.ui.playback_performance_help"] = "Higher playback update rates make motion interpolation smoother. Lower values reduce server/client work.",
     ["mmd_vmd_npc.ui.playback_updates_per_second"] = "Playback updates per second",
@@ -525,6 +530,12 @@ MMDVMDNPC.I18N.en = {
     ["mmd_vmd_npc.manager.column_music"] = "Music",
     ["mmd_vmd_npc.manager.column_addon"] = "From Addon",
     ["mmd_vmd_npc.manager.column_built"] = "Built",
+    ["mmd_vmd_npc.manager.column_wheel"] = "Wheel",
+    ["mmd_vmd_npc.manager.wheel_add"] = "☆ Add To Wheel",
+    ["mmd_vmd_npc.manager.wheel_remove"] = "★ Remove From Wheel",
+    ["mmd_vmd_npc.manager.wheel_added"] = "Added to the radial wheel",
+    ["mmd_vmd_npc.manager.wheel_removed"] = "Removed from the radial wheel",
+    ["mmd_vmd_npc.manager.wheel_select_first"] = "Select a motion from the list first.",
     ["mmd_vmd_npc.manager.select_motion_details"] = "Select a motion to view details.",
     ["mmd_vmd_npc.manager.details_fmt"] = "%s\nFPS %s | frames %s-%s | duration %.2fs | bones %s | flexes %s | music %s | source %s",
     ["mmd_vmd_npc.manager.play_music"] = "Play music",
@@ -695,6 +706,8 @@ MMDVMDNPC.I18N.zh = merge_i18n({
     ["mmd_vmd_npc.ui.build_performance"] = "构建性能",
     ["mmd_vmd_npc.ui.build_performance_help"] = "较高的构建批量会更快完成，但隐藏模型一次计算更多帧时客户端可能短暂停顿。",
     ["mmd_vmd_npc.ui.build_frames_per_batch"] = "每批构建帧数",
+    ["mmd_vmd_npc.ui.fast_build"] = "快速动画构建（推荐）",
+    ["mmd_vmd_npc.ui.fast_build_help"] = "使用闭式数学计算骨骼重定向，每帧只需一次骨架更新而不是每根骨骼一次，构建速度可提升数十倍。每帧都会与引擎结果校验；不兼容的模型会自动回退到旧构建方式。",
     ["mmd_vmd_npc.ui.playback_performance"] = "播放性能",
     ["mmd_vmd_npc.ui.playback_performance_help"] = "较高的播放更新率可让插值更平滑。较低值可减少服务器/客户端负载。",
     ["mmd_vmd_npc.ui.playback_updates_per_second"] = "每秒播放更新次数",
@@ -911,6 +924,8 @@ MMDVMDNPC.I18N.ja = merge_i18n({
     ["mmd_vmd_npc.ui.build_performance"] = "ビルド性能",
     ["mmd_vmd_npc.ui.build_performance_help"] = "ビルドバッチ値を上げると速く完了しますが、隠しモデルが一度に多くのフレームを計算するとクライアントが一時停止することがあります。",
     ["mmd_vmd_npc.ui.build_frames_per_batch"] = "ビルドするフレーム数/バッチ",
+    ["mmd_vmd_npc.ui.fast_build"] = "高速アニメーションビルド（推奨）",
+    ["mmd_vmd_npc.ui.fast_build_help"] = "ボーンのリターゲットを閉形式で計算し、骨ごとではなくフレームごとに1回だけスケルトンを更新するため、ビルドが大幅に高速化されます。毎フレームエンジンの結果と検証し、非対応モデルは自動的に従来のビルド方式へ戻ります。",
     ["mmd_vmd_npc.ui.playback_performance"] = "再生性能",
     ["mmd_vmd_npc.ui.playback_performance_help"] = "再生更新率を上げると補間が滑らかになります。下げるとサーバー/クライアント負荷が減ります。",
     ["mmd_vmd_npc.ui.playback_updates_per_second"] = "再生更新回数/秒",
@@ -1907,7 +1922,12 @@ function MMDVMDNPC.BuiltPath(motionID, modelPath, options)
         options.disableSpinePelvisCorrection and 1 or 0
     )
     local modelName = MMDVMDNPC.SafeModelName(modelPath or "")
-    return MMDVMDNPC.BuiltRoot .. "/" .. id .. "_" .. modelName .. "_" .. suffix .. MMDVMDNPC.CacheExtension, id
+    -- SafeModelName collapses '/', '.', and every special character to '_', so
+    -- distinct model paths (models/player/alyx.mdl vs models/player_alyx.mdl)
+    -- can sanitize to the same string. Append a CRC of the exact lowercased
+    -- model path so different skeletons never share one built-cache file.
+    local modelHash = util.CRC(string.lower(trim(modelPath or "")))
+    return MMDVMDNPC.BuiltRoot .. "/" .. id .. "_" .. modelName .. "_" .. modelHash .. "_" .. suffix .. MMDVMDNPC.CacheExtension, id
 end
 
 function MMDVMDNPC.Chat(ply, message)

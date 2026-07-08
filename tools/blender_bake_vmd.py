@@ -619,25 +619,34 @@ def export_parent_corrected_bone_rotations(
     tracks: dict[str, dict[str, object]] = {}
     print(f"Exporting parent-corrected rotation JSON frames {frame_start}..{frame_end}: {output_path}")
 
+    # The name -> (source, role, target) mapping is constant across frames, so
+    # resolve it once instead of per bone per frame inside the export loop.
+    mapped_bones: list[tuple[str, str, str, str]] = []
+    source_parent_names: dict[str, str] = {}
+    for bone in armature.pose.bones:
+        source_name, role, target_bone = bone_target_info(bone.name, bone_map)
+        if source_name and target_bone and role not in PRE_PELVIS_ROLES:
+            source_parent_names.setdefault(target_bone, bone.name)
+        if target_bone and role not in PRE_PELVIS_ROLES:
+            mapped_bones.append((bone.name, source_name, role, target_bone))
+
     try:
         for frame in range(frame_start, frame_end + 1):
             scene.frame_set(frame)
-            bpy.context.view_layer.update()
 
             depsgraph = bpy.context.evaluated_depsgraph_get()
             armature_eval = armature.evaluated_get(depsgraph)
             q_arm_world = clean_quat_from_matrix(armature_eval.matrix_world)
-            source_pose_bones = {}
-            for candidate in armature_eval.pose.bones:
-                candidate_source, candidate_role, candidate_target = bone_target_info(candidate.name, bone_map)
-                if candidate_source and candidate_target and candidate_role not in PRE_PELVIS_ROLES:
-                    source_pose_bones.setdefault(candidate_target, candidate)
+            eval_pose_bones = armature_eval.pose.bones
+            source_pose_bones = {
+                target: eval_pose_bones[name]
+                for target, name in source_parent_names.items()
+                if name in eval_pose_bones
+            }
 
-            for pose_bone in armature_eval.pose.bones:
-                source_name, role, target_bone = bone_target_info(pose_bone.name, bone_map)
-                if not target_bone:
-                    continue
-                if role in PRE_PELVIS_ROLES:
+            for bone_name, source_name, role, target_bone in mapped_bones:
+                pose_bone = eval_pose_bones.get(bone_name)
+                if pose_bone is None:
                     continue
 
                 position = [0.0, 0.0, 0.0]
@@ -744,7 +753,21 @@ def export_parent_corrected_bone_rotations(
     print(f"Exported parent-corrected bone rotations: {output_path}")
 
 
+def configure_output_streams() -> None:
+    # Motion/model paths often contain CJK characters; keep progress prints
+    # alive when stdout is piped through a narrow console codepage.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main() -> int:
+    configure_output_streams()
     args = parse_args()
     for path in (args.input_vmd, args.mmd_model):
         if not path.exists():

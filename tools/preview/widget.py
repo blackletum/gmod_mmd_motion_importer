@@ -174,6 +174,7 @@ class PreviewWidget(QOpenGLWidget):
         self._material_ranges: list[tuple[int, int, int]] = []
         self._hidden_material_count = 0
         self._rest_inverse: np.ndarray | None = None
+        self._rest_local: np.ndarray | None = None
         self._children: list[list[int]] = []
         self._deform_mirror_pairs: list[tuple[int, int]] = []
         self._scene_center = np.zeros(3, dtype=np.float64)
@@ -334,7 +335,11 @@ class PreviewWidget(QOpenGLWidget):
             else:
                 self.current_frame = float(self.scene_data.frame_end)
                 self.pause()
-        self._sync_audio_to_frame(play_if_ready=True)
+        # Only keep audio following the animation while still playing; after the
+        # non-loop end pause() above, re-syncing with play_if_ready would restart
+        # the music over a frozen frame.
+        if self.playing:
+            self._sync_audio_to_frame(play_if_ready=True)
         self.frameChanged.emit(int(self.current_frame), self.current_frame / max(1, self.scene_data.fps))
         self.update()
 
@@ -364,6 +369,18 @@ class PreviewWidget(QOpenGLWidget):
             if 0 <= bone.parent < len(scene.bones):
                 self._children[bone.parent].append(index)
         self._deform_mirror_pairs = self._build_deform_mirror_pairs()
+
+        # Per-bone rest offset relative to its parent is frame-invariant; cache
+        # it once instead of rebuilding np.arrays for every bone every frame in
+        # the skinning hot path.
+        self._rest_local = np.zeros((len(scene.bones), 3), dtype=np.float64)
+        for index, bone in enumerate(scene.bones):
+            parent = bone.parent if 0 <= bone.parent < len(scene.bones) else -1
+            position = np.array(bone.position, dtype=np.float64)
+            if parent >= 0:
+                self._rest_local[index] = position - np.array(scene.bones[parent].position, dtype=np.float64)
+            else:
+                self._rest_local[index] = position
 
         self._rest_inverse = self._compute_rest_inverse()
         bounds_source = self._positions if len(self._positions) > 0 else np.array([bone.position for bone in scene.bones], dtype=np.float64)
@@ -470,12 +487,7 @@ class PreviewWidget(QOpenGLWidget):
         bone_world = np.zeros((len(scene.bones), 3), dtype=np.float64)
         for index, bone in enumerate(scene.bones):
             parent = bone.parent if 0 <= bone.parent < len(scene.bones) else -1
-            position = np.array(bone.position, dtype=np.float64)
-            if parent >= 0:
-                parent_position = np.array(scene.bones[parent].position, dtype=np.float64)
-                rest_local = position - parent_position
-            else:
-                rest_local = position
+            rest_local = self._rest_local[index]
 
             loc, quat = sample_bone_motion(scene.bone_tracks.get(index), self.current_frame)
             local[index] = _translation_matrix(rest_local + np.array(loc, dtype=np.float64)) @ _rotation_matrix(quat)
@@ -675,9 +687,37 @@ class PreviewWidget(QOpenGLWidget):
         dpr = max(1.0, float(self.devicePixelRatioF()))
         return max(1, int(round(self.width() * dpr))), max(1, int(round(self.height() * dpr)))
 
+    def _release_gl_resources(self) -> None:
+        """Delete previously allocated GL buffers/textures. Called before a
+        realloc so reloading a scene does not leak the old GPU objects."""
+        if not GL:
+            self._vao, self._vbo, self._ibo, self._texture_ids = 0, 0, 0, {}
+            return
+        try:
+            tex_list = [t for t in (self._texture_ids or {}).values() if t]
+            if tex_list and hasattr(GL, "glDeleteTextures"):
+                GL.glDeleteTextures(tex_list)
+        except Exception:
+            pass
+        for handle, deleter in ((self._vbo, "glDeleteBuffers"), (self._ibo, "glDeleteBuffers")):
+            if handle and hasattr(GL, deleter):
+                try:
+                    getattr(GL, deleter)(1, [handle])
+                except Exception:
+                    pass
+        if self._vao and hasattr(GL, "glDeleteVertexArrays"):
+            try:
+                GL.glDeleteVertexArrays(1, [self._vao])
+            except Exception:
+                pass
+        self._vao, self._vbo, self._ibo, self._texture_ids = 0, 0, 0, {}
+
     def _ensure_gl_resources(self) -> bool:
         if not GL or self._gl_ready or not self.scene_data or not self.scene_data.mesh or self._indices is None:
             return self._gl_ready
+
+        # Free any resources left over from a previously loaded scene first.
+        self._release_gl_resources()
 
         try:
             if hasattr(GL, "glGenVertexArrays"):
