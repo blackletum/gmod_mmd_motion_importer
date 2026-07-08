@@ -703,7 +703,6 @@ function TOOL.BuildCPanel(panel)
     section(advancedTab, L("mmd_vmd_npc.ui.tab.advanced"), Color(180, 180, 180))
 
     advancedTab:CheckBox("Q: Show halos", "mmd_vmd_npc_show_halos") -- ADDED
-    -- advancedTab:CheckBox("Q: Transfer PAC", "mmd_vmd_npc_transfer_pac") -- ADDED
 
     advancedTab:CheckBox(L("mmd_vmd_npc.ui.disable_armtwist"), "mmd_vmd_npc_disable_armtwist")
     advancedTab:CheckBox(L("mmd_vmd_npc.ui.disable_handtwist"), "mmd_vmd_npc_disable_handtwist")

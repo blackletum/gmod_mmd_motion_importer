@@ -1,5 +1,4 @@
 MMDVMDNPC = MMDVMDNPC or {}
-
 MMDVMDNPC.DebugTargets = MMDVMDNPC.DebugTargets or {}
 MMDVMDNPC.AssignedActors = MMDVMDNPC.AssignedActors or {}
 MMDVMDNPC.BuildJobs = MMDVMDNPC.BuildJobs or {}
