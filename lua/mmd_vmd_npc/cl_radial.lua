@@ -252,11 +252,7 @@ vgui.Register("MMD_RadialMenu", PANEL, "EditablePanel")
 
 local radialMenuInstance = nil
 
-concommand.Add("+mmd_wheel", function()
-    if #MMDVMDNPC.RadialFavorites == 0 then 
-        notification.AddLegacy("Колесо пусто!", NOTIFY_ERROR, 3)
-        return 
-    end
+        notification.AddLegacy("Wheel is empty!", NOTIFY_ERROR, 3)
     
     if IsValid(radialMenuInstance) then radialMenuInstance:Remove() end
     radialMenuInstance = vgui.Create("MMD_RadialMenu")
