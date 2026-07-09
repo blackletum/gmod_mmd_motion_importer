@@ -10,6 +10,7 @@ MMDVMDNPC.SelfPlaybackVisuals = MMDVMDNPC.SelfPlaybackVisuals or {}
 MMDVMDNPC.SelfPlaybackMovementLocks = MMDVMDNPC.SelfPlaybackMovementLocks or {}
 MMDVMDNPC.EyeTrackCameraTargets = MMDVMDNPC.EyeTrackCameraTargets or {}
 MMDVMDNPC.CVarSuppressions = MMDVMDNPC.CVarSuppressions or {}
+MMDVMDNPC.CVarOriginals = MMDVMDNPC.CVarOriginals or {}
 MMDVMDNPC.RPEBodySuppressionToken = MMDVMDNPC.RPEBodySuppressionToken or nil
 MMDVMDNPC.AudioOffsets = MMDVMDNPC.AudioOffsets or nil
 
@@ -60,6 +61,9 @@ end
 local function store_built_cache(path, built)
     if not path or path == "" then return end
     MMDVMDNPC.BuiltCache[path] = built
+    -- Record the tiny header so clears/deletes can match this file without
+    -- re-parsing its multi-MB body (the file is already on disk by here).
+    if MMDVMDNPC.NoteBuiltHeader then MMDVMDNPC.NoteBuiltHeader(path, built) end
 
     local order = MMDVMDNPC.BuiltCacheOrder
     for i = #order, 1, -1 do
@@ -365,15 +369,18 @@ local function optional_convar(name)
     return GetConVar(name)
 end
 
--- Apply cvar changes IMMEDIATELY via ConVar:SetString rather than the deferred
--- RunConsoleCommand. Two suppression sets share the RPE body cvar on one
--- refcounted state, and the build->play handoff releases then re-acquires it in
--- the same frame. With a deferred restore the re-acquire would read the still-
--- suppressed "0" as the "original" and pin the cvar off permanently; an
--- immediate restore means the re-capture sees the true original value.
-local function set_cvar_now(name, value)
-    local cvar = optional_convar(name)
-    if cvar then cvar:SetString(tostring(value)) end
+-- Cvar changes go through RunConsoleCommand: ConVar:SetString throws
+-- "attempted to modify ConVar not created by Lua" for the other addon's
+-- (engine-registered) cvars, which is exactly what we suppress. RunConsoleCommand
+-- is deferred to end of frame, so we must NOT re-read the live cvar to recover
+-- its original value during a same-frame release/re-acquire (build->play, or
+-- stop->replay) — it would still read the suppressed "0" and pin the cvar off
+-- permanently. Instead the true original is remembered in CVarOriginals and only
+-- forgotten a frame after the last release, once the restore has actually run.
+local function forget_cvar_original(name)
+    if not MMDVMDNPC.CVarSuppressions[name] then
+        MMDVMDNPC.CVarOriginals[name] = nil
+    end
 end
 
 local function begin_scoped_cvar_suppression(names)
@@ -383,12 +390,12 @@ local function begin_scoped_cvar_suppression(names)
         if cvar then
             local state = MMDVMDNPC.CVarSuppressions[name]
             if not state then
-                state = {
-                    original = cvar:GetString(),
-                    count = 0,
-                }
+                if MMDVMDNPC.CVarOriginals[name] == nil then
+                    MMDVMDNPC.CVarOriginals[name] = cvar:GetString()
+                end
+                state = { count = 0 }
                 MMDVMDNPC.CVarSuppressions[name] = state
-                set_cvar_now(name, "0")
+                RunConsoleCommand(name, "0")
             end
             state.count = (state.count or 0) + 1
             token[#token + 1] = name
@@ -404,7 +411,13 @@ local function end_scoped_cvar_suppression(token)
             state.count = math.max(0, (state.count or 1) - 1)
             if state.count <= 0 then
                 MMDVMDNPC.CVarSuppressions[name] = nil
-                set_cvar_now(name, tostring(state.original or "0"))
+                if optional_convar(name) then
+                    local original = MMDVMDNPC.CVarOriginals[name]
+                    RunConsoleCommand(name, tostring(original ~= nil and original or "0"))
+                end
+                -- Forget next frame, once the restore has applied and unless a
+                -- re-acquire re-suppressed the cvar in the meantime.
+                timer.Simple(0, function() forget_cvar_original(name) end)
             end
         end
     end
@@ -1913,21 +1926,26 @@ local function built_matches_scope(built, motionID, model)
     return true
 end
 
+local function header_matches_scope(header, motionID, model)
+    if not istable(header) then return false end
+    if header.format ~= MMDVMDNPC.BuiltFormat then return false end
+    if tostring(header.motion_id or "") ~= tostring(motionID or "") then return false end
+    if model ~= nil and tostring(header.model or "") ~= tostring(model or "") then return false end
+    return true
+end
+
 local function remove_matching_built_cache(motionID, model)
     local removed = 0
     local files = file.Find(MMDVMDNPC.BuiltRoot .. "/*" .. MMDVMDNPC.CacheExtension, "DATA", "nameasc")
 
     for _, name in ipairs(files or {}) do
         local path = MMDVMDNPC.BuiltRoot .. "/" .. name
-        local cached = MMDVMDNPC.BuiltCache[path]
-        local built = cached
-        if not built then
-            local raw = file.Read(path, "DATA")
-            built = raw and util.JSONToTable(raw) or nil
-        end
-
-        if built_matches_scope(built, motionID, model) then
+        -- Match on the lightweight header (index-cached, keyed by mtime) instead
+        -- of parsing the whole baked animation just to read 3 fields.
+        local header = MMDVMDNPC.BuiltHeader and MMDVMDNPC.BuiltHeader(path, MMDVMDNPC.BuiltCache[path]) or nil
+        if header_matches_scope(header, motionID, model) then
             MMDVMDNPC.BuiltCache[path] = nil
+            if MMDVMDNPC.ForgetBuiltHeader then MMDVMDNPC.ForgetBuiltHeader(path) end
             file.Delete(path)
             removed = removed + 1
         end
@@ -1936,6 +1954,7 @@ local function remove_matching_built_cache(motionID, model)
     for path, built in pairs(MMDVMDNPC.BuiltCache) do
         if built_matches_scope(built, motionID, model) then
             MMDVMDNPC.BuiltCache[path] = nil
+            if MMDVMDNPC.ForgetBuiltHeader then MMDVMDNPC.ForgetBuiltHeader(path) end
             removed = removed + 1
         end
     end
@@ -2090,6 +2109,7 @@ function MMDVMDNPC.DeleteMotionForPlayer(ply, motionID)
 
     file.Delete(path)
     MMDVMDNPC.Cache[id] = nil
+    if MMDVMDNPC.ForgetMotionMeta then MMDVMDNPC.ForgetMotionMeta(id) end
 
     local musicPath, musicRemoved, musicExisted = try_delete_imported_music(musicSound)
     local deleted = file.Exists(path, "DATA") ~= true

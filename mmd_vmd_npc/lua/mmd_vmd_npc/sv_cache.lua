@@ -503,14 +503,72 @@ local function read_motion_file(info)
     return motion
 end
 
+-- Lightweight persistent header/metadata indexes -----------------------------
+-- Parsing every motion or built-cache JSON in full (each can be several MB of
+-- baked frames) just to read a handful of header fields is what made the first
+-- menu open, motion deletion and built-cache clearing extremely slow. These
+-- indexes remember the small header per file keyed by the file's mtime, persist
+-- to a tiny sidecar (a ".dat" so it never matches the "*.json" motion/built
+-- globs), and are only rebuilt for files that are new or have changed.
+
+local MOTION_META_INDEX_PATH = MMDVMDNPC.MotionRoot .. "/_meta_index.dat"
+local BUILT_HEADER_INDEX_PATH = MMDVMDNPC.BuiltRoot .. "/_headers.dat"
+
+local function load_json_index(filePath)
+    local raw = file.Read(filePath, "DATA")
+    if not raw then return {} end
+    local parsed = util.JSONToTable(raw)
+    return istable(parsed) and parsed or {}
+end
+
+local function save_json_index(filePath, tbl)
+    local dir = string.GetPathFromFilename(filePath)
+    if dir and dir ~= "" then file.CreateDir(dir) end
+    file.Write(filePath, util.TableToJSON(tbl or {}))
+end
+
+local function make_index(path, timerName)
+    local cache
+    local function get()
+        if not cache then cache = load_json_index(path) end
+        return cache
+    end
+    local dirty = false
+    local function schedule_save()
+        if dirty then return end
+        dirty = true
+        timer.Create(timerName, 1, 1, function()
+            dirty = false
+            save_json_index(path, get())
+        end)
+    end
+    return get, schedule_save
+end
+
+local motion_meta_index, save_motion_meta_index = make_index(MOTION_META_INDEX_PATH, "MMDVMDNPCMotionMetaSave")
+local built_header_index, save_built_header_index = make_index(BUILT_HEADER_INDEX_PATH, "MMDVMDNPCBuiltHeaderSave")
+
+-- Motion metadata: served from the index whenever the file's mtime is unchanged
+-- so a full parse only happens for new/changed motions.
 function MMDVMDNPC.MotionMetadata(motionID)
     local info = motion_file_info(motionID)
     if not info then return nil, "invalid motion id" end
 
+    local modified = info.modified or 0
+    -- Size is part of the validity key: file.Time is only whole-second, so a
+    -- same-second content replacement (backup restore, cp -p, a re-import inside
+    -- one second) would otherwise keep serving stale persisted metadata.
+    local size = file.Size(info.path, info.realm) or -1
+    local idx = motion_meta_index()
+    local cached = idx[info.id]
+    if istable(cached) and cached.modified == modified and cached.size == size and istable(cached.meta) then
+        return cached.meta
+    end
+
     local motion, err = MMDVMDNPC.LoadMotion(info.id)
     if not motion then return nil, err end
 
-    return {
+    local meta = {
         id = info.id,
         fps = motion.fps or MMDVMDNPC.VMDFPS or 30,
         frameStart = motion.frameStart or 0,
@@ -519,11 +577,11 @@ function MMDVMDNPC.MotionMetadata(motionID)
         duration = motion.duration or 0,
         boneCount = #(motion.boneTracks or {}),
         flexCount = #(motion.flexTracks or {}),
-        displayName = motion.displayName ~= "" and motion.displayName or id,
+        displayName = (motion.displayName and motion.displayName ~= "") and motion.displayName or info.id,
         sourceName = motion.sourceName or "",
         sourcePath = motion.sourcePath or "",
         modelPath = motion.modelPath or "",
-        modified = file.Time(motion.filePath or info.path, motion.fileRealm or info.realm) or motion.modified or 0,
+        modified = modified,
         isAddon = motion.isAddon == true,
         musicSound = motion.music and motion.music.sound or "",
         musicSource = motion.music and motion.music.source or "",
@@ -531,7 +589,102 @@ function MMDVMDNPC.MotionMetadata(motionID)
         musicOffset = motion.defaultAudioOffset or (motion.music and motion.music.offset) or 0,
         hasCamera = motion.camera ~= nil,
     }
+
+    idx[info.id] = { modified = modified, size = size, meta = meta }
+    save_motion_meta_index()
+    return meta
 end
+
+function MMDVMDNPC.ForgetMotionMeta(motionID)
+    local id = MMDVMDNPC.NormalizeMotionID(motionID) or tostring(motionID or "")
+    local idx = motion_meta_index()
+    if idx[id] ~= nil then
+        idx[id] = nil
+        save_motion_meta_index()
+    end
+end
+
+-- Built-cache header {motion_id, model, format} without parsing the whole file
+-- once the index knows it. builtInMem is the in-memory BuiltCache entry, if any.
+local function derive_built_header(built, modified)
+    return {
+        motion_id = tostring(built.motion_id or ""),
+        model = tostring(built.model or ""),
+        format = tostring(built.format or ""),
+        modified = modified,
+    }
+end
+
+function MMDVMDNPC.BuiltHeader(path, builtInMem)
+    if not path or path == "" then return nil end
+    local modified = file.Time(path, "DATA") or 0
+    if modified == 0 and not file.Exists(path, "DATA") then return nil end
+
+    local idx = built_header_index()
+    local entry = idx[path]
+    if istable(entry) and entry.modified == modified then
+        return entry
+    end
+
+    local built = builtInMem
+    if not istable(built) then
+        local raw = file.Read(path, "DATA")
+        built = raw and util.JSONToTable(raw) or nil
+    end
+    if not istable(built) then return nil end
+
+    entry = derive_built_header(built, modified)
+    idx[path] = entry
+    save_built_header_index()
+    return entry
+end
+
+function MMDVMDNPC.NoteBuiltHeader(path, built)
+    if not path or path == "" or not istable(built) then return end
+    built_header_index()[path] = derive_built_header(built, file.Time(path, "DATA") or 0)
+    save_built_header_index()
+end
+
+function MMDVMDNPC.ForgetBuiltHeader(path)
+    if not path then return end
+    local idx = built_header_index()
+    if idx[path] ~= nil then
+        idx[path] = nil
+        save_built_header_index()
+    end
+end
+
+-- Drop index entries whose files no longer exist. Files removed outside the
+-- addon's own delete/clear paths (manual deletion, MRU eviction then deletion)
+-- would otherwise linger forever; a stale entry is never served (both lookups
+-- re-validate against the live file) but the sidecars would grow unbounded.
+-- Runs once, shortly after server start.
+function MMDVMDNPC.PruneStaleIndexes()
+    local built = built_header_index()
+    local builtChanged = false
+    for path in pairs(built) do
+        if not file.Exists(path, "DATA") then
+            built[path] = nil
+            builtChanged = true
+        end
+    end
+    if builtChanged then save_built_header_index() end
+
+    local meta = motion_meta_index()
+    local metaChanged = false
+    for id in pairs(meta) do
+        local info = motion_file_info(id)
+        if not info or not file.Exists(info.path, info.realm) then
+            meta[id] = nil
+            metaChanged = true
+        end
+    end
+    if metaChanged then save_motion_meta_index() end
+end
+
+timer.Simple(30, function()
+    if MMDVMDNPC.PruneStaleIndexes then MMDVMDNPC.PruneStaleIndexes() end
+end)
 
 function MMDVMDNPC.ListMotions()
     local files = file.Find(MMDVMDNPC.MotionRoot .. "/*" .. MMDVMDNPC.CacheExtension, "DATA", "nameasc")

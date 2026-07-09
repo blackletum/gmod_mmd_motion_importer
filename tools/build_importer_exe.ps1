@@ -2,7 +2,19 @@ param(
     [string]$Python = "python",
     [string]$Name = "GmodMMDMotionImporter",
     [switch]$UseUPX,
-    [switch]$NoBundledFFmpeg
+    [switch]$NoBundledFFmpeg,
+    # Blender 4.5.10 LTS is embedded in the one-file EXE. At runtime the importer
+    # reuses the Simple Character Model Importer's Blender if present, otherwise it
+    # extracts this embedded zip once into %LOCALAPPDATA%\MMDVMDNPC. Pass -BlenderZip
+    # to point at an already-downloaded portable zip; otherwise the script reuses a
+    # local copy (SCMI download cache / project) or downloads the pinned version.
+    [string]$BlenderZip = "",
+    [string]$BlenderVersion = "4.5.10",
+    [switch]$NoBundledBlender,
+    # Optional: embed an mmd_tools .zip so a freshly-extracted Blender installs it
+    # offline. When omitted, the bake downloads mmd_tools from extensions.blender.org
+    # on first use (unchanged behaviour).
+    [string]$MmdToolsZip = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,6 +63,76 @@ try {
         $FfmpegPath = (& $Python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
         if ($LASTEXITCODE -eq 0 -and (Test-Path $FfmpegPath)) {
             $ExtraArgs += @("--add-binary", "$FfmpegPath;imageio_ffmpeg\binaries")
+        }
+    }
+
+    # Embed portable Blender 4.5.10 so the importer needs no separate install.
+    if (-not $NoBundledBlender) {
+        $BlenderZipName = "blender-$BlenderVersion-windows-x64.zip"
+        $ResolvedBlenderZip = ""
+        $Candidates = @()
+        if ($BlenderZip) { $Candidates += $BlenderZip }
+        if ($env:MMDVMDNPC_BLENDER_ZIP) { $Candidates += $env:MMDVMDNPC_BLENDER_ZIP }
+        if ($env:LOCALAPPDATA) {
+            # The Simple Character Model Importer keeps the same portable zip here.
+            $Candidates += (Join-Path $env:LOCALAPPDATA "MMDCharacterImporter\downloads\$BlenderZipName")
+        }
+        $Candidates += (Join-Path $Root "build\blender_cache\$BlenderZipName")
+        foreach ($cand in $Candidates) {
+            if ($cand -and (Test-Path $cand) -and ((Get-Item $cand).Length -gt 50MB)) {
+                $ResolvedBlenderZip = (Resolve-Path $cand).Path
+                break
+            }
+        }
+        if (-not $ResolvedBlenderZip) {
+            $CacheDir = Join-Path $Root "build\blender_cache"
+            New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+            $DownloadTarget = Join-Path $CacheDir $BlenderZipName
+            $Series = ($BlenderVersion -split '\.')[0..1] -join '.'
+            $Url = "https://download.blender.org/release/Blender$Series/$BlenderZipName"
+            Write-Host "Downloading Blender $BlenderVersion (~400 MB) from $Url ..."
+            $PrevProgress = $ProgressPreference
+            $ProgressPreference = 'SilentlyContinue'
+            try {
+                Invoke-WebRequest -Uri $Url -OutFile $DownloadTarget
+            }
+            finally {
+                $ProgressPreference = $PrevProgress
+            }
+            if (-not (Test-Path $DownloadTarget) -or (Get-Item $DownloadTarget).Length -lt 50MB) {
+                throw "Blender download failed or is too small: $DownloadTarget"
+            }
+            $ResolvedBlenderZip = $DownloadTarget
+        }
+        # PyInstaller keeps the source basename, and the runtime only recognises a
+        # `blender-*-windows-x64.zip` name, so normalise a custom -BlenderZip to the
+        # canonical filename before embedding.
+        if ([System.IO.Path]::GetFileName($ResolvedBlenderZip) -ne $BlenderZipName) {
+            $StageDir = Join-Path $Root "build\blender_cache"
+            New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+            $CanonicalPath = Join-Path $StageDir $BlenderZipName
+            if ((Resolve-Path $ResolvedBlenderZip).Path -ne $CanonicalPath) {
+                Copy-Item -LiteralPath $ResolvedBlenderZip -Destination $CanonicalPath -Force
+            }
+            $ResolvedBlenderZip = $CanonicalPath
+        }
+        Write-Host "Embedding Blender: $ResolvedBlenderZip"
+        $ExtraArgs += @("--add-data", "$ResolvedBlenderZip;blender")
+    }
+    else {
+        Write-Host "Skipping bundled Blender (-NoBundledBlender); the importer will reuse a sibling/system Blender at runtime."
+    }
+
+    # Optionally embed an mmd_tools zip for fully-offline first-run baking.
+    $MmdToolsSource = if ($MmdToolsZip) { $MmdToolsZip } elseif ($env:MMDVMDNPC_MMD_TOOLS_ZIP) { $env:MMDVMDNPC_MMD_TOOLS_ZIP } else { "" }
+    if ($MmdToolsSource) {
+        if (Test-Path $MmdToolsSource) {
+            $ResolvedMmd = (Resolve-Path $MmdToolsSource).Path
+            Write-Host "Embedding mmd_tools archive: $ResolvedMmd"
+            $ExtraArgs += @("--add-data", "$ResolvedMmd;blender_addons")
+        }
+        else {
+            Write-Host "WARNING: mmd_tools zip not found, skipping: $MmdToolsSource"
         }
     }
 

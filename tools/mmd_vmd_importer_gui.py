@@ -6,9 +6,10 @@ from __future__ import annotations
 import sys
 import html
 import json
+import os
+import subprocess
 import time
 import traceback
-import webbrowser
 from pathlib import Path
 
 try:
@@ -128,7 +129,9 @@ class ImportWorker(QtCore.QThread):
 
             baked_dir = import_vmd.BAKED_OUTPUT_DIR
             model_path = import_vmd.find_default_mmd_model()
-            blender_path = Path(str(self.settings["blender_path"])) if self.settings.get("blender_path") else None
+            # Blender is resolved by import_vmd (bundled / reused / extracted) — the
+            # user no longer picks it, so always let the resolver choose.
+            blender_path = None
             flex_vmds = [Path(str(path)) for path in self.settings.get("flex_vmds", [])]
             motion_name = str(self.settings.get("motion_name") or "").strip()
             audio_offset = float(self.settings.get("audio_offset") or 0.0)
@@ -190,6 +193,67 @@ class ImportWorker(QtCore.QThread):
             self.done.emit(result)
         except Exception as exc:
             self.failed.emit(str(exc) + "\n\n" + traceback.format_exc())
+
+
+class ManagerScanWorker(QtCore.QThread):
+    """Scans the installed-motions folder off the UI thread. Reuses a per-file
+    (mtime, size)-keyed header cache so repeat scans only re-read changed files."""
+
+    results = QtCore.Signal(list)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, motions_dir: Path, cache: dict) -> None:
+        super().__init__()
+        self.motions_dir = motions_dir
+        # Snapshot so the worker never races the main thread's live cache.
+        self.cache = dict(cache)
+
+    def run(self) -> None:
+        try:
+            rows: list[dict] = []
+            for path in sorted(self.motions_dir.glob("*.json")):
+                if path.name.startswith("."):
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                key = str(path)
+                cached = self.cache.get(key)
+                header: dict | None = None
+                error: str | None = None
+                if cached and cached.get("mtime") == stat.st_mtime and cached.get("size") == stat.st_size:
+                    header = cached.get("header")
+                if header is None:
+                    try:
+                        header = import_vmd.read_motion_header(path)
+                    except Exception as exc:  # a single corrupt file must not fail the scan
+                        error = str(exc)
+                rows.append({
+                    "path": key,
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size,
+                    "header": header,
+                    "error": error,
+                })
+            self.results.emit(rows)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class SortableTableItem(QtWidgets.QTableWidgetItem):
+    """Table cell that sorts by an explicit numeric key while showing formatted
+    text (so '1:23' / '2.5 MB' columns sort by real magnitude, not lexically)."""
+
+    def __init__(self, text: str, sort_key: float) -> None:
+        super().__init__(text)
+        self.sort_key = sort_key
+        self.setFlags(QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+
+    def __lt__(self, other: QtWidgets.QTableWidgetItem) -> bool:
+        if isinstance(other, SortableTableItem):
+            return self.sort_key < other.sort_key
+        return super().__lt__(other)
 
 
 class PathRow(QtWidgets.QWidget):
@@ -301,6 +365,15 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.output_title_labels: dict[str, QtWidgets.QLabel] = {}
         self.progress_timer = QtCore.QTimer(self)
         self.progress_timer.timeout.connect(self.update_import_progress)
+        # The Blender bake emits hundreds of log lines; appending each one to the
+        # QPlainTextEdit individually re-lays-out the widget every line and makes
+        # the UI stutter. Buffer the raw text and flush it in batches (~10 Hz);
+        # progress-bar detection still runs per line so feedback stays live.
+        self._log_buffer: list[str] = []
+        self._log_flush_timer = QtCore.QTimer(self)
+        self._log_flush_timer.setInterval(100)
+        self._log_flush_timer.timeout.connect(self._flush_log_buffer)
+        self._log_flush_timer.start()
 
         icon_path = self.importer_icon_path()
         if icon_path.exists():
@@ -310,8 +383,17 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(self.tabs)
         self.output_labels: dict[str, QtWidgets.QLabel] = {}
 
+        # Motion Manager state.
+        self._manager_worker: ManagerScanWorker | None = None
+        self._manager_cache: dict = self._load_manager_index()
+        self._manager_rows: list[dict] = []
+        self._manager_scanned_once = False
+        self._manager_refresh_pending = False
+
         self._build_inputs_tab()
         self._build_preview_tab()
+        self._build_manager_tab()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self._apply_style()
         self._load_persisted_settings()
         self._wire_persisted_settings()
@@ -471,6 +553,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if hasattr(self, "tabs"):
             self.tabs.setTabText(0, self.tr("tab.inputs"))
             self.tabs.setTabText(1, self.tr("tab.preview"))
+            self.tabs.setTabText(2, self.tr("tab.manager"))
+        self.retranslate_manager()
 
         if hasattr(self, "language_group"):
             self.language_group.setTitle(self.tr("language.panel.title"))
@@ -490,7 +574,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.remove_flex_button.setText(self.tr("inputs.flex.remove"))
 
         for attr, key in (
-            ("detect_blender_button", "inputs.detect_blender"),
             ("detect_gmod_button", "inputs.detect_gmod"),
             ("preview_button", "inputs.preview_motion"),
             ("import_button", "inputs.bake_import"),
@@ -512,8 +595,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         if hasattr(self, "follow_camera_check"):
             self.follow_camera_check.setToolTip(self.tr("preview.follow_camera.tooltip"))
 
-        if hasattr(self, "detect_blender_button"):
-            self.detect_blender_button.setToolTip(self.tr("inputs.detect_blender.tooltip"))
+        if hasattr(self, "blender_info_label"):
+            self.blender_info_label.setText(self.tr("inputs.blender.bundled", version=import_vmd.BUNDLED_BLENDER_VERSION))
+        if hasattr(self, "detect_gmod_button"):
             self.detect_gmod_button.setToolTip(self.tr("inputs.detect_gmod.tooltip"))
             self.export_addon_check.setText(self.tr("inputs.export_addon"))
             self.export_addon_check.setToolTip(self.tr("inputs.export_addon.tooltip"))
@@ -590,12 +674,18 @@ class ImporterWindow(QtWidgets.QMainWindow):
         layout.addWidget(self._build_language_panel())
 
         self.body_row = self.make_path_row("inputs.body_vmd.label", "file", "filter.vmd_motion", required=True, hint_key="inputs.body_vmd.hint")
-        self.blender_row = self.make_path_row("inputs.blender.label", "file", "filter.blender_executable", required=True, hint_key="inputs.blender.hint")
         self.gmod_row = self.make_path_row("inputs.gmod.label", "dir", required=True, hint_key="inputs.gmod.hint")
         self.music_row = self.make_path_row("inputs.music.label", "file", "filter.media", required=False, hint_key="inputs.music.hint")
         self.camera_row = self.make_path_row("inputs.camera_vmd.label", "file", "filter.vmd_motion", required=False, hint_key="inputs.camera_vmd.hint")
-        for row in (self.body_row, self.blender_row, self.gmod_row, self.music_row, self.camera_row):
+        for row in (self.body_row, self.gmod_row, self.music_row, self.camera_row):
             layout.addWidget(row)
+
+        # Blender ships with the importer (or is reused from a sibling importer),
+        # so there is no Blender path to pick or detect anymore.
+        self.blender_info_label = QtWidgets.QLabel(self.tr("inputs.blender.bundled", version=import_vmd.BUNDLED_BLENDER_VERSION))
+        self.blender_info_label.setObjectName("fieldHint")
+        self.blender_info_label.setWordWrap(True)
+        layout.addWidget(self.blender_info_label)
 
         audio_offset_layout = QtWidgets.QGridLayout()
         self.input_audio_offset_label = QtWidgets.QLabel(self.tr("inputs.audio_offset.label", seconds=0.0))
@@ -649,8 +739,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.flex_group)
 
         actions = QtWidgets.QHBoxLayout()
-        self.detect_blender_button = QtWidgets.QPushButton(self.tr("inputs.detect_blender"))
-        self.detect_blender_button.setToolTip(self.tr("inputs.detect_blender.tooltip"))
         self.detect_gmod_button = QtWidgets.QPushButton(self.tr("inputs.detect_gmod"))
         self.detect_gmod_button.setToolTip(self.tr("inputs.detect_gmod.tooltip"))
         self.preview_button = QtWidgets.QPushButton(self.tr("inputs.preview_motion"))
@@ -663,12 +751,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.export_addon_check.setToolTip(self.tr("inputs.export_addon.tooltip"))
         self.cancel_button = QtWidgets.QPushButton(self.tr("inputs.cancel_import"))
         self.cancel_button.setEnabled(False)
-        self.detect_blender_button.clicked.connect(self.detect_blender)
         self.detect_gmod_button.clicked.connect(self.detect_gmod)
         self.preview_button.clicked.connect(self.load_preview)
         self.import_button.clicked.connect(self.start_import)
         self.cancel_button.clicked.connect(self.cancel_import)
-        for button in (self.detect_blender_button, self.detect_gmod_button, self.preview_button, self.import_button):
+        for button in (self.detect_gmod_button, self.preview_button, self.import_button):
             actions.addWidget(button)
         actions.addWidget(self.export_addon_check)
         actions.addWidget(self.cancel_button)
@@ -706,8 +793,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(80)
+        # Cap retained lines so a very long bake log stays cheap to render; old
+        # lines scroll off automatically (the full text is still copyable live).
+        self.log.setMaximumBlockCount(6000)
         self.copy_log_button = QtWidgets.QPushButton(self.tr("inputs.copy_log"))
-        self.copy_log_button.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.log.toPlainText()))
+        self.copy_log_button.clicked.connect(self.copy_log_to_clipboard)
         log_layout.addWidget(self.log, 1)
         log_layout.addWidget(self.copy_log_button, 0, QtCore.Qt.AlignRight)
         layout.addWidget(self.log_group, 1)
@@ -882,7 +972,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
             "body_vmd": self.body_row,
             "music_path": self.music_row,
             "camera_vmd": self.camera_row,
-            "blender_path": self.blender_row,
             "gmod_dir": self.gmod_row,
         }
 
@@ -974,21 +1063,23 @@ class ImporterWindow(QtWidgets.QMainWindow):
             except Exception as exc:
                 self.append_log(self.tr("log.gmod_autodetect_skipped", error=exc))
 
-        if not self.blender_row.value():
-            try:
-                path = import_vmd.detect_blender()
-                self.blender_row.set_value(str(path))
-                version = import_vmd.blender_version(path)
-                self.append_log(self.tr("log.detected_blender", path=path, version=import_vmd.format_blender_version(version)))
-                if not import_vmd.is_blender_version_supported(version):
-                    self.prompt_install_blender(version)
-            except Exception as exc:
-                self.append_log(self.tr("log.blender_autodetect_skipped", error=exc))
-
     def append_log(self, message: str) -> None:
-        self.log.appendPlainText(message)
+        # Buffer the text (flushed in batches by the timer) but keep the live
+        # feedback — status line and progress-bar stage — immediate.
+        self._log_buffer.append(message)
         self.statusBar().showMessage(message[:160])
         self.update_progress_from_log(message)
+
+    def _flush_log_buffer(self) -> None:
+        if not self._log_buffer:
+            return
+        text = "\n".join(self._log_buffer)
+        self._log_buffer.clear()
+        self.log.appendPlainText(text)
+
+    def copy_log_to_clipboard(self) -> None:
+        self._flush_log_buffer()
+        QtWidgets.QApplication.clipboard().setText(self.log.toPlainText())
 
     def progress_stage_from_log(self, message: str) -> tuple[int, str, str] | None:
         checks = [
@@ -1042,25 +1133,6 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.append_log(self.tr("log.detected_gmod", path=path))
         except Exception as exc:
             self.show_error(self.tr("dialog.gmod_detection_failed.title"), str(exc))
-
-    def detect_blender(self) -> None:
-        try:
-            path = import_vmd.detect_blender()
-            self.blender_row.set_value(str(path))
-            version = import_vmd.blender_version(path)
-            self.append_log(self.tr("log.detected_blender", path=path, version=import_vmd.format_blender_version(version)))
-            if not import_vmd.is_blender_version_supported(version):
-                self.prompt_install_blender(version)
-        except Exception as exc:
-            self.show_error(self.tr("dialog.blender_detection_failed.title"), str(exc))
-
-    def prompt_install_blender(self, version=None) -> None:
-        if QtWidgets.QMessageBox.question(
-            self,
-            self.tr("dialog.blender_update_required.title"),
-            self.tr("dialog.blender_update_required.body", version=import_vmd.format_blender_version(version)),
-        ) == QtWidgets.QMessageBox.Yes:
-            webbrowser.open(import_vmd.STEAM_BLENDER_URL)
 
     def load_preview(self) -> None:
         try:
@@ -1307,13 +1379,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 return
             if not addon_gma_path.lower().endswith(".gma"):
                 addon_gma_path += ".gma"
+        self._log_buffer.clear()
         settings = {
             "body_vmd": self.body_row.value(),
             "music_path": self.music_row.value(),
             "camera_vmd": self.camera_row.value(),
             "motion_name": self.motion_name_edit.text().strip(),
             "audio_offset": self.current_audio_offset_seconds(),
-            "blender_path": self.blender_row.value(),
             "gmod_dir": self.gmod_row.value(),
             "flex_vmds": self.flex_vmd_paths(),
             "export_addon": export_addon,
@@ -1335,6 +1407,381 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.worker.cancel()
             self.append_log(self.tr("log.cancel_requested"))
 
+    # --- Motion Manager tab -------------------------------------------------
+    def _build_manager_tab(self) -> None:
+        self._manager_column_keys = [
+            "manager.col.name",
+            "manager.col.duration",
+            "manager.col.fps",
+            "manager.col.frames",
+            "manager.col.music",
+            "manager.col.camera",
+            "manager.col.flexes",
+            "manager.col.size",
+            "manager.col.modified",
+        ]
+        tab = QtWidgets.QWidget()
+        self.manager_tab = tab
+        layout = QtWidgets.QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        top = QtWidgets.QHBoxLayout()
+        self.manager_hint = QtWidgets.QLabel(self.tr("manager.hint"))
+        self.manager_hint.setObjectName("fieldHint")
+        self.manager_hint.setWordWrap(True)
+        self.manager_refresh_button = QtWidgets.QPushButton(self.tr("manager.refresh"))
+        self.manager_refresh_button.clicked.connect(self.manager_refresh)
+        self.manager_open_folder_button = QtWidgets.QPushButton(self.tr("manager.open_folder"))
+        self.manager_open_folder_button.clicked.connect(self.manager_open_folder)
+        top.addWidget(self.manager_hint, 1)
+        top.addWidget(self.manager_refresh_button)
+        top.addWidget(self.manager_open_folder_button)
+        layout.addLayout(top)
+
+        self.manager_table = QtWidgets.QTableWidget(0, len(self._manager_column_keys))
+        self.manager_table.setHorizontalHeaderLabels([self.tr(k) for k in self._manager_column_keys])
+        self.manager_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.manager_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.manager_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.manager_table.setSortingEnabled(True)
+        self.manager_table.setAlternatingRowColors(True)
+        self.manager_table.verticalHeader().setVisible(False)
+        header = self.manager_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for column in range(1, len(self._manager_column_keys)):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.manager_table.itemSelectionChanged.connect(self._update_manager_buttons)
+        self.manager_table.itemDoubleClicked.connect(lambda *_: self.manager_show_json())
+        layout.addWidget(self.manager_table, 1)
+
+        bottom = QtWidgets.QHBoxLayout()
+        self.manager_rename_button = QtWidgets.QPushButton(self.tr("manager.rename"))
+        self.manager_rename_button.clicked.connect(self.manager_rename)
+        self.manager_remove_button = QtWidgets.QPushButton(self.tr("manager.remove"))
+        self.manager_remove_button.clicked.connect(self.manager_remove)
+        self.manager_show_json_button = QtWidgets.QPushButton(self.tr("manager.show_json"))
+        self.manager_show_json_button.clicked.connect(self.manager_show_json)
+        self.manager_show_music_button = QtWidgets.QPushButton(self.tr("manager.show_music"))
+        self.manager_show_music_button.clicked.connect(self.manager_show_music)
+        self.manager_status_label = QtWidgets.QLabel(self.tr("manager.status_idle"))
+        self.manager_status_label.setObjectName("fieldHint")
+        for button in (self.manager_rename_button, self.manager_remove_button, self.manager_show_json_button, self.manager_show_music_button):
+            bottom.addWidget(button)
+        bottom.addStretch(1)
+        bottom.addWidget(self.manager_status_label)
+        layout.addLayout(bottom)
+
+        self._update_manager_buttons()
+        self.tabs.addTab(tab, self.tr("tab.manager"))
+
+    def retranslate_manager(self) -> None:
+        if not hasattr(self, "manager_table"):
+            return
+        self.manager_table.setHorizontalHeaderLabels([self.tr(k) for k in self._manager_column_keys])
+        self.manager_hint.setText(self.tr("manager.hint"))
+        self.manager_refresh_button.setText(self.tr("manager.refresh"))
+        self.manager_open_folder_button.setText(self.tr("manager.open_folder"))
+        self.manager_rename_button.setText(self.tr("manager.rename"))
+        self.manager_remove_button.setText(self.tr("manager.remove"))
+        self.manager_show_json_button.setText(self.tr("manager.show_json"))
+        self.manager_show_music_button.setText(self.tr("manager.show_music"))
+
+    def _manager_index_path(self) -> Path:
+        return import_vmd.app_local_dir() / "manager_index.json"
+
+    def _load_manager_index(self) -> dict:
+        try:
+            path = self._manager_index_path()
+            if path.is_file():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                entries = data.get("entries")
+                if isinstance(entries, dict):
+                    return entries
+        except Exception:
+            pass
+        return {}
+
+    def _save_manager_index(self) -> None:
+        try:
+            path = self._manager_index_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"version": 1, "entries": self._manager_cache}, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _invalidate_manager_cache(self, path) -> None:
+        if path:
+            self._manager_cache.pop(str(path), None)
+
+    def _resolve_gmod_dir(self) -> Path | None:
+        value = self.gmod_row.value().strip()
+        if value:
+            return Path(value)
+        try:
+            return import_vmd.find_gmod_install()
+        except Exception:
+            return None
+
+    def manager_motions_dir(self) -> Path | None:
+        gmod = self._resolve_gmod_dir()
+        if gmod is None:
+            return None
+        return import_vmd.gmod_motions_dir(gmod)
+
+    def _on_tab_changed(self, index: int) -> None:
+        if getattr(self, "manager_tab", None) is not None and self.tabs.widget(index) is self.manager_tab:
+            # Lazily scan when the manager is first opened, and re-scan on return
+            # so motions imported/edited elsewhere show up.
+            self.manager_refresh()
+
+    def manager_refresh(self) -> None:
+        if self._manager_worker is not None and self._manager_worker.isRunning():
+            # A scan is already running with a stale snapshot; queue one more so a
+            # delete/rename/import that happened mid-scan is reflected afterwards.
+            self._manager_refresh_pending = True
+            return
+        motions_dir = self.manager_motions_dir()
+        if motions_dir is None or not motions_dir.is_dir():
+            self._manager_rows = []
+            self._populate_manager_table([])
+            self.manager_status_label.setText(self.tr("manager.status_no_dir"))
+            self._update_manager_buttons()
+            return
+        self.manager_status_label.setText(self.tr("manager.status_scanning"))
+        self.manager_refresh_button.setEnabled(False)
+        self._manager_scanned_once = True
+        self._manager_worker = ManagerScanWorker(motions_dir, self._manager_cache)
+        self._manager_worker.results.connect(self._on_manager_results)
+        self._manager_worker.failed.connect(self._on_manager_failed)
+        self._manager_worker.start()
+
+    def _on_manager_results(self, rows: list) -> None:
+        self.manager_refresh_button.setEnabled(True)
+        # Rebuild the cache from the files that exist now (auto-prunes deleted ones).
+        new_cache: dict = {}
+        for row in rows:
+            if row.get("header"):
+                new_cache[row["path"]] = {"mtime": row["mtime"], "size": row["size"], "header": row["header"]}
+        self._manager_cache = new_cache
+        self._save_manager_index()
+        self._manager_rows = rows
+        self._populate_manager_table(rows)
+        ok = sum(1 for row in rows if row.get("header"))
+        self.manager_status_label.setText(self.tr("manager.status_count", count=ok))
+        self._update_manager_buttons()
+        if self._manager_refresh_pending:
+            # A refresh requested during this scan (e.g. a mid-scan delete) was
+            # deferred; run it now against current disk + the freshly pruned cache.
+            self._manager_refresh_pending = False
+            self.manager_refresh()
+
+    def _on_manager_failed(self, message: str) -> None:
+        self.manager_refresh_button.setEnabled(True)
+        self.manager_status_label.setText(self.tr("manager.status_error", error=message))
+
+    def _populate_manager_table(self, rows: list) -> None:
+        table = self.manager_table
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        for row in rows:
+            header = row.get("header") or {}
+            r = table.rowCount()
+            table.insertRow(r)
+            display = str(header.get("display_name") or Path(row["path"]).stem)
+            name_item = QtWidgets.QTableWidgetItem(display)
+            name_item.setFlags(QtCore.Qt.ItemFlag.ItemIsSelectable | QtCore.Qt.ItemFlag.ItemIsEnabled)
+            name_item.setData(QtCore.Qt.ItemDataRole.UserRole, row["path"])
+            if row.get("error"):
+                name_item.setToolTip(self.tr("manager.row_error", error=row["error"]))
+            table.setItem(r, 0, name_item)
+
+            dur = float(header.get("duration") or 0.0)
+            table.setItem(r, 1, SortableTableItem(self._format_duration(dur), dur))
+            fps = int(header.get("fps") or 0)
+            table.setItem(r, 2, SortableTableItem(str(fps) if fps else "—", fps))
+            frames = int(header.get("frame_count") or 0)
+            table.setItem(r, 3, SortableTableItem(str(frames) if frames else "—", frames))
+            has_music = bool(header.get("has_music"))
+            table.setItem(r, 4, SortableTableItem(self.tr("manager.yes") if has_music else "—", 1 if has_music else 0))
+            cam_keys = int(header.get("camera_key_count") or 0)
+            cam_text = self.tr("manager.camera_keys", count=cam_keys) if cam_keys else "—"
+            table.setItem(r, 5, SortableTableItem(cam_text, cam_keys))
+            flexes = int(header.get("flex_count") or 0)
+            table.setItem(r, 6, SortableTableItem(str(flexes), flexes))
+            size = int(row.get("size") or 0)
+            table.setItem(r, 7, SortableTableItem(self._format_size(size), size))
+            mtime = float(row.get("mtime") or 0.0)
+            table.setItem(r, 8, SortableTableItem(self._format_time(mtime), mtime))
+        table.setSortingEnabled(True)
+
+    def _selected_manager_paths(self) -> list[str]:
+        paths: list[str] = []
+        for item in self.manager_table.selectedItems():
+            if item.column() == 0:
+                value = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if value:
+                    paths.append(str(value))
+        return paths
+
+    def _header_for_path(self, path: str) -> dict | None:
+        for row in self._manager_rows:
+            if row.get("path") == path:
+                return row.get("header")
+        return None
+
+    def _update_manager_buttons(self) -> None:
+        if not hasattr(self, "manager_rename_button"):
+            return
+        paths = self._selected_manager_paths()
+        single = len(paths) == 1
+        self.manager_rename_button.setEnabled(single)
+        self.manager_remove_button.setEnabled(len(paths) >= 1)
+        self.manager_show_json_button.setEnabled(single)
+        has_music = bool(single and (self._header_for_path(paths[0]) or {}).get("has_music"))
+        self.manager_show_music_button.setEnabled(has_music)
+
+    def manager_rename(self) -> None:
+        paths = self._selected_manager_paths()
+        if len(paths) != 1:
+            return
+        path = Path(paths[0])
+        current = str((self._header_for_path(paths[0]) or {}).get("display_name") or path.stem)
+        new_name, ok = QtWidgets.QInputDialog.getText(
+            self, self.tr("manager.rename_title"), self.tr("manager.rename_prompt"), text=current
+        )
+        if not ok:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == current:
+            return
+        try:
+            import_vmd.rename_motion_display_name(path, new_name)
+        except Exception as exc:
+            self.show_error(self.tr("manager.rename_failed_title"), str(exc))
+            return
+        self._invalidate_manager_cache(str(path))
+        self.manager_refresh()
+        self.statusBar().showMessage(self.tr("manager.renamed", name=new_name))
+
+    def manager_remove(self) -> None:
+        paths = self._selected_manager_paths()
+        if not paths:
+            return
+        names = [str((self._header_for_path(p) or {}).get("display_name") or Path(p).stem) for p in paths]
+        preview = "\n".join(names[:20])
+        if len(names) > 20:
+            preview += "\n…"
+        if QtWidgets.QMessageBox.question(
+            self,
+            self.tr("manager.remove_title"),
+            self.tr("manager.remove_confirm", count=len(paths), names=preview),
+        ) != QtWidgets.QMessageBox.Yes:
+            return
+        gmod = self._resolve_gmod_dir()
+        removed = 0
+        errors: list[str] = []
+        for path_str in paths:
+            header = self._header_for_path(path_str) or {}
+            path = Path(path_str)
+            try:
+                path.unlink(missing_ok=True)
+                removed += 1
+            except Exception as exc:
+                errors.append(f"{path.name}: {exc}")
+                continue
+            sound_rel = str(header.get("music_sound") or "")
+            if sound_rel and gmod is not None:
+                try:
+                    sound_root = (gmod / "garrysmod" / "sound").resolve()
+                    sound_path = (sound_root / import_vmd.safe_relative_path(sound_rel)).resolve()
+                    # Never delete outside the GMod sound tree, even if a shared
+                    # motion carried a hostile music path.
+                    if sound_root in sound_path.parents and sound_path.is_file():
+                        sound_path.unlink()
+                except Exception:
+                    pass
+            self._invalidate_manager_cache(path_str)
+        self.manager_refresh()
+        if errors:
+            self.show_error(self.tr("manager.remove_failed_title"), "\n".join(errors))
+        self.statusBar().showMessage(self.tr("manager.removed", count=removed))
+
+    def manager_open_folder(self) -> None:
+        motions_dir = self.manager_motions_dir()
+        if motions_dir is None:
+            self.manager_status_label.setText(self.tr("manager.status_no_dir"))
+            return
+        try:
+            motions_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self._open_in_file_manager(motions_dir)
+
+    def manager_show_json(self) -> None:
+        paths = self._selected_manager_paths()
+        if len(paths) == 1:
+            self._reveal_in_file_manager(Path(paths[0]))
+
+    def manager_show_music(self) -> None:
+        paths = self._selected_manager_paths()
+        if len(paths) != 1:
+            return
+        sound_rel = str((self._header_for_path(paths[0]) or {}).get("music_sound") or "")
+        gmod = self._resolve_gmod_dir()
+        if not sound_rel or gmod is None:
+            return
+        try:
+            sound_path = gmod / "garrysmod" / "sound" / import_vmd.safe_relative_path(sound_rel)
+        except Exception:
+            return
+        self._reveal_in_file_manager(sound_path)
+
+    def _open_in_file_manager(self, path: Path) -> None:
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            else:
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+        except Exception as exc:
+            self.show_error(self.tr("manager.open_failed_title"), str(exc))
+
+    def _reveal_in_file_manager(self, path: Path) -> None:
+        try:
+            if sys.platform.startswith("win") and path.exists():
+                # explorer returns exit code 1 even on success, so fire-and-forget.
+                subprocess.Popen(f'explorer /select,"{path}"')
+            else:
+                target = path if path.is_dir() else path.parent
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(target)))
+        except Exception as exc:
+            self.show_error(self.tr("manager.open_failed_title"), str(exc))
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        minutes = int(seconds // 60)
+        return f"{minutes}:{seconds - minutes * 60:04.1f}"
+
+    @staticmethod
+    def _format_size(size: int) -> str:
+        size = max(0, int(size))
+        if size < 1024:
+            return f"{size} B"
+        if size < 1024 * 1024:
+            return f"{size / 1024:.1f} KB"
+        return f"{size / 1024 / 1024:.1f} MB"
+
+    @staticmethod
+    def _format_time(mtime: float) -> str:
+        if not mtime:
+            return "—"
+        try:
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+        except Exception:
+            return "—"
+
     def closeEvent(self, event) -> None:
         # Destroying a still-running QThread makes Qt qFatal (hard crash). Ask the
         # running import to stop and wait for it to actually finish first.
@@ -1345,6 +1792,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
                 # The bake only polls cancel between Blender output lines; keep
                 # waiting rather than tearing the thread down mid-run.
                 worker.wait()
+        manager_worker = self._manager_worker
+        if manager_worker is not None and manager_worker.isRunning():
+            manager_worker.wait()
         super().closeEvent(event)
 
     def import_done(self, result: dict) -> None:
@@ -1361,6 +1811,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.output_labels["addon_gma"].setText(str(result.get("addon_gma", "")))
         music = result.get("music") or {}
         self.output_labels["music"].setText(str(music.get("sound", "")) if isinstance(music, dict) else "")
+        # The newly written motion must show up in the manager next time it opens.
+        self._invalidate_manager_cache(result.get("motion_json"))
+        self.manager_refresh()
         QtWidgets.QMessageBox.information(
             self,
             self.tr("dialog.import_complete.title"),

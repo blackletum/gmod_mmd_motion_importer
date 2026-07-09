@@ -134,6 +134,18 @@ local function WrapText(text, font, maxWidth)
     return lines
 end
 
+local SLOTS_PER_PAGE = 9
+local MOTIONS_PER_PAGE = SLOTS_PER_PAGE - 1 -- slot 1 is always the Stop button
+
+local function camera_auto_on()
+    local cvar = GetConVar("mmd_vmd_npc_camera_auto")
+    return not cvar or cvar:GetBool()
+end
+
+local function WL(key, fallback)
+    return (MMDVMDNPC.L and MMDVMDNPC.L(key, fallback)) or fallback
+end
+
 function PANEL:Init()
     self:SetSize(ScrW(), ScrH())
     self:Center()
@@ -142,69 +154,78 @@ function PANEL:Init()
     -- so -mmd_wheel never fires. The wheel is mouse-driven, so release keyboard
     -- capture and keep only mouse input.
     self:SetKeyboardInputEnabled(false)
+    self:SetMouseInputEnabled(true)
     self:SetAlpha(0)
     self:AlphaTo(255, 0.1)
 
-    self.Favorites = {}
+    -- Motion favorites only; the Stop button and empty slots are drawn from the
+    -- fixed 9-slot layout, not from this list.
+    self.Motions = {}
     for _, v in ipairs(MMDVMDNPC.RadialFavorites) do
-        if v ~= "toggle_cam_mode" then
-            table.insert(self.Favorites, v)
+        if v ~= "toggle_cam_mode" and v ~= "stop_playback" then
+            self.Motions[#self.Motions + 1] = v
         end
     end
 
-    self.Count = #self.Favorites
-    self.SelectedIndex = 0
+    self.PageCount = math.max(1, math.ceil(#self.Motions / MOTIONS_PER_PAGE))
+    self.Page = 0
+    self.SelectedSlot = 0
     self.Segments = {}
     self.LerpAlpha = {}
-    self.PrecachedNames = {}
 
-    -- Derive the geometry from the viewport so the ring and the FOLLOW toggle
-    -- below it stay on screen at low resolutions (e.g. 800x600).
-    self.OuterRadius = math.min(260, ScrH() * 0.40)
-    self.InnerRadius = self.OuterRadius * 0.31
-    self.TextRadius = self.OuterRadius * 0.65
+    -- Larger ring; still derived from the viewport so it and the bottom toggles
+    -- stay on screen at low resolutions.
+    self.OuterRadius = math.min(360, ScrH() * 0.46)
+    self.InnerRadius = self.OuterRadius * 0.34
+    self.TextRadius = (self.OuterRadius + self.InnerRadius) * 0.5
 
-    local cx, cy = ScrW()/2, ScrH()/2
-    local step = self.Count > 0 and (360 / self.Count) or 0
-    local font = "DermaDefaultBold"
-    local maxTextWidth = 120
-
-    for i = 1, self.Count do
+    local cx, cy = ScrW() / 2, ScrH() / 2
+    local step = 360 / SLOTS_PER_PAGE
+    for i = 1, SLOTS_PER_PAGE do
         local startAng = (i - 1) * step - 90 - (step / 2)
-        local endAng = startAng + step
-        self.Segments[i] = GetArcPoly(cx, cy, startAng, endAng, self.OuterRadius, self.InnerRadius, 30)
+        self.Segments[i] = GetArcPoly(cx, cy, startAng, startAng + step, self.OuterRadius, self.InnerRadius, 24)
         self.LerpAlpha[i] = 0
-        local rawName = MMDVMDNPC.GetNiceName(self.Favorites[i] or "Unknown")
-        self.PrecachedNames[i] = WrapText(rawName, font, maxTextWidth)
     end
 
-    self.ToggleBtn = {
-        w = 190,
-        h = 50,
-        hover = 0
-    }
+    self.ToggleBtn = { w = 190, h = 50, hover = 0 }
     -- Second button beside FOLLOW: whether playing a motion auto-enters its
     -- imported camera animation (global mmd_vmd_npc_camera_auto option).
-    self.CameraBtn = {
-        w = 190,
-        h = 50,
-        hover = 0
-    }
+    self.CameraBtn = { w = 190, h = 50, hover = 0 }
+
+    self:RebuildPageNames()
 end
 
-local function camera_auto_on()
-    local cvar = GetConVar("mmd_vmd_npc_camera_auto")
-    return not cvar or cvar:GetBool()
+-- What a given ring slot does on the current page. Slot 1 is always Stop.
+function PANEL:SlotAction(i)
+    if i == 1 then return "stop", nil end
+    local motionIdx = self.Page * MOTIONS_PER_PAGE + (i - 1)
+    local id = self.Motions[motionIdx]
+    if id then return "motion", id end
+    return "empty", nil
+end
+
+function PANEL:RebuildPageNames()
+    self.SlotNames = {}
+    for i = 1, SLOTS_PER_PAGE do
+        local kind, id = self:SlotAction(i)
+        if kind == "stop" then
+            self.SlotNames[i] = { WL("mmd_vmd_npc.radial.stop", "STOP") }
+        elseif kind == "motion" then
+            self.SlotNames[i] = WrapText(MMDVMDNPC.GetNiceName(id or "Unknown"), "DermaDefaultBold", 150)
+        else
+            self.SlotNames[i] = {}
+        end
+    end
 end
 
 function PANEL:Paint(w, h)
     local cx, cy = w / 2, h / 2
     local mx, my = gui.MousePos()
     local dx, dy = mx - cx, my - cy
-    local dist = math.sqrt(dx*dx + dy*dy)
-    
-    local outerRadius = self.OuterRadius or 260
-    local innerRadius = self.InnerRadius or 80
+    local dist = math.sqrt(dx * dx + dy * dy)
+
+    local outerRadius = self.OuterRadius or 320
+    local innerRadius = self.InnerRadius or 100
     local btnW, btnH = self.ToggleBtn.w, self.ToggleBtn.h
     local camW, camH = self.CameraBtn.w, self.CameraBtn.h
     local btnX = cx - btnW - 5
@@ -215,79 +236,101 @@ function PANEL:Paint(w, h)
     self.IsOverToggle = isOverToggle
     self.IsOverCamera = isOverCamera
 
-    -- Choice
-    local step = self.Count > 0 and (360 / self.Count) or 0
-    self.SelectedIndex = 0
+    local step = 360 / SLOTS_PER_PAGE
+    self.SelectedSlot = 0
     if dist > innerRadius and dist < outerRadius and not isOverToggle and not isOverCamera then
         local mouseAngle = math.deg(math.atan2(dy, dx)) + 90
         if mouseAngle < 0 then mouseAngle = mouseAngle + 360 end
-        local adjustedAngle = (mouseAngle + step/2) % 360
-        self.SelectedIndex = math.floor(adjustedAngle / step) + 1
+        local adjustedAngle = (mouseAngle + step / 2) % 360
+        self.SelectedSlot = math.floor(adjustedAngle / step) + 1
     end
 
     draw.NoTexture()
 
-    -- 1. Segments of wheel
-    for i = 1, self.Count do
-        local isSelected = (i == self.SelectedIndex)
+    for i = 1, SLOTS_PER_PAGE do
+        local kind = self:SlotAction(i)
+        local isEmpty = kind == "empty"
+        local isStop = kind == "stop"
+        local isSelected = (i == self.SelectedSlot) and not isEmpty
         self.LerpAlpha[i] = Lerp(FrameTime() * 12, self.LerpAlpha[i], isSelected and 255 or 0)
-        
-        surface.SetDrawColor(15, 15, 15, 220)
+
+        surface.SetDrawColor(15, 15, 15, isEmpty and 110 or 220)
         surface.DrawPoly(self.Segments[i])
 
         if self.LerpAlpha[i] > 1 then
-            surface.SetDrawColor(50, 150, 255, self.LerpAlpha[i] * 0.6)
+            if isStop then
+                surface.SetDrawColor(220, 70, 70, self.LerpAlpha[i] * 0.6)
+            else
+                surface.SetDrawColor(50, 150, 255, self.LerpAlpha[i] * 0.6)
+            end
             surface.DrawPoly(self.Segments[i])
         end
 
         local textAng = math.rad((i - 1) * step - 90)
-        local textRadius = self.TextRadius or 170
-        local tx = cx + math.cos(textAng) * textRadius
-        local ty = cy + math.sin(textAng) * textRadius
-        
-        local lines = self.PrecachedNames[i]
-        local font = "DermaDefaultBold"
-        local lineHeight = 14
-        local totalHeight = #lines * lineHeight
-        local col = isSelected and Color(255, 255, 255) or Color(180, 180, 180)
-        
-        for k, line in ipairs(lines) do
-            local ly = ty - (totalHeight / 2) + (k - 1) * lineHeight + (lineHeight / 2)
-            draw.SimpleText(line, font, tx, ly, col, 1, 1)
+        local tx = cx + math.cos(textAng) * self.TextRadius
+        local ty = cy + math.sin(textAng) * self.TextRadius
+
+        if isEmpty then
+            draw.SimpleText("—", "DermaDefaultBold", tx, ty, Color(95, 95, 95), 1, 1)
+        else
+            local lines = self.SlotNames[i] or {}
+            local lineHeight = 15
+            local totalHeight = #lines * lineHeight
+            local col
+            if isStop then
+                col = isSelected and Color(255, 160, 160) or Color(232, 96, 96)
+            else
+                col = isSelected and Color(255, 255, 255) or Color(188, 188, 188)
+            end
+            for k, line in ipairs(lines) do
+                local ly = ty - (totalHeight / 2) + (k - 1) * lineHeight + (lineHeight / 2)
+                draw.SimpleText(line, "DermaDefaultBold", tx, ly, col, 1, 1)
+            end
         end
     end
 
-    -- 2. Follow toggle
-    self.ToggleBtn.hover = Lerp(FrameTime() * 10, self.ToggleBtn.hover, isOverToggle and 1 or 0)
+    -- Center: page indicator + scroll hint (only when there is more than 1 page).
+    if self.PageCount > 1 then
+        draw.SimpleText(
+            string.format(WL("mmd_vmd_npc.radial.page_fmt", "Page %d / %d"), self.Page + 1, self.PageCount),
+            "DermaDefaultBold", cx, cy - 9, Color(255, 255, 255), 1, 1)
+        draw.SimpleText(WL("mmd_vmd_npc.radial.scroll_hint", "Scroll to switch pages"),
+            "DermaDefault", cx, cy + 11, Color(180, 180, 180), 1, 1)
+    end
 
+    -- Follow toggle
+    self.ToggleBtn.hover = Lerp(FrameTime() * 10, self.ToggleBtn.hover, isOverToggle and 1 or 0)
     draw.RoundedBox(8, btnX, btnY, btnW, btnH, Color(15, 15, 15, 220))
     if self.ToggleBtn.hover > 0.01 then
         draw.RoundedBox(8, btnX, btnY, btnW, btnH, Color(50, 150, 255, 100 * self.ToggleBtn.hover))
     end
     surface.SetDrawColor(255, 255, 255, 20 + (self.ToggleBtn.hover * 50))
     surface.DrawOutlinedRect(btnX, btnY, btnW, btnH, 1)
-
     local modeName = MMDVMDNPC.CameraTrackMode and "FOLLOW: ON" or "FOLLOW: OFF"
     local modeCol = MMDVMDNPC.CameraTrackMode and Color(100, 255, 100) or Color(255, 100, 100)
-    draw.SimpleText(modeName, "DermaDefaultBold", btnX + btnW/2, btnY + btnH/2, modeCol, 1, 1)
+    draw.SimpleText(modeName, "DermaDefaultBold", btnX + btnW / 2, btnY + btnH / 2, modeCol, 1, 1)
 
-    -- 3. Camera-animation auto-enter toggle
+    -- Camera-animation auto-enter toggle
     self.CameraBtn.hover = Lerp(FrameTime() * 10, self.CameraBtn.hover, isOverCamera and 1 or 0)
-
     draw.RoundedBox(8, camX, btnY, camW, camH, Color(15, 15, 15, 220))
     if self.CameraBtn.hover > 0.01 then
         draw.RoundedBox(8, camX, btnY, camW, camH, Color(50, 150, 255, 100 * self.CameraBtn.hover))
     end
     surface.SetDrawColor(255, 255, 255, 20 + (self.CameraBtn.hover * 50))
     surface.DrawOutlinedRect(camX, btnY, camW, camH, 1)
-
     local camOn = camera_auto_on()
     local camName = camOn and "CAMERA: ON" or "CAMERA: OFF"
     local camCol = camOn and Color(100, 255, 100) or Color(255, 100, 100)
-    draw.SimpleText(camName, "DermaDefaultBold", camX + camW/2, btnY + camH/2, camCol, 1, 1)
+    draw.SimpleText(camName, "DermaDefaultBold", camX + camW / 2, btnY + camH / 2, camCol, 1, 1)
+end
 
-    surface.SetDrawColor(255, 255, 255, 50)
-    surface.DrawRect(cx-1, cy-1, 2, 2)
+function PANEL:OnMouseWheeled(delta)
+    if self.PageCount <= 1 then return true end
+    -- Scroll up = previous page, down = next; wraps around.
+    self.Page = (self.Page - (delta > 0 and 1 or -1)) % self.PageCount
+    self:RebuildPageNames()
+    surface.PlaySound("common/wpn_moveselect.wav")
+    return true
 end
 
 function PANEL:OnMousePressed(mouseCode)
@@ -296,8 +339,8 @@ function PANEL:OnMousePressed(mouseCode)
             self:ToggleCameraMode()
         elseif self.IsOverCamera then
             self:ToggleCameraAuto()
-        elseif self.SelectedIndex > 0 then
-            self:ExecuteSelection(self.SelectedIndex)
+        elseif self.SelectedSlot > 0 then
+            self:ExecuteSelection(self.SelectedSlot)
         end
     end
 end
@@ -305,9 +348,8 @@ end
 function PANEL:ToggleCameraAuto()
     local turnOn = not camera_auto_on()
     RunConsoleCommand("mmd_vmd_npc_camera_auto", turnOn and "1" or "0")
-    local label = (MMDVMDNPC.L and MMDVMDNPC.L("mmd_vmd_npc.camera.auto_option", "Enter camera animation automatically"))
-        or "Enter camera animation automatically"
-    notification.AddLegacy(label .. ": " .. (turnOn and "ON" or "OFF"), NOTIFY_HINT, 3)
+    notification.AddLegacy(WL("mmd_vmd_npc.camera.auto_option", "Enter camera animation automatically")
+        .. ": " .. (turnOn and "ON" or "OFF"), NOTIFY_HINT, 3)
     surface.PlaySound("buttons/lightswitch2.wav")
 end
 
@@ -316,7 +358,7 @@ function PANEL:ToggleCameraMode()
     local modeName = MMDVMDNPC.CameraTrackMode and "Dynamic" or "Static"
     notification.AddLegacy("Camera: " .. modeName, NOTIFY_HINT, 3)
     surface.PlaySound("buttons/lightswitch2.wav")
-    
+
     if not MMDVMDNPC.CameraTrackMode and IsValid(MMDVMDNPC.SelfPlaybackCameraEnt) then
         local target = MMDVMDNPC.SelfPlaybackCameraEnt
         local pelvisBone = target:LookupBone("ValveBiped.Bip01_Pelvis") or target:LookupBone("Pelvis") or 0
@@ -325,23 +367,23 @@ function PANEL:ToggleCameraMode()
     end
 end
 
-function PANEL:ExecuteSelection(index)
+function PANEL:ExecuteSelection(slot)
     -- Guard against a double fire: a mouse click executes and starts the close
-    -- fade, then the key-up (-mmd_wheel) would execute the same selection again.
+    -- fade, then the key-up (-mmd_wheel) would execute the same slot again.
     -- CloseMenu (called below) sets self.Closed, so this entry guard blocks the
     -- second call. Do NOT set self.Closed here or CloseMenu becomes a no-op and
     -- the wheel never disappears.
     if self.Closed then return end
-    local act = self.Favorites[index]
-    if not act then return end
+    local kind, id = self:SlotAction(slot)
 
-    if act == "stop_playback" then
+    if kind == "stop" then
         MMDVMDNPC.RequestStopSelectedMotion()
-    elseif MMDVMDNPC.RequestPlaySelfAuto then
+    elseif kind == "motion" and MMDVMDNPC.RequestPlaySelfAuto then
         -- Play the chosen motion on the player, auto-building first if the
         -- playermodel has no cache for it yet.
-        MMDVMDNPC.RequestPlaySelfAuto(act)
+        MMDVMDNPC.RequestPlaySelfAuto(id)
     end
+    -- Empty slot: just close.
 
     self:CloseMenu()
 end
@@ -361,33 +403,47 @@ vgui.Register("MMD_RadialMenu", PANEL, "EditablePanel")
 
 local radialMenuInstance = nil
 
-local function radial_empty_message()
-    return (MMDVMDNPC.L and MMDVMDNPC.L("mmd_vmd_npc.radial.empty", "Favorites wheel is empty!"))
-        or "Favorites wheel is empty!"
-end
-
 concommand.Add("+mmd_wheel", function()
-    -- Count only entries the wheel will actually show (Init drops
-    -- "toggle_cam_mode"), so an all-filtered list does not open an empty wheel.
-    local playable = 0
-    for _, v in ipairs(MMDVMDNPC.RadialFavorites) do
-        if v ~= "toggle_cam_mode" then playable = playable + 1 end
-    end
-    if playable == 0 then
-        notification.AddLegacy(radial_empty_message(), NOTIFY_ERROR, 3)
-        return
-    end
-
+    -- Always openable: the Stop button and the 9 fixed slots are useful even
+    -- with no motions on the wheel yet.
     if IsValid(radialMenuInstance) then radialMenuInstance:Remove() end
     radialMenuInstance = vgui.Create("MMD_RadialMenu")
 end)
 
 concommand.Add("-mmd_wheel", function()
     if IsValid(radialMenuInstance) and not radialMenuInstance.Closed then
-        if radialMenuInstance.SelectedIndex > 0 then
-            radialMenuInstance:ExecuteSelection(radialMenuInstance.SelectedIndex)
+        if radialMenuInstance.SelectedSlot and radialMenuInstance.SelectedSlot > 0 then
+            radialMenuInstance:ExecuteSelection(radialMenuInstance.SelectedSlot)
         else
             radialMenuInstance:CloseMenu()
         end
     end
+end)
+
+-- Bind the wheel to K by default the first time only, without clobbering an
+-- existing bind or a deliberate later unbind/rebind.
+CreateClientConVar("mmd_vmd_npc_wheel_bound_once", "0", true, false)
+
+hook.Add("InitPostEntity", "MMDVMDNPCWheelDefaultBind", function()
+    local marker = GetConVar("mmd_vmd_npc_wheel_bound_once")
+    if marker and marker:GetBool() then return end
+    RunConsoleCommand("mmd_vmd_npc_wheel_bound_once", "1")
+
+    -- Already bound somewhere: respect it.
+    if input.LookupBinding and input.LookupBinding("+mmd_wheel") then return end
+
+    -- Only claim K if it is actually free; never clobber an existing key bind
+    -- (e.g. the default flashlight on K).
+    local kBind = input.LookupKeyBinding and input.LookupKeyBinding(KEY_K)
+    if kBind and kBind ~= "" then
+        timer.Simple(2, function()
+            notification.AddLegacy(WL("mmd_vmd_npc.radial.bind_hint", "Bind the MMD motion wheel with: bind <key> +mmd_wheel"), NOTIFY_GENERIC, 8)
+        end)
+        return
+    end
+
+    RunConsoleCommand("bind", "k", "+mmd_wheel")
+    timer.Simple(2, function()
+        notification.AddLegacy(WL("mmd_vmd_npc.radial.default_bind", "MMD motion wheel bound to K. Rebind with: bind <key> +mmd_wheel"), NOTIFY_GENERIC, 8)
+    end)
 end)

@@ -53,6 +53,25 @@ PARENT_CORRECTED_ROTATION_JSON = "bone_parent_corrected_rotation_degrees.json"
 STEAM_BLENDER_APP_ID = "365670"
 STEAM_BLENDER_URL = "https://store.steampowered.com/app/365670/Blender/"
 MIN_SUPPORTED_BLENDER_VERSION = (4, 3, 0)
+
+# Blender is bundled with (or first-run extracted by) the importer so no separate
+# install is required. The portable zip's top-level folder is named after the
+# build, and a completed portable extraction always contains a sibling `portable`
+# directory, which doubles as an "extraction finished" marker.
+BUNDLED_BLENDER_VERSION = "4.5.10"
+BUNDLED_BLENDER_DIRNAME = f"blender-{BUNDLED_BLENDER_VERSION}-windows-x64"
+BUNDLED_BLENDER_ZIP_NAME = f"{BUNDLED_BLENDER_DIRNAME}.zip"
+BUNDLED_BLENDER_PORTABLE_MARKER = "portable"
+# This importer's own local-data folder (only used when it must extract its own
+# embedded Blender because no reusable install was found).
+APP_LOCAL_DIR_NAME = "MMDVMDNPC"
+# Optional bundled mmd_tools zip so a freshly-extracted Blender bakes offline.
+BUNDLED_ADDONS_SUBDIR = "blender_addons"
+# The sibling "Simple Character Model Importer" ships the SAME Blender 4.5.10 and
+# extracts it (with mmd_tools already installed) under its local-data folder.
+# Reusing that install avoids a second ~1 GB copy on disk and a redundant extract.
+SCMI_APP_DIR_NAME = "MMDCharacterImporter"
+
 GMOD_SOUND_SUBDIR = "mmd_vmd_npc/music"
 MUSIC_SAMPLE_RATE = 44100
 MUSIC_BITRATE = "192k"
@@ -1457,6 +1476,106 @@ def gmod_sound_output_path(gmod_dir: Path, sound_identifier: str) -> Path:
     return gmod_dir / "garrysmod" / "sound" / GMOD_SOUND_SUBDIR / f"{sound_identifier}.mp3"
 
 
+# --- Installed-motion inspection (Motion Manager tab) ------------------------
+def gmod_motions_dir(gmod_dir: Path) -> Path:
+    """Where imported motion JSONs live in a GMod install (what the addon reads
+    and what the importer writes to)."""
+    return gmod_dir / "garrysmod" / "data" / "mmd_vmd_npc" / "motions"
+
+
+def _header_find_int(text: str, key: str) -> int | None:
+    match = re.search(rf'"{re.escape(key)}":\s*(-?\d+)', text)
+    return int(match.group(1)) if match else None
+
+
+def _header_find_str(text: str, key: str) -> str | None:
+    match = re.search(rf'"{re.escape(key)}":"((?:[^"\\]|\\.)*)"', text)
+    if not match:
+        return None
+    try:
+        return json.loads('"' + match.group(1) + '"')
+    except ValueError:
+        return match.group(1)
+
+
+def read_motion_header(path: Path) -> dict:
+    """Extract the display-worthy header fields of an imported motion JSON.
+
+    Motion JSONs embed multi-MB `bones`/`camera` arrays, so this avoids a full
+    ``json.loads`` (which would build millions of Python floats) by scanning for
+    the handful of scalar fields, and only falls back to a full parse when that
+    fast path cannot find the essentials. All scalar top-level fields precede the
+    camera block, so the first regex match is always the top-level value."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+
+    motion_id = _header_find_str(text, "motion_id")
+    fps = _header_find_int(text, "fps")
+    if motion_id is None or fps is None:
+        # Unexpected layout — pay for a correct full parse rather than guess.
+        data = json.loads(text)
+        motion_id = str(data.get("motion_id") or path.stem)
+        fps = int(data.get("fps") or VMD_FPS)
+        frame_start = int(data.get("frame_start") or 0)
+        frame_end = int(data.get("frame_end") or 0)
+        frame_count = data.get("frame_count")
+        display = data.get("display_name") or data.get("motion_name") or motion_id
+        motion_name = data.get("motion_name") or display
+        flex_count = data.get("flex_count")
+        if flex_count is None and isinstance(data.get("flexes"), list):
+            flex_count = len(data["flexes"])
+        music = data.get("music") if isinstance(data.get("music"), dict) else None
+        camera = data.get("camera") if isinstance(data.get("camera"), dict) else None
+        music_sound = str(music.get("sound")) if music and music.get("sound") else ""
+        camera_keys = int(camera.get("key_count") or 0) if camera else 0
+        is_addon = bool(data.get("is_addon"))
+    else:
+        frame_start = _header_find_int(text, "frame_start") or 0
+        frame_end = _header_find_int(text, "frame_end") or 0
+        frame_count = _header_find_int(text, "frame_count")
+        display = _header_find_str(text, "display_name") or _header_find_str(text, "motion_name") or motion_id
+        motion_name = _header_find_str(text, "motion_name") or display
+        flex_count = _header_find_int(text, "flex_count")
+        music_sound = _header_find_str(text, "sound") or ""
+        camera_keys = _header_find_int(text, "key_count") or 0
+        is_addon = '"is_addon":true' in text
+
+    fps = fps if fps and fps > 0 else VMD_FPS
+    if frame_count is None:
+        frame_count = max(0, frame_end - frame_start + 1)
+    duration = max(0.0, (frame_end - frame_start) / fps) if fps else 0.0
+
+    return {
+        "motion_id": str(motion_id or path.stem),
+        "display_name": str(display or path.stem),
+        "motion_name": str(motion_name or display or path.stem),
+        "fps": int(fps),
+        "frame_start": int(frame_start),
+        "frame_end": int(frame_end),
+        "frame_count": int(frame_count),
+        "duration": float(duration),
+        "has_music": bool(music_sound),
+        "music_sound": str(music_sound),
+        "has_camera": bool(camera_keys > 0),
+        "camera_key_count": int(camera_keys),
+        "flex_count": int(flex_count or 0),
+        "is_addon": bool(is_addon),
+    }
+
+
+def rename_motion_display_name(path: Path, new_display_name: str) -> str:
+    """Rewrite an imported motion JSON's in-game name in place, preserving the
+    file/motion_id (which the addon keys motions and built caches by). Returns the
+    saved name."""
+    new_display_name = str(new_display_name or "").strip()
+    if not new_display_name:
+        raise ValueError("motion name cannot be empty")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["motion_name"] = new_display_name
+    data["display_name"] = new_display_name
+    atomic_write_text(path, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+    return new_display_name
+
+
 # --- MMD camera track -------------------------------------------------------
 # Validated at machine precision against Blender mmd_tools (see repo history):
 #   R = RotY(-ry) @ RotX(-rx) @ RotZ(-rz)
@@ -1765,7 +1884,13 @@ def safe_relative_path(value: str) -> Path:
     ]
     if not parts:
         raise ValueError("empty relative path")
-    return Path(*parts)
+    result = Path(*parts)
+    # A leading part like "C:" makes the result drive-anchored, so joining it onto
+    # a base directory would escape that base (e.g. deleting a file on another
+    # drive). A genuine relative path (mmd_vmd_npc/music/x.mp3) has neither.
+    if result.is_absolute() or result.drive:
+        raise ValueError(f"unsafe absolute or drive-anchored path: {value!r}")
+    return result
 
 
 def find_gmad_executable(gmod_dir: Path) -> Path:
@@ -2111,7 +2236,305 @@ def blender_path_version_key(path: Path) -> tuple[int, int, int]:
     return (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0))
 
 
-def find_blender_executable() -> Path:
+def app_local_dir() -> Path:
+    """This importer's own local-data folder (only written to when it has to
+    extract its embedded Blender because no reusable install was found)."""
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        return Path(local) / APP_LOCAL_DIR_NAME
+    return Path.home() / f".{APP_LOCAL_DIR_NAME}"
+
+
+def scmi_app_local_dir() -> Path:
+    """Local-data folder of the sibling Simple Character Model Importer.
+
+    Overridable with MMDVMDNPC_SCMI_APP_DIR for non-default machines."""
+    override = os.environ.get("MMDVMDNPC_SCMI_APP_DIR")
+    if override:
+        return Path(override)
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        return Path(local) / SCMI_APP_DIR_NAME
+    return Path.home() / f".{SCMI_APP_DIR_NAME}"
+
+
+def blender_exe_in_dir(root: Path) -> Path | None:
+    """Locate blender.exe directly in `root`, then anywhere beneath it."""
+    try:
+        direct = root / "blender.exe"
+        if direct.is_file():
+            return direct
+        return next(iter(root.rglob("blender.exe")), None)
+    except OSError:
+        return None
+
+
+def blender_install_is_complete(blender_exe: Path | None) -> bool:
+    """A fully extracted portable Blender always has a `portable` folder beside
+    the executable; its presence means the extraction finished (not interrupted)."""
+    if not blender_exe:
+        return False
+    try:
+        return blender_exe.is_file() and (blender_exe.parent / BUNDLED_BLENDER_PORTABLE_MARKER).is_dir()
+    except OSError:
+        return False
+
+
+def scmi_managed_blender() -> Path | None:
+    """Reuse the Blender 4.5.x that the Simple Character Model Importer already
+    extracted (it also pre-installs mmd_tools, so the bake needs no download).
+
+    Prefers the exe recorded in its verified setup_state.json, then falls back to
+    scanning its managed blender folder."""
+    app = scmi_app_local_dir()
+
+    state_path = app / "setup" / "setup_state.json"
+    try:
+        if state_path.is_file():
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            raw = str(state.get("blender_exe") or "")
+            if raw:
+                exe = Path(raw)
+                version = str(state.get("blender_version") or "") or (infer_blender_version_from_path(exe) or "")
+                if version.startswith("4.5") and blender_install_is_complete(exe):
+                    return exe
+    except (OSError, ValueError):
+        pass
+
+    managed_root = app / "software" / "blender"
+    try:
+        version_dirs = sorted(
+            (d for d in managed_root.glob("4.5*") if d.is_dir()),
+            key=lambda d: blender_path_version_key(d),
+            reverse=True,
+        )
+    except OSError:
+        version_dirs = []
+    for version_dir in version_dirs:
+        exe = blender_exe_in_dir(version_dir)
+        if blender_install_is_complete(exe):
+            return exe
+    return None
+
+
+def infer_blender_version_from_path(path: Path | str) -> str | None:
+    match = re.search(r"blender-(\d+\.\d+(?:\.\d+)?)-windows-x64", str(path), re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def path_blender_version_supported(path: Path | str) -> bool:
+    """True only when the `blender-X.Y.Z-windows-x64` version parsed from the path
+    is a supported release. Returns False when no version is present, so callers
+    fall back to the real `--version` probe rather than trusting an unknown build."""
+    version_text = infer_blender_version_from_path(path)
+    if not version_text:
+        return False
+    try:
+        parts = tuple(int(x) for x in version_text.split(".")[:3])
+    except ValueError:
+        return False
+    parts = parts + (0,) * (3 - len(parts))
+    return is_blender_version_supported(parts)
+
+
+def _cached_bundled_blender_dir() -> Path:
+    """Where this importer extracts its own embedded Blender, keyed by version so
+    a future upgrade extracts alongside rather than over the old copy."""
+    return app_local_dir() / "software" / "blender" / BUNDLED_BLENDER_VERSION
+
+
+def cached_bundled_blender() -> Path | None:
+    exe = blender_exe_in_dir(_cached_bundled_blender_dir())
+    return exe if blender_install_is_complete(exe) else None
+
+
+def bundled_blender_sources() -> list[Path]:
+    """Directories that may hold this build's Blender: as an already-extracted
+    `<dirname>/` sidecar or as the portable `<dirname>.zip` to extract once.
+
+    Order: frozen bundle payload, folder beside the exe (onedir/sidecar), dev repo."""
+    roots: list[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            roots.append(Path(meipass) / "blender")
+        try:
+            roots.append(Path(sys.executable).resolve().parent / "blender")
+        except OSError:
+            pass
+    roots.append(ROOT / "tools" / "blender")
+    return roots
+
+
+def extract_bundled_blender(zip_path: Path, progress: ProgressCallback | None = None) -> Path:
+    """Extract the embedded portable Blender zip once into the per-user cache and
+    return blender.exe.
+
+    The official portable zip ships WITHOUT the `portable` folder, so we create it
+    (matching the sibling Simple Character Model Importer) both to run Blender in
+    portable mode and to serve as the "extraction finished" marker. Extraction
+    lands in a per-pid staging dir and is atomically renamed only after the marker
+    is written; a peer process that already produced a complete install is never
+    clobbered, so two first-run instances are safe."""
+    dest = _cached_bundled_blender_dir()
+    cached = cached_bundled_blender()
+    if cached:
+        return cached
+
+    dest.mkdir(parents=True, exist_ok=True)
+    emit_progress(progress, f"Preparing bundled Blender {BUNDLED_BLENDER_VERSION} (first run only)...")
+    # Stage as a SIBLING of the version dir, not inside it: cached_bundled_blender
+    # rglobs `dest`, so an in-dest staging copy would be mistaken for a finished
+    # peer install (and then deleted by the finally).
+    staging = dest.parent / f".extract_{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    try:
+        import zipfile
+
+        with zipfile.ZipFile(zip_path) as archive:
+            archive.extractall(staging)
+        extracted_exe = blender_exe_in_dir(staging)
+        if extracted_exe is None or not extracted_exe.is_file():
+            raise RuntimeError(f"bundled Blender archive did not contain blender.exe: {zip_path}")
+        # Enable portable mode and mark the extraction complete. The stock zip has
+        # no `portable` folder, so blender_install_is_complete would otherwise fail.
+        (extracted_exe.parent / BUNDLED_BLENDER_PORTABLE_MARKER).mkdir(exist_ok=True)
+
+        # A concurrent instance may have finished a complete install while we
+        # extracted; use it rather than fighting over the destination.
+        peer = cached_bundled_blender()
+        if peer:
+            return peer
+        final_dir = dest / extracted_exe.parent.name
+        if final_dir.exists() and not blender_install_is_complete(blender_exe_in_dir(final_dir)):
+            # Only ever clear an INCOMPLETE leftover, never a peer's live install.
+            shutil.rmtree(final_dir, ignore_errors=True)
+        try:
+            os.replace(str(extracted_exe.parent), str(final_dir))
+        except OSError:
+            # Lost the finalize race (a peer created final_dir); use theirs if complete.
+            peer = cached_bundled_blender()
+            if peer:
+                return peer
+            raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    exe = cached_bundled_blender()
+    if not exe:
+        raise RuntimeError(f"failed to extract bundled Blender to {dest}")
+    emit_progress(progress, f"Bundled Blender ready: {exe}")
+    return exe
+
+
+def bundled_blender_executable(progress: ProgressCallback | None = None) -> Path | None:
+    """Blender that ships with (or was extracted once by) this importer, or None
+    when this build was made without an embedded Blender."""
+    cached = cached_bundled_blender()
+    if cached:
+        return cached
+    # Already-extracted sidecar (onedir/dev): exact name first, then any
+    # blender-*-windows-x64 folder so a differently-versioned build still resolves.
+    for root in bundled_blender_sources():
+        sidecar = blender_exe_in_dir(root / BUNDLED_BLENDER_DIRNAME)
+        if blender_install_is_complete(sidecar):
+            return sidecar
+        if root.is_dir():
+            for candidate in sorted(root.glob("blender-*-windows-x64")):
+                exe = blender_exe_in_dir(candidate)
+                if blender_install_is_complete(exe) and path_blender_version_supported(candidate):
+                    return exe
+    # Embedded/sidecar zip to extract once: exact name first, then any matching zip.
+    for root in bundled_blender_sources():
+        zip_path = root / BUNDLED_BLENDER_ZIP_NAME
+        if zip_path.is_file():
+            return extract_bundled_blender(zip_path, progress)
+        if root.is_dir():
+            for candidate in sorted(root.glob("blender-*-windows-x64.zip")):
+                if candidate.is_file() and path_blender_version_supported(candidate):
+                    return extract_bundled_blender(candidate, progress)
+    return None
+
+
+def bundled_mmd_tools_archive() -> Path | None:
+    """A bundled mmd_tools zip shipped alongside this importer, if any, so a
+    freshly-extracted Blender can install mmd_tools offline. Returns None (and the
+    bake falls back to its network download) when nothing is bundled."""
+    roots: list[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            roots.append(Path(meipass) / BUNDLED_ADDONS_SUBDIR)
+        try:
+            roots.append(Path(sys.executable).resolve().parent / BUNDLED_ADDONS_SUBDIR)
+        except OSError:
+            pass
+    roots.append(ROOT / "tools" / BUNDLED_ADDONS_SUBDIR)
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+        except OSError:
+            continue
+        direct = root / "mmd_tools.zip"
+        if direct.is_file():
+            return direct
+        matches = sorted(root.glob("*mmd*tools*.zip"))
+        if matches:
+            return matches[0]
+    return None
+
+
+def blender_is_trusted_bundled(blender: Path | None) -> bool:
+    """True when `blender` is a known-good portable install we provisioned (SCMI's
+    managed install, our own cache, or a sidecar) AND its path names a supported
+    version, so the `--version` probe can be skipped. Any other path — including a
+    provisioned install of an unsupported version — is still verified so the
+    'Blender X is not supported' error is never silently skipped."""
+    if not blender:
+        return False
+    if not blender_install_is_complete(blender):
+        return False
+    if not path_blender_version_supported(blender):
+        return False
+    try:
+        resolved = blender.resolve()
+    except OSError:
+        resolved = blender
+    trusted_roots = [scmi_app_local_dir(), app_local_dir(), *bundled_blender_sources()]
+    for root in trusted_roots:
+        try:
+            resolved.relative_to(root.resolve())
+            return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def find_blender_executable(progress: ProgressCallback | None = None) -> Path:
+    # 0. Explicit override for advanced users / development.
+    env = os.environ.get("MMDVMDNPC_BLENDER_EXE") or os.environ.get("BLENDER_EXE")
+    if env and Path(env).exists():
+        return Path(env)
+
+    # 1. Reuse the Blender the Simple Character Model Importer already provisioned.
+    scmi = scmi_managed_blender()
+    if scmi:
+        emit_progress(progress, f"Using Blender installed by Simple Character Model Importer: {scmi}")
+        return scmi
+
+    # 2/3. The Blender bundled with this importer (extracting it once if needed).
+    bundled = bundled_blender_executable(progress)
+    if bundled:
+        return bundled
+
+    # 4. Development fallback: an ordinary system Blender install.
+    return detect_system_blender()
+
+
+def detect_system_blender() -> Path:
     # An explicit override wins over auto-detection; otherwise the documented
     # BLENDER_EXE is silently ignored whenever any Steam Blender exists.
     env = os.environ.get("BLENDER_EXE")
@@ -2147,7 +2570,7 @@ def find_blender_executable() -> Path:
         # Prefer the highest actual version, not the lexicographically-last path.
         return sorted(existing, key=blender_path_version_key)[-1]
 
-    raise FileNotFoundError("could not locate Blender; set BLENDER_EXE or pass --blender")
+    raise FileNotFoundError("could not locate Blender; set MMDVMDNPC_BLENDER_EXE or pass --blender")
 
 
 def detect_blender() -> Path:
@@ -2192,6 +2615,10 @@ def is_blender_version_supported(version: tuple[int, int, int]) -> bool:
 
 
 def require_supported_blender(blender: Path) -> Path:
+    # A portable Blender we provisioned ourselves is a known-good 4.5.x; skip the
+    # ~1s `blender --version` subprocess for it and only probe unknown installs.
+    if blender_is_trusted_bundled(blender):
+        return blender
     version = blender_version(blender)
     if not is_blender_version_supported(version):
         raise RuntimeError(
@@ -2258,7 +2685,7 @@ def bake_vmd_with_blender(
     if not BLENDER_BAKE_SCRIPT.exists():
         raise FileNotFoundError(f"missing Blender bake script: {BLENDER_BAKE_SCRIPT}")
 
-    blender = require_supported_blender(blender or find_blender_executable())
+    blender = require_supported_blender(blender or find_blender_executable(progress))
     mmd_model = mmd_model or find_default_mmd_model()
     if not blender.exists():
         raise FileNotFoundError(f"Blender executable not found: {blender}")
@@ -2294,6 +2721,11 @@ def bake_vmd_with_blender(
     )
     emit_progress(progress, "Starting Blender bake process...")
     started = time.monotonic()
+    bake_env = os.environ.copy()
+    mmd_tools_archive = bundled_mmd_tools_archive()
+    if mmd_tools_archive:
+        bake_env["MMDVMDNPC_MMD_TOOLS_ARCHIVE"] = str(mmd_tools_archive)
+        emit_progress(progress, f"Using bundled mmd_tools archive: {mmd_tools_archive}")
     process = subprocess.Popen(
         command,
         text=True,
@@ -2302,6 +2734,7 @@ def bake_vmd_with_blender(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=1,
+        env=bake_env,
     )
     output_lines: list[str] = []
     assert process.stdout is not None

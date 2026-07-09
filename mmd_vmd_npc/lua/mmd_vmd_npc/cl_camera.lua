@@ -27,6 +27,17 @@ CreateClientConVar("mmd_vmd_npc_cam_fov", "0", true, false, "Camera animation: f
 CreateClientConVar("mmd_vmd_npc_cam_collision", "1", true, false, "Camera animation: pull the camera in front of walls it would otherwise clip through")
 CreateClientConVar("mmd_vmd_npc_cam_max_distance", "2500", true, false, "Camera animation: cap the camera's distance to the subject (0 = unlimited)")
 
+-- Wall collision defaults on. New clients already get "1"; this one-time
+-- migration also turns it on for existing clients that saved it off during
+-- earlier testing (before it actually worked), then respects any later choice.
+CreateClientConVar("mmd_vmd_npc_cam_collision_migrated", "0", true, false)
+hook.Add("InitPostEntity", "MMDVMDNPCCamCollisionDefaultOn", function()
+    local marker = GetConVar("mmd_vmd_npc_cam_collision_migrated")
+    if marker and marker:GetBool() then return end
+    RunConsoleCommand("mmd_vmd_npc_cam_collision_migrated", "1")
+    RunConsoleCommand("mmd_vmd_npc_cam_collision", "1")
+end)
+
 local function L(key, fallback)
     return MMDVMDNPC.L and MMDVMDNPC.L(key, fallback) or (fallback or key)
 end

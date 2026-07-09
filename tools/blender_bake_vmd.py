@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import tempfile
 import urllib.request
@@ -148,6 +149,45 @@ def download_file(url: str, target: Path) -> None:
             handle.write(chunk)
 
 
+def install_mmd_tools_from_local_archive() -> list[str]:
+    """Install mmd_tools from a bundled local zip (path passed by the importer via
+    MMDVMDNPC_MMD_TOOLS_ARCHIVE) so a freshly-extracted bundled Blender can bake
+    fully offline. A no-op when the variable is unset, so the network path and the
+    bake result are unchanged when nothing is bundled."""
+    archive = os.environ.get("MMDVMDNPC_MMD_TOOLS_ARCHIVE", "")
+    if not archive:
+        return []
+    archive_path = Path(archive)
+    if not archive_path.is_file():
+        return [f"bundled mmd_tools archive not found: {archive_path}"]
+    errors: list[str] = []
+    print(f"Installing MMD Tools from bundled archive: {archive_path}")
+    try:
+        bpy.ops.extensions.package_install_files(
+            filepath=str(archive_path),
+            repo="user_default",
+            enable_on_install=True,
+            overwrite=True,
+        )
+        if mmd_tools_registered():
+            return errors
+    except Exception as exc:
+        errors.append(f"bundled extension file install failed: {exc}")
+
+    try:
+        bpy.ops.preferences.addon_install(
+            filepath=str(archive_path),
+            overwrite=True,
+            enable_on_install=True,
+        )
+        if mmd_tools_registered():
+            return errors
+    except Exception as exc:
+        errors.append(f"bundled legacy add-on install failed: {exc}")
+
+    return errors
+
+
 def install_mmd_tools_from_extension_site() -> list[str]:
     errors: list[str] = []
     try:
@@ -207,6 +247,11 @@ def enable_mmd_tools() -> None:
         return
 
     errors = enable_mmd_tools_modules(addon_utils)
+    if mmd_tools_registered():
+        return
+
+    errors.extend(install_mmd_tools_from_local_archive())
+    errors.extend(enable_mmd_tools_modules(addon_utils))
     if mmd_tools_registered():
         return
 
