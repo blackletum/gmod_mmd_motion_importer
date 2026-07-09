@@ -788,10 +788,16 @@ function TOOL.BuildCPanel(panel)
     add_checkbox_with_help(lightingTab, L("mmd_vmd_npc.lighting.shadows"), "mmd_vmd_npc_flashlight_shadows", L("mmd_vmd_npc.lighting.shadows_help"))
 
     section(lightingTab, L("mmd_vmd_npc.lighting.beam"), Color(255, 220, 120))
-    add_slider(lightingTab, L("mmd_vmd_npc.lighting.brightness"), "mmd_vmd_npc_flashlight_brightness", 0, 2048, 1)
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.brightness"), "mmd_vmd_npc_flashlight_brightness", 0, 100, 2)
     add_slider(lightingTab, L("mmd_vmd_npc.lighting.fov"), "mmd_vmd_npc_flashlight_fov", 5, 170, 0)
     add_slider(lightingTab, L("mmd_vmd_npc.lighting.distance"), "mmd_vmd_npc_flashlight_distance", 128, 8192, 0)
     add_slider(lightingTab, L("mmd_vmd_npc.lighting.nearz"), "mmd_vmd_npc_flashlight_nearz", 1, 64, 0)
+
+    section(lightingTab, L("mmd_vmd_npc.lighting.rtx_shaping"), Color(255, 220, 120))
+    lightingTab:Help(L("mmd_vmd_npc.lighting.rtx_shaping_help"))
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.rtx_radius"), "mmd_vmd_npc_flashlight_rtx_radius", 1, 200, 0)
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.rtx_softness"), "mmd_vmd_npc_flashlight_rtx_softness", 0, 1, 2)
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.rtx_volumetric"), "mmd_vmd_npc_flashlight_rtx_volumetric", 0, 5, 1)
 
     section(lightingTab, L("mmd_vmd_npc.lighting.color"), Color(255, 220, 120))
     add_slider(lightingTab, L("mmd_vmd_npc.lighting.color_r"), "mmd_vmd_npc_flashlight_color_r", 0, 255, 0)

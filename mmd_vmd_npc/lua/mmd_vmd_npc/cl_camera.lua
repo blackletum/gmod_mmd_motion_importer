@@ -174,7 +174,15 @@ local function vertical_to_source_fov(vfov)
     return math.deg(2 * math.atan(math.tan(half) * (4 / 3)))
 end
 
-local function anchor_transform(ent)
+local function anchor_transform(ent, track)
+    -- Non-debug tracks anchor to the dance-start snapshot sent in camera_begin:
+    -- root-motion playback moves the entity origin during the dance, and the
+    -- camera VMD already contains the character's travel, so re-anchoring to
+    -- the live entity would double-count it. Debug previews (no dance running)
+    -- keep following the live entity so the orbit tracks wherever it stands.
+    if track and track.debug ~= true and isvector(track.anchorPos) then
+        return track.anchorPos, Angle(0, tonumber(track.anchorYaw) or 0, 0)
+    end
     local ang = ent:GetAngles()
     return ent:GetPos(), Angle(0, ang.y or 0, 0)
 end
@@ -197,6 +205,19 @@ local CAMERA_HULL_MIN = Vector(-4, -4, -4)
 local CAMERA_HULL_MAX = Vector(4, 4, 4)
 
 local function camera_pivot(anchorEnt)
+    -- Follow the dancing CHARACTER (pelvis bone), not the entity center: with
+    -- root motion the character walks away from where the dance started, and
+    -- collision must trace from where the body actually is. Bone id is memoized
+    -- per entity (false = model has no pelvis, skip further lookups).
+    local pelvis = anchorEnt.MMDVMDNPCPelvisBone
+    if pelvis == nil and anchorEnt.LookupBone then
+        pelvis = anchorEnt:LookupBone("ValveBiped.Bip01_Pelvis") or anchorEnt:LookupBone("Pelvis") or false
+        anchorEnt.MMDVMDNPCPelvisBone = pelvis
+    end
+    if pelvis and anchorEnt.GetBonePosition then
+        local pos = anchorEnt:GetBonePosition(pelvis)
+        if isvector(pos) then return pos end
+    end
     if anchorEnt.WorldSpaceCenter then
         local center = anchorEnt:WorldSpaceCenter()
         if isvector(center) then return center end
@@ -270,7 +291,7 @@ local function camera_view_for(track, anchorEnt, frame)
     if x == nil then return nil end
     x, y, z, p, yw, r, fov = apply_global_transform(x, y, z, p, yw, r, fov)
 
-    local anchorPos, anchorAng = anchor_transform(anchorEnt)
+    local anchorPos, anchorAng = anchor_transform(anchorEnt, track)
     local worldPos, worldAng = LocalToWorld(Vector(x, y, z), Angle(p, yw, r), anchorPos, anchorAng)
     worldPos, fov = apply_camera_collision(anchorEnt, camera_pivot(anchorEnt), worldPos, fov)
     return {
@@ -423,6 +444,8 @@ net.Receive("mmdvmd_camera_begin", function()
     local transferID = net.ReadUInt(32)
     local entIndex = net.ReadUInt(16)
     local motionID = net.ReadString()
+    local anchorPos = net.ReadVector()
+    local anchorYaw = net.ReadFloat()
     local fps = net.ReadUInt(16)
     local frameStart = net.ReadUInt(32)
     local frameEnd = net.ReadUInt(32)
@@ -436,6 +459,8 @@ net.Receive("mmdvmd_camera_begin", function()
     local track = {
         entIndex = entIndex,
         motionID = motionID,
+        anchorPos = anchorPos,
+        anchorYaw = anchorYaw,
         fps = fps,
         frameStart = frameStart,
         frameEnd = frameEnd,

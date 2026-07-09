@@ -1,13 +1,19 @@
 -- Camera-following flashlight for the MMD VMD NPC addon.
 --
--- A single native ProjectedTexture is driven along the addon's current view:
+-- The light is driven along the addon's current view:
 --   1. the imported camera-path animation (or its debug preview),
---   2. the third-person self-playback camera (when not in first-person/free view),
+--   2. the third-person self-playback camera (when not in free view),
 --   3. otherwise the player's own eyes (optional).
 --
--- ProjectedTexture is portable: vanilla Garry's Mod renders it as a real dynamic
--- spotlight, and the RTX-Remix binary's ProjectedTexture() wrapper mirrors it into
--- a path-traced light automatically, so the same code works in both builds.
+-- Two render paths share that view:
+--   * RTX-Remix build (the RTXFixesBinary module exposes the global `RemixLight`
+--     table): a path-traced sphere spotlight is created/updated directly through
+--     RemixLight.CreateSphere/UpdateSphere — the same proven pattern as the remix
+--     binary's own rtx_flashlight. We do NOT rely on the binary's
+--     ProjectedTexture() wrapper: it is silently disabled by archived convars
+--     (rtx_lightupdater, rtx_projectedtexture_wrapper_enabled), and Remix discards
+--     the raster lighting a ProjectedTexture produces, so nothing would render.
+--   * Vanilla Garry's Mod (no RemixLight): a native ProjectedTexture spotlight.
 
 if not CLIENT then return end
 
@@ -28,8 +34,16 @@ CreateClientConVar("mmd_vmd_npc_flashlight_color_b", "255", true, false, "MMD fl
 CreateClientConVar("mmd_vmd_npc_flashlight_offset_forward", "0", true, false, "MMD flashlight forward offset from the view")
 CreateClientConVar("mmd_vmd_npc_flashlight_offset_right", "0", true, false, "MMD flashlight right offset from the view")
 CreateClientConVar("mmd_vmd_npc_flashlight_offset_up", "0", true, false, "MMD flashlight up offset from the view")
+-- RTX-Remix specific light shaping (ignored by the vanilla ProjectedTexture path).
+CreateClientConVar("mmd_vmd_npc_flashlight_rtx_radius", "20", true, false, "RTX flashlight light sphere radius")
+CreateClientConVar("mmd_vmd_npc_flashlight_rtx_softness", "0.45", true, false, "RTX flashlight cone edge softness (0-1)")
+CreateClientConVar("mmd_vmd_npc_flashlight_rtx_volumetric", "0", true, false, "RTX flashlight volumetric intensity multiplier")
 
 local FLASHLIGHT_TEXTURE = "effects/flashlight001"
+-- The remix flashlight's neutral brightness is radiance == color (scale 1.0 at its
+-- brightness 1000). Our slider's default is 4, so divide by 4 to land in the same
+-- place: brightness 4 -> radiance 255 per channel.
+local RTX_BRIGHTNESS_DIVISOR = 4
 
 local function convar_number(name, fallback)
     local cvar = GetConVar(name)
@@ -47,21 +61,69 @@ local function flashlight_enabled()
     return convar_bool("mmd_vmd_npc_flashlight_enabled", false)
 end
 
--- ProjectedTexture handle + last-applied state for a cheap per-frame dirty check.
-local projected = nil
+-- RTXFixesBinary (RTX-Remix builds) exposes RemixLight; absent in vanilla GMod.
+local function remix_available()
+    return istable(RemixLight)
+        and RemixLight.CreateSphere ~= nil
+        and RemixLight.UpdateSphere ~= nil
+end
+
+-- Light handles live on the persistent MMDVMDNPC table, NOT as file-locals: a
+-- Lua auto-refresh re-executes this file with fresh (nil) locals BEFORE the
+-- OnReloaded cleanup hook fires, which would orphan a live RemixLight sphere as
+-- a frozen duplicate until map change. Table fields survive re-execution, so a
+-- refreshed file can reclaim the previous execution's light here.
+if MMDVMDNPC.FlashlightRemixLightId and istable(RemixLight) and RemixLight.DestroyLight then
+    RemixLight.DestroyLight(MMDVMDNPC.FlashlightRemixLightId)
+end
+MMDVMDNPC.FlashlightRemixLightId = nil
+if IsValid(MMDVMDNPC.FlashlightProjected) then
+    MMDVMDNPC.FlashlightProjected:Remove()
+end
+MMDVMDNPC.FlashlightProjected = nil
+
+-- Vanilla-path dirty-check caches (pure perf state; losing them on refresh is
+-- harmless — the next frame just re-applies).
 local lastPos = nil
 local lastAng = nil
 local lastSig = nil
 
+-- RTX path: reusable tables so the per-frame update allocates nothing (same
+-- trick as the remix binary's flashlight).
+local _vec_pos = { x = 0, y = 0, z = 0 }
+local _vec_dir = { x = 0, y = 0, z = 0 }
+local _vec_rad = { x = 0, y = 0, z = 0 }
+local _shaping = { direction = _vec_dir, coneAngleDegrees = 0, coneSoftness = 0.2, focusExponent = 1.0 }
+local _sphere = { position = _vec_pos, radius = 20, shaping = _shaping, volumetricRadianceScale = 0 }
+local _base = { hash = 0, radiance = _vec_rad, isDynamic = true, ignoreViewModel = true }
+
+local function remix_hash()
+    local ply = LocalPlayer()
+    local entIndex = IsValid(ply) and ply:EntIndex() or 0
+    return tonumber(util.CRC("mmd_vmd_npc_flashlight_" .. entIndex)) or 987654
+end
+
 local function destroy_projected()
-    if IsValid(projected) then projected:Remove() end
-    projected = nil
+    if IsValid(MMDVMDNPC.FlashlightProjected) then MMDVMDNPC.FlashlightProjected:Remove() end
+    MMDVMDNPC.FlashlightProjected = nil
     lastPos = nil
     lastAng = nil
     lastSig = nil
 end
 
-MMDVMDNPC.DestroyFlashlight = destroy_projected
+local function destroy_remix_light()
+    if MMDVMDNPC.FlashlightRemixLightId and istable(RemixLight) and RemixLight.DestroyLight then
+        RemixLight.DestroyLight(MMDVMDNPC.FlashlightRemixLightId)
+    end
+    MMDVMDNPC.FlashlightRemixLightId = nil
+end
+
+local function destroy_flashlight()
+    destroy_projected()
+    destroy_remix_light()
+end
+
+MMDVMDNPC.DestroyFlashlight = destroy_flashlight
 
 -- Resolve the origin + angles the flashlight should follow this frame, or nil when
 -- it should be hidden (disabled, or free view with eye-follow turned off).
@@ -92,27 +154,50 @@ local function resolve_view()
     return nil
 end
 
-local function apply_flashlight()
-    local origin, ang = resolve_view()
-    if not origin or not ang then
-        destroy_projected()
+-- RTX-Remix path: drive a RemixLight sphere spotlight directly. Updated every
+-- frame unconditionally — the light is isDynamic and that is the proven pattern
+-- (both the remix flashlight and its ProjectedTexture wrapper update per frame).
+local function apply_remix_flashlight(origin, ang, fov, brightness, r, g, b)
+    local forward = ang:Forward()
+    local scale = brightness / RTX_BRIGHTNESS_DIVISOR
+    _vec_rad.x = r * scale
+    _vec_rad.y = g * scale
+    _vec_rad.z = b * scale
+
+    _vec_pos.x = origin.x
+    _vec_pos.y = origin.y
+    _vec_pos.z = origin.z
+
+    _vec_dir.x = forward.x
+    _vec_dir.y = forward.y
+    _vec_dir.z = forward.z
+
+    -- Remix shaping uses the HALF angle (center to edge); ProjectedTexture FOV is
+    -- the full cone, so halve it (the remix PT wrapper does the same).
+    _shaping.coneAngleDegrees = math.Clamp(fov * 0.5, 1, 89)
+    _shaping.coneSoftness = math.Clamp(convar_number("mmd_vmd_npc_flashlight_rtx_softness", 0.45), 0, 1)
+
+    _sphere.radius = math.Clamp(convar_number("mmd_vmd_npc_flashlight_rtx_radius", 20), 1, 200)
+    _sphere.volumetricRadianceScale = math.max(0, convar_number("mmd_vmd_npc_flashlight_rtx_volumetric", 0))
+
+    _base.hash = remix_hash()
+
+    if not MMDVMDNPC.FlashlightRemixLightId then
+        local ply = LocalPlayer()
+        local id = RemixLight.CreateSphere(_base, _sphere, IsValid(ply) and ply:EntIndex() or 0)
+        if id and id ~= 0 then
+            MMDVMDNPC.FlashlightRemixLightId = id
+        end
         return
     end
 
-    local offForward = convar_number("mmd_vmd_npc_flashlight_offset_forward", 0)
-    local offRight = convar_number("mmd_vmd_npc_flashlight_offset_right", 0)
-    local offUp = convar_number("mmd_vmd_npc_flashlight_offset_up", 0)
-    if offForward ~= 0 or offRight ~= 0 or offUp ~= 0 then
-        origin = origin + ang:Forward() * offForward + ang:Right() * offRight + ang:Up() * offUp
-    end
+    RemixLight.UpdateSphere(_base, _sphere, MMDVMDNPC.FlashlightRemixLightId)
+end
 
-    local fov = math.Clamp(convar_number("mmd_vmd_npc_flashlight_fov", 60), 1, 179)
+-- Vanilla path: native ProjectedTexture spotlight.
+local function apply_projected_flashlight(origin, ang, fov, brightness, r, g, b)
     local farz = math.max(1, convar_number("mmd_vmd_npc_flashlight_distance", 1200))
     local nearz = math.Clamp(convar_number("mmd_vmd_npc_flashlight_nearz", 12), 1, farz - 1)
-    local r = math.Clamp(math.floor(convar_number("mmd_vmd_npc_flashlight_color_r", 255)), 0, 255)
-    local g = math.Clamp(math.floor(convar_number("mmd_vmd_npc_flashlight_color_g", 255)), 0, 255)
-    local b = math.Clamp(math.floor(convar_number("mmd_vmd_npc_flashlight_color_b", 255)), 0, 255)
-    local brightness = math.max(0, convar_number("mmd_vmd_npc_flashlight_brightness", 4))
     local shadows = convar_bool("mmd_vmd_npc_flashlight_shadows", true)
 
     -- Signature of everything except pos/ang; combined with a position/angle delta
@@ -120,13 +205,15 @@ local function apply_flashlight()
     -- actually changed, e.g. a paused dance or a stationary first-person view.
     local sig = table.concat({ fov, farz, nearz, r, g, b, brightness, shadows and 1 or 0 }, ":")
 
+    local projected = MMDVMDNPC.FlashlightProjected
     if not IsValid(projected) then
         projected = ProjectedTexture()
         if not IsValid(projected) then
-            projected = nil
+            MMDVMDNPC.FlashlightProjected = nil
             return
         end
         projected:SetTexture(FLASHLIGHT_TEXTURE)
+        MMDVMDNPC.FlashlightProjected = projected
         lastPos = nil
         lastAng = nil
         lastSig = nil
@@ -154,6 +241,37 @@ local function apply_flashlight()
     lastPos = origin
     lastAng = Angle(ang.p, ang.y, ang.r)
     lastSig = sig
+end
+
+local function apply_flashlight()
+    local origin, ang = resolve_view()
+    if not origin or not ang then
+        destroy_flashlight()
+        return
+    end
+
+    local offForward = convar_number("mmd_vmd_npc_flashlight_offset_forward", 0)
+    local offRight = convar_number("mmd_vmd_npc_flashlight_offset_right", 0)
+    local offUp = convar_number("mmd_vmd_npc_flashlight_offset_up", 0)
+    if offForward ~= 0 or offRight ~= 0 or offUp ~= 0 then
+        origin = origin + ang:Forward() * offForward + ang:Right() * offRight + ang:Up() * offUp
+    end
+
+    local fov = math.Clamp(convar_number("mmd_vmd_npc_flashlight_fov", 60), 1, 179)
+    local brightness = math.max(0, convar_number("mmd_vmd_npc_flashlight_brightness", 4))
+    local r = math.Clamp(math.floor(convar_number("mmd_vmd_npc_flashlight_color_r", 255)), 0, 255)
+    local g = math.Clamp(math.floor(convar_number("mmd_vmd_npc_flashlight_color_g", 255)), 0, 255)
+    local b = math.Clamp(math.floor(convar_number("mmd_vmd_npc_flashlight_color_b", 255)), 0, 255)
+
+    if remix_available() then
+        -- Never keep a ProjectedTexture alive in the RTX build: Remix discards its
+        -- raster lighting, and the binary's PT wrapper could bridge it into a
+        -- SECOND remix light on setups where that wrapper is enabled.
+        if MMDVMDNPC.FlashlightProjected then destroy_projected() end
+        apply_remix_flashlight(origin, ang, fov, brightness, r, g, b)
+    else
+        apply_projected_flashlight(origin, ang, fov, brightness, r, g, b)
+    end
 end
 
 -- Hotkey toggle. input.WasKeyPressed only fires inside Move hooks, so from Think we
@@ -187,7 +305,7 @@ hook.Add("Think", "MMDVMDNPCFlashlight", function()
     end
 
     if not flashlight_enabled() then
-        if IsValid(projected) then destroy_projected() end
+        if MMDVMDNPC.FlashlightProjected or MMDVMDNPC.FlashlightRemixLightId then destroy_flashlight() end
         return
     end
 
@@ -198,6 +316,6 @@ concommand.Add("mmd_vmd_npc_flashlight_toggle", function()
     RunConsoleCommand("mmd_vmd_npc_flashlight_enabled", flashlight_enabled() and "0" or "1")
 end)
 
--- Free the ProjectedTexture on map change / lua refresh so it never leaks.
-hook.Add("ShutDown", "MMDVMDNPCFlashlightCleanup", destroy_projected)
-hook.Add("OnReloaded", "MMDVMDNPCFlashlightCleanup", destroy_projected)
+-- Free the light on map change / lua refresh so it never leaks.
+hook.Add("ShutDown", "MMDVMDNPCFlashlightCleanup", destroy_flashlight)
+hook.Add("OnReloaded", "MMDVMDNPCFlashlightCleanup", destroy_flashlight)

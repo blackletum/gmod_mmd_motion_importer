@@ -881,14 +881,18 @@ local function warn_if_ai_enabled(ply, ent)
 
     local now = SysTime()
     if (ply.MMDVMDNPCAiWarnNext or 0) > now then return end
-    ply.MMDVMDNPCAiWarnNext = now + 5
+    -- Short window: dedupes the per-NPC burst of a group play (all in one tick)
+    -- without feeling unresponsive when the user re-selects to test.
+    ply.MMDVMDNPCAiWarnNext = now + 2
 
     local message = L(
         "mmd_vmd_npc.status.ai_enabled_warning",
         "Warning: NPC AI is enabled (ai_disabled 0), so NPCs may walk or fight during the dance. Run ai_disabled 1 for a clean performance. Playing anyway."
     )
-    send_play_status(ply, "warning", message, ent)
+    -- Chat first so the notice always reaches the player even if the status net
+    -- message is dropped for any reason.
     MMDVMDNPC.Chat(ply, message)
+    send_play_status(ply, "warning", message, ent)
 end
 
 function MMDVMDNPC.SelectTargetForPlayer(ply, ent)
@@ -903,6 +907,7 @@ function MMDVMDNPC.SelectTargetForPlayer(ply, ent)
         send_target_status(ply, message)
         return ok, message
     end
+    warn_if_ai_enabled(ply, ent)
     local ok, referenceOrErr = require_reference_sequence_for_actor(ply, ent, false)
     if not ok then return false, referenceOrErr end
 
@@ -2251,6 +2256,12 @@ local function send_camera_track(ply, anchorEnt, motion, opts)
         net.WriteUInt(transferID, 32)
         net.WriteUInt(math.max(0, IsValid(anchorEnt) and anchorEnt:EntIndex() or 0), 16)
         net.WriteString(tostring(motion and motion.id or opts.motionID or ""))
+        -- Anchor transform snapshot at dance start: root-motion playback moves
+        -- the entity origin during the dance, and the camera VMD already
+        -- contains the character's travel, so the client must not re-anchor
+        -- the camera path to the live entity (it would double-count it).
+        net.WriteVector(IsValid(anchorEnt) and anchorEnt:GetPos() or Vector(0, 0, 0))
+        net.WriteFloat(IsValid(anchorEnt) and (anchorEnt:GetAngles().y or 0) or 0)
         net.WriteUInt(math.Clamp(math.floor(istable(camera) and camera.fps or 30), 1, 1000), 16)
         net.WriteUInt(math.max(0, math.floor(istable(camera) and camera.frameStart or 0)), 32)
         net.WriteUInt(math.max(0, math.floor(istable(camera) and camera.frameEnd or 0)), 32)
@@ -2331,7 +2342,17 @@ local function stop_camera_for_state(state)
     end
 end
 
-local function apply_built_sample(ent, frameA, frameB, fraction, pelvisZOffset)
+-- Root motion: the pelvis track's horizontal travel is carried on the ENTITY
+-- ORIGIN instead of a bone position manipulation. Networked bone position
+-- manipulations are range-limited by the engine, which visibly froze dances
+-- that walk far from the start point (the imported/built data itself holds the
+-- full travel); SetPos has full range and clients interpolate it smoothly.
+local cv_root_motion_origin = CreateConVar(
+    "mmd_vmd_npc_root_motion_origin", "1", FCVAR_ARCHIVE,
+    "Carry the dance's root travel on the entity origin so characters can walk any distance (0 = legacy bone-offset only)"
+)
+
+local function apply_built_sample(ent, frameA, frameB, fraction, pelvisZOffset, state)
     if not is_usable_npc(ent) then return end
 
     frameA = frameA or {}
@@ -2339,6 +2360,7 @@ local function apply_built_sample(ent, frameA, frameB, fraction, pelvisZOffset)
     fraction = math.Clamp(tonumber(fraction) or 0, 0, 1)
     pelvisZOffset = tonumber(pelvisZOffset) or 0
     local pelvisBone = ent.LookupBone and ent:LookupBone(SOURCE_PELVIS) or nil
+    local rootMotion = state ~= nil and cv_root_motion_origin:GetBool()
 
     for index, boneA in ipairs(frameA.bones or {}) do
         local boneB = (frameB.bones or {})[index] or boneA
@@ -2356,6 +2378,22 @@ local function apply_built_sample(ent, frameA, frameB, fraction, pelvisZOffset)
             )
             if pelvisBone and bone == pelvisBone then
                 pos.z = pos.z + pelvisZOffset
+                if rootMotion then
+                    -- Anchor once to the dance-start transform (set eagerly at
+                    -- playback start; guarded here for safety), then move the
+                    -- origin by the pelvis's horizontal travel rotated into
+                    -- world space. The manipulation keeps only the vertical
+                    -- component, which stays far inside the networked range.
+                    if not state.rootBase then
+                        state.rootBase = ent:GetPos()
+                        state.rootYaw = Angle(0, ent:GetAngles().y or 0, 0)
+                    end
+                    local travel = Vector(pos.x, pos.y, 0)
+                    travel:Rotate(state.rootYaw)
+                    ent:SetPos(state.rootBase + travel)
+                    pos.x = 0
+                    pos.y = 0
+                end
             end
             ent:ManipulateBoneAngles(bone, ang, true)
             if ent.ManipulateBonePosition then
@@ -2475,6 +2513,11 @@ function MMDVMDNPC.StopPlayback(ent, clearPose)
     end
 
     if clearPose ~= false then
+        -- Root motion moved the origin along the dance; put the actor back at
+        -- its start spot, matching how clearing manipulations resets the pose.
+        if state and state.rootBase and ent.SetPos then
+            ent:SetPos(state.rootBase)
+        end
         clear_all_bone_manipulations(ent)
         clear_all_flex_weights(ent)
         force_reference_pose(ent)
@@ -2597,6 +2640,11 @@ local function start_playback_on_entity(ply, ent, motionID, options, playbackSet
         ent = playbackEnt,
         realPlayer = selfProxy and ent or nil,
         selfProxy = selfProxy,
+        -- Dance-start transform: root-motion playback moves the origin along
+        -- the pelvis track and restores it here on stop. Captured after any
+        -- group alignment, and matching the camera track's anchor snapshot.
+        rootBase = playbackEnt:GetPos(),
+        rootYaw = Angle(0, playbackEnt:GetAngles().y or 0, 0),
         built = built,
         motion = motion,
         path = pathOrErr,
@@ -3111,7 +3159,7 @@ local function update_playback_state(ent, state, now)
 
     if ent.SetCycle then ent:SetCycle(0) end
     if ent.SetPlaybackRate then ent:SetPlaybackRate(0) end
-    apply_built_sample(ent, frames[lowerIndex], frames[upperIndex], fraction, state.pelvisZOffset or 0)
+    apply_built_sample(ent, frames[lowerIndex], frames[upperIndex], fraction, state.pelvisZOffset or 0, state)
     apply_runtime_eye_tracking(ent, state, now)
 
     if finished then
@@ -3712,6 +3760,7 @@ function MMDVMDNPC.AssignActorForPlayer(ply, ent, motionID, options, playbackSet
         send_assignment_status(ply)
         return true, "removed"
     end
+    warn_if_ai_enabled(ply, ent)
     local referenceOK, referenceErr = require_reference_sequence_for_actor(ply, ent, true)
     if not referenceOK then
         send_assignment_status(ply)
