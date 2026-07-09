@@ -788,7 +788,7 @@ function TOOL.BuildCPanel(panel)
     add_checkbox_with_help(lightingTab, L("mmd_vmd_npc.lighting.shadows"), "mmd_vmd_npc_flashlight_shadows", L("mmd_vmd_npc.lighting.shadows_help"))
 
     section(lightingTab, L("mmd_vmd_npc.lighting.beam"), Color(255, 220, 120))
-    add_slider(lightingTab, L("mmd_vmd_npc.lighting.brightness"), "mmd_vmd_npc_flashlight_brightness", 0, 16, 1)
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.brightness"), "mmd_vmd_npc_flashlight_brightness", 0, 2048, 1)
     add_slider(lightingTab, L("mmd_vmd_npc.lighting.fov"), "mmd_vmd_npc_flashlight_fov", 5, 170, 0)
     add_slider(lightingTab, L("mmd_vmd_npc.lighting.distance"), "mmd_vmd_npc_flashlight_distance", 128, 8192, 0)
     add_slider(lightingTab, L("mmd_vmd_npc.lighting.nearz"), "mmd_vmd_npc_flashlight_nearz", 1, 64, 0)
