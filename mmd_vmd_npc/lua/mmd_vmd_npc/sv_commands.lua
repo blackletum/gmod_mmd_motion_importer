@@ -862,6 +862,35 @@ local function fail_ai_disabled_required(ply, forBuild)
     return false, message
 end
 
+local function ai_thinking_disabled()
+    -- `ai_disabled` is a server convar; the server is authoritative here. When the
+    -- convar is somehow missing we treat AI as "unknown" and stay silent rather
+    -- than nagging on every build/play.
+    local cv = GetConVar("ai_disabled")
+    if not cv then return true end
+    return cv:GetBool()
+end
+
+-- Non-blocking notice: applying a dance to an NPC while AI thinking is on lets the
+-- NPC wander/fight mid-performance. We warn (once per few seconds so a group action
+-- does not spam) and then let the build/playback proceed anyway.
+local function warn_if_ai_enabled(ply, ent)
+    if not IsValid(ply) then return end
+    if not is_playable_npc(ent) or is_playback_proxy(ent) then return end
+    if ai_thinking_disabled() then return end
+
+    local now = SysTime()
+    if (ply.MMDVMDNPCAiWarnNext or 0) > now then return end
+    ply.MMDVMDNPCAiWarnNext = now + 5
+
+    local message = L(
+        "mmd_vmd_npc.status.ai_enabled_warning",
+        "Warning: NPC AI is enabled (ai_disabled 0), so NPCs may walk or fight during the dance. Run ai_disabled 1 for a clean performance. Playing anyway."
+    )
+    send_play_status(ply, "warning", message, ent)
+    MMDVMDNPC.Chat(ply, message)
+end
+
 function MMDVMDNPC.SelectTargetForPlayer(ply, ent)
     if not IsValid(ply) then return false, L("mmd_vmd_npc.status.invalid_player", "invalid player") end
     if not is_usable_actor(ent) then
@@ -2505,6 +2534,7 @@ local function start_playback_on_entity(ply, ent, motionID, options, playbackSet
     if not ai_disabled_enabled() then
         return fail_ai_disabled_required(ply, false)
     end
+    warn_if_ai_enabled(ply, ent)
 
     local built, pathOrErr, errCode = preparedBuilt, preparedPath, nil
     if not built then
@@ -3393,6 +3423,7 @@ local function start_build_for_entity(ply, ent, motionID, options, playbackSetti
     if not ai_disabled_enabled() then
         return fail_ai_disabled_required(ply, true)
     end
+    warn_if_ai_enabled(ply, ent)
 
     local motion, err = MMDVMDNPC.LoadMotion(motionID)
     if not motion then

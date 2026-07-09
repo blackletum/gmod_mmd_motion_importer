@@ -305,28 +305,7 @@ function TOOL.BuildCPanel(panel)
     panel:ClearControls()
     panel:Help(L("mmd_vmd_npc.ui.tool_help"))
 
-    -- Camera animation hotkey: enters/exits the imported MMD camera view of the
-    -- most recently started dance (see cl_camera.lua).
-    local binderRow = vgui.Create("DPanel", panel)
-    binderRow:SetTall(32)
-    binderRow.Paint = nil
-    local binderLabel = vgui.Create("DLabel", binderRow)
-    binderLabel:Dock(FILL)
-    binderLabel:SetText(L("mmd_vmd_npc.camera.hotkey_label"))
-    binderLabel:SetTextColor(Color(255, 200, 90))
-    binderLabel:SetFont("DermaDefaultBold")
-    local binder = vgui.Create("DBinder", binderRow)
-    binder:Dock(RIGHT)
-    binder:SetWide(130)
-    local cameraKeyCvar = GetConVar("mmd_vmd_npc_camera_key")
-    binder:SetValue(cameraKeyCvar and cameraKeyCvar:GetInt() or 0)
-    binder.OnChange = function(_, num)
-        RunConsoleCommand("mmd_vmd_npc_camera_key", tostring(math.max(0, math.floor(tonumber(num) or 0))))
-    end
-    panel:AddItem(binderRow)
-    panel:Help(L("mmd_vmd_npc.camera.hotkey_help"))
-    panel:CheckBox(L("mmd_vmd_npc.camera.auto_option"), "mmd_vmd_npc_camera_auto")
-    panel:Help(L("mmd_vmd_npc.camera.auto_option_help"))
+    -- Camera and RTX-Remix lighting settings live in their own sub-tabs below.
 
     local screenW = ScrW and ScrW() or 1280
     local screenH = ScrH and ScrH() or 720
@@ -406,8 +385,31 @@ function TOOL.BuildCPanel(panel)
         return button
     end
 
+    local function key_binder(parent, labelText, cvarName, color)
+        local row = vgui.Create("DPanel")
+        row:SetTall(30)
+        row.Paint = nil
+        local label = vgui.Create("DLabel", row)
+        label:Dock(FILL)
+        label:SetText(labelText)
+        label:SetTextColor(color or Color(255, 200, 90))
+        label:SetFont("DermaDefaultBold")
+        local binder = vgui.Create("DBinder", row)
+        binder:Dock(RIGHT)
+        binder:SetWide(130)
+        local cvar = GetConVar(cvarName)
+        binder:SetValue(cvar and cvar:GetInt() or 0)
+        binder.OnChange = function(_, num)
+            RunConsoleCommand(cvarName, tostring(math.max(0, math.floor(tonumber(num) or 0))))
+        end
+        parent:AddItem(row)
+        return binder
+    end
+
     local motionTab = create_subtab(L("mmd_vmd_npc.ui.tab.motion"), "icon16/film.png")
     local playbackTab = create_subtab(L("mmd_vmd_npc.ui.tab.build_playback"), "icon16/control_play_blue.png")
+    local cameraTab = create_subtab(L("mmd_vmd_npc.ui.tab.camera"), "icon16/camera.png")
+    local lightingTab = create_subtab(L("mmd_vmd_npc.ui.tab.lighting"), "icon16/lightbulb.png")
     local performanceTab = create_subtab(L("mmd_vmd_npc.ui.tab.performance"), "icon16/lightning.png")
     local advancedTab = create_subtab(L("mmd_vmd_npc.ui.tab.advanced"), "icon16/wrench.png")
 
@@ -756,6 +758,50 @@ function TOOL.BuildCPanel(panel)
             print("[MMD VMD] " .. L("mmd_vmd_npc.error.select_motion"))
         end
     end)
+
+    -- Camera tab -----------------------------------------------------------------
+    section(cameraTab, L("mmd_vmd_npc.ui.tab.camera"), Color(120, 200, 255))
+    cameraTab:Help(L("mmd_vmd_npc.camera.tab_help"))
+    key_binder(cameraTab, L("mmd_vmd_npc.camera.hotkey_label"), "mmd_vmd_npc_camera_key", Color(120, 200, 255))
+    cameraTab:Help(L("mmd_vmd_npc.camera.hotkey_help"))
+    add_checkbox_with_help(cameraTab, L("mmd_vmd_npc.camera.auto_option"), "mmd_vmd_npc_camera_auto", L("mmd_vmd_npc.camera.auto_option_help"))
+    add_checkbox_with_help(cameraTab, L("mmd_vmd_npc.camera.collision"), "mmd_vmd_npc_cam_collision", L("mmd_vmd_npc.camera.collision_help"))
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.max_distance"), "mmd_vmd_npc_cam_max_distance", 0, 6000, 0)
+
+    section(cameraTab, L("mmd_vmd_npc.camera.transform"), Color(120, 200, 255))
+    cameraTab:Help(L("mmd_vmd_npc.camera.transform_help"))
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.scale"), "mmd_vmd_npc_cam_scale", 0.1, 3, 2)
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.offset_x"), "mmd_vmd_npc_cam_offset_x", -128, 128, 0)
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.offset_y"), "mmd_vmd_npc_cam_offset_y", -128, 128, 0)
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.offset_z"), "mmd_vmd_npc_cam_offset_z", -128, 128, 0)
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.yaw"), "mmd_vmd_npc_cam_yaw", -180, 180, 0)
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.pitch"), "mmd_vmd_npc_cam_pitch", -90, 90, 0)
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.fov_offset"), "mmd_vmd_npc_cam_fov", -80, 80, 0)
+
+    -- RTX-Remix lighting tab -----------------------------------------------------
+    section(lightingTab, L("mmd_vmd_npc.ui.tab.lighting"), Color(255, 220, 120))
+    lightingTab:Help(L("mmd_vmd_npc.lighting.tab_help"))
+    add_checkbox_with_help(lightingTab, L("mmd_vmd_npc.lighting.enable"), "mmd_vmd_npc_flashlight_enabled", L("mmd_vmd_npc.lighting.enable_help"))
+    key_binder(lightingTab, L("mmd_vmd_npc.lighting.hotkey_label"), "mmd_vmd_npc_flashlight_key", Color(255, 220, 120))
+    lightingTab:Help(L("mmd_vmd_npc.lighting.hotkey_help"))
+    add_checkbox_with_help(lightingTab, L("mmd_vmd_npc.lighting.follow_eye"), "mmd_vmd_npc_flashlight_follow_eye", L("mmd_vmd_npc.lighting.follow_eye_help"))
+    add_checkbox_with_help(lightingTab, L("mmd_vmd_npc.lighting.shadows"), "mmd_vmd_npc_flashlight_shadows", L("mmd_vmd_npc.lighting.shadows_help"))
+
+    section(lightingTab, L("mmd_vmd_npc.lighting.beam"), Color(255, 220, 120))
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.brightness"), "mmd_vmd_npc_flashlight_brightness", 0, 16, 1)
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.fov"), "mmd_vmd_npc_flashlight_fov", 5, 170, 0)
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.distance"), "mmd_vmd_npc_flashlight_distance", 128, 8192, 0)
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.nearz"), "mmd_vmd_npc_flashlight_nearz", 1, 64, 0)
+
+    section(lightingTab, L("mmd_vmd_npc.lighting.color"), Color(255, 220, 120))
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.color_r"), "mmd_vmd_npc_flashlight_color_r", 0, 255, 0)
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.color_g"), "mmd_vmd_npc_flashlight_color_g", 0, 255, 0)
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.color_b"), "mmd_vmd_npc_flashlight_color_b", 0, 255, 0)
+
+    section(lightingTab, L("mmd_vmd_npc.lighting.offset"), Color(255, 220, 120))
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.offset_forward"), "mmd_vmd_npc_flashlight_offset_forward", -64, 64, 0)
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.offset_right"), "mmd_vmd_npc_flashlight_offset_right", -64, 64, 0)
+    add_slider(lightingTab, L("mmd_vmd_npc.lighting.offset_up"), "mmd_vmd_npc_flashlight_offset_up", -64, 64, 0)
 
     update_eye_status = function()
         if not IsValid(eyeStatusLabel) then return end

@@ -1874,9 +1874,15 @@ hook.Add("CalcView", "MMDVMDNPCSelfThirdPerson", function(ply, pos, angles, fov)
 
     MMDVMDNPC.EyeTrackCameraOrigin = tr.HitPos
 
+    local viewAngles = (center - tr.HitPos):Angle()
+    -- Expose the resolved 3rd-person view so the camera-following flashlight
+    -- (cl_flashlight.lua) can track it without recomputing the orbit.
+    MMDVMDNPC.SelfThirdPersonViewOrigin = tr.HitPos
+    MMDVMDNPC.SelfThirdPersonViewAngles = viewAngles
+
     return {
         origin = tr.HitPos,
-        angles = (center - tr.HitPos):Angle(),
+        angles = viewAngles,
         fov = fov,
         drawviewer = false,
     }

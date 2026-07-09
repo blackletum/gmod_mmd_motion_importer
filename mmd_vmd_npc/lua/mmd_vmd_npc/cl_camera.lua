@@ -579,6 +579,7 @@ hook.Add("CalcView", "MMDVMDNPCCameraAnim", function(ply, pos, angles, fov)
         local view = camera_view_for(track, anchor, math.max(0, frame))
         if view then
             MMDVMDNPC.CameraAnimViewOrigin = view.origin
+            MMDVMDNPC.CameraAnimViewAngles = view.angles
             return view
         end
     end
@@ -600,6 +601,7 @@ hook.Add("CalcView", "MMDVMDNPCCameraAnim", function(ply, pos, angles, fov)
     end
 
     MMDVMDNPC.CameraAnimViewOrigin = view.origin
+    MMDVMDNPC.CameraAnimViewAngles = view.angles
     return view
 end)
 

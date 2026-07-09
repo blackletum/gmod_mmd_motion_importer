@@ -5,6 +5,7 @@ if SERVER then
     AddCSLuaFile("mmd_vmd_npc/cl_radial.lua")
     AddCSLuaFile("mmd_vmd_npc/cl_camera.lua")
     AddCSLuaFile("mmd_vmd_npc/cl_menu.lua")
+    AddCSLuaFile("mmd_vmd_npc/cl_flashlight.lua")
 
     util.AddNetworkString("mmdvmd_list_request")
     util.AddNetworkString("mmdvmd_list_response")
@@ -65,4 +66,5 @@ if SERVER then
 else
     include("mmd_vmd_npc/cl_camera.lua")
     include("mmd_vmd_npc/cl_menu.lua")
+    include("mmd_vmd_npc/cl_flashlight.lua")
 end
