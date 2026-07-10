@@ -10,13 +10,19 @@ local function LF(key, ...)
 end
 
 local function motion_display_name(metaOrID)
+    -- Prefer the shared CustomNames-aware resolver from cl_menu so tool-panel
+    -- names match the Motion Manager and the wheel, including user renames.
+    local id = istable(metaOrID) and tostring(metaOrID.id or "") or tostring(metaOrID or "")
+    if MMDVMDNPC.GetNiceName and id ~= "" then
+        return MMDVMDNPC.GetNiceName(id)
+    end
+
     if istable(metaOrID) then
         local display = tostring(metaOrID.displayName or "")
         if display ~= "" then return display end
         return tostring(metaOrID.id or "")
     end
 
-    local id = tostring(metaOrID or "")
     local meta = MMDVMDNPC.MotionDetails and MMDVMDNPC.MotionDetails[id] or nil
     local display = meta and tostring(meta.displayName or "") or ""
     return display ~= "" and display or id
@@ -101,6 +107,7 @@ TOOL.ClientConVar = {
     disable_handtwist = "0",
     disable_eyes = "0",
     disable_spine_pelvis_correction = "0",
+    disable_jiggle = "0",
     start_delay = "2",
     pelvis_z_offset = "-2.5",
     thirdperson_distance = "120",
@@ -333,7 +340,13 @@ function TOOL.BuildCPanel(panel)
     end
 
     local container = vgui.Create("DPanel", panel)
-    container:SetTall(compactPanel and math.max(screenH * 1.05, 700) or math.max(screenH * 1.15, 820))
+    -- Previously a screen-scaled fixed height (screenH * ~1.15) — that made the
+    -- whole spawn-menu column taller than the screen on every resolution (absurdly
+    -- so on 1440p/4K), forcing one enormous outer scrollbar. Instead pin the sheet
+    -- to a viewport that fits the tool column on any resolution and let each tab
+    -- scroll its own overflow internally, so the outer scrollbar stays short.
+    local viewportTall = math.Clamp(math.floor(screenH * 0.62), 440, 760)
+    container:SetTall(viewportTall)
     container.Paint = nil
     panel:AddItem(container)
 
@@ -341,9 +354,14 @@ function TOOL.BuildCPanel(panel)
     sheet:Dock(FILL)
 
     local function create_subtab(title, icon)
-        local tab = vgui.Create("ControlPanel", sheet)
-        tab:Dock(FILL)
-        sheet:AddSheet(title, tab, icon or "icon16/wrench.png")
+        -- Each tab is a ControlPanel inside a DScrollPanel: the ControlPanel takes
+        -- its natural content height (Dock TOP) and the scroll panel shows a
+        -- scrollbar only when that content exceeds the fixed viewport above.
+        local scroll = vgui.Create("DScrollPanel", sheet)
+        scroll:Dock(FILL)
+        local tab = vgui.Create("ControlPanel", scroll)
+        tab:Dock(TOP)
+        sheet:AddSheet(title, scroll, icon or "icon16/wrench.png")
         return tab
     end
 
@@ -483,13 +501,62 @@ function TOOL.BuildCPanel(panel)
     motionTab:Help(L("mmd_vmd_npc.ui.music_range_help"))
     add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.loop_playback"), "mmd_vmd_npc_loop_playback", L("mmd_vmd_npc.ui.loop_playback_help"))
 
+    -- Category + text filter row above the motion list (same category set as
+    -- the Motion Manager: addon categories + "User Import").
+    local stoolCategoryFilter = cookie and cookie.GetString and cookie.GetString("mmdvmd_tool_category", "") or ""
+    local filterRow = vgui.Create("DPanel")
+    filterRow:SetTall(26)
+    filterRow:SetPaintBackground(false)
+    local categoryCombo = vgui.Create("DComboBox", filterRow)
+    categoryCombo:Dock(LEFT)
+    categoryCombo:SetWide(150)
+    categoryCombo:SetSortItems(false)
+    local motionSearch = vgui.Create("DTextEntry", filterRow)
+    motionSearch:Dock(FILL)
+    motionSearch:DockMargin(6, 0, 0, 0)
+    motionSearch:SetPlaceholderText(L("mmd_vmd_npc.manager.search_placeholder"))
+    motionTab:AddItem(filterRow)
+
     local motionList = vgui.Create("DListView")
-    motionList:SetTall(145)
+    motionList:SetTall(compactPanel and 190 or 250)
     motionList:SetMultiSelect(false)
     motionList:AddColumn(L("mmd_vmd_npc.ui.column.motion"))
+    local categoryColumn = motionList:AddColumn(L("mmd_vmd_npc.manager.column_category"))
+    if IsValid(categoryColumn) and categoryColumn.SetMinWidth then categoryColumn:SetMinWidth(90) end
     motionList:AddColumn(L("mmd_vmd_npc.ui.column.duration"))
-    motionList:AddColumn(L("mmd_vmd_npc.ui.column.addon"))
     motionTab:AddItem(motionList)
+
+    local function stool_category_display(category)
+        if (category or "") == "" then return L("mmd_vmd_npc.category.all", "All Categories") end
+        return MMDVMDNPC.CategoryDisplayName and MMDVMDNPC.CategoryDisplayName(category) or category
+    end
+
+    local function rebuild_stool_category_combo()
+        if not IsValid(categoryCombo) then return end
+        -- Never rebuild under an open dropdown; and add choices WITHOUT the
+        -- select flag (it fires OnSelect synchronously, rewriting the cookie
+        -- as a side effect of every rebuild) — display via SetValue instead.
+        if categoryCombo.IsMenuOpen and categoryCombo:IsMenuOpen() then return end
+        categoryCombo:Clear()
+        categoryCombo:AddChoice(L("mmd_vmd_npc.category.all", "All Categories"), "")
+        local found = stoolCategoryFilter == ""
+        if MMDVMDNPC.MotionCategories then
+            for _, category in ipairs(MMDVMDNPC.MotionCategories()) do
+                found = found or category == stoolCategoryFilter
+                categoryCombo:AddChoice(stool_category_display(category), category)
+            end
+        end
+        if found or #(MMDVMDNPC.MotionDetailsOrdered or {}) == 0 then
+            -- Keep the remembered filter while the details have not streamed
+            -- yet; a later rebuild (details hook) genuinely validates it.
+            categoryCombo:SetValue(stool_category_display(stoolCategoryFilter))
+        else
+            stoolCategoryFilter = ""
+            if cookie and cookie.Set then cookie.Set("mmdvmd_tool_category", "") end
+            categoryCombo:SetValue(stool_category_display(""))
+        end
+    end
+    rebuild_stool_category_combo()
     local targetLabel = vgui.Create("DLabel")
     local assignmentLabel = vgui.Create("DLabel")
     local buildLabel = vgui.Create("DLabel")
@@ -505,7 +572,34 @@ function TOOL.BuildCPanel(panel)
         return string.format("%.2fs", tonumber(meta.duration) or 0)
     end
 
-    local function refresh_motion_list(motions)
+    local suppressRowSelect = false
+
+    local function stool_category_text(meta)
+        -- Unknown metadata (details not streamed, or a deleted motion) shows
+        -- an empty category rather than confidently claiming "User Import".
+        if not istable(meta) or (meta.category or "") == "" then return "" end
+        if MMDVMDNPC.CategoryDisplayName then
+            return MMDVMDNPC.CategoryDisplayName(meta.category)
+        end
+        return tostring(meta.category)
+    end
+
+    local function stool_row_matches(meta, id, query)
+        if MMDVMDNPC.MotionMatchesCategory and not MMDVMDNPC.MotionMatchesCategory(meta, stoolCategoryFilter) then
+            return false
+        end
+        if query == "" then return true end
+        local haystack = string.lower(table.concat({
+            id,
+            motion_display_name(meta or id),
+            istable(meta) and meta.englishName or "",
+            istable(meta) and meta.artist or "",
+            istable(meta) and meta.motionArtist or "",
+        }, " "))
+        return string.find(haystack, query, 1, true) ~= nil
+    end
+
+    local function refresh_motion_list_now()
         if not IsValid(motionList) then return end
         motionList:Clear()
         local current = GetConVar("mmd_vmd_npc_motion")
@@ -514,56 +608,117 @@ function TOOL.BuildCPanel(panel)
         local seen = {}
         local detailsOrdered = MMDVMDNPC.MotionDetailsOrdered or {}
         local detailsByID = MMDVMDNPC.MotionDetails or {}
+        local query = string.lower(IsValid(motionSearch) and motionSearch:GetValue() or "")
+
+        local function add_row(id, meta)
+            seen[id] = true
+            if not stool_row_matches(meta, id, query) then return end
+            local line = motionList:AddLine(motion_display_name(meta or id), stool_category_text(meta), duration_text(meta))
+            line.MotionID = id
+            line.Meta = meta
+            if id == selected then selectedLine = line end
+        end
 
         if #detailsOrdered > 0 then
             for _, meta in ipairs(detailsOrdered) do
                 local id = tostring(meta.id or "")
-                if id ~= "" then
-                    seen[id] = true
-                    local line = motionList:AddLine(motion_display_name(meta), duration_text(meta), meta.isAddon and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"))
-                    line.MotionID = id
-                    line.Meta = meta
-                    if id == selected then
-                        selectedLine = line
-                    end
-                end
+                if id ~= "" then add_row(id, meta) end
             end
         else
-            for _, id in ipairs(motions or MMDVMDNPC.ClientMotions or {}) do
+            for _, id in ipairs(MMDVMDNPC.ClientMotions or {}) do
                 id = tostring(id or "")
-                if id ~= "" then
-                    seen[id] = true
-                    local meta = detailsByID[id]
-                    local line = motionList:AddLine(motion_display_name(meta or id), duration_text(meta), meta and meta.isAddon and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"))
-                    line.MotionID = id
-                    line.Meta = meta
-                    if id == selected then
-                        selectedLine = line
-                    end
-                end
+                if id ~= "" then add_row(id, detailsByID[id]) end
             end
         end
 
-        if selected ~= "" and not seen[selected] then
-            selectedLine = motionList:AddLine(selected, L("mmd_vmd_npc.ui.missing"), L("mmd_vmd_npc.ui.no"))
+        -- Keep the currently selected motion visible even when it is missing
+        -- from the list (deleted) or hidden by the active filters.
+        if selected ~= "" and not selectedLine then
+            local label = seen[selected] and motion_display_name(selected) or selected
+            selectedLine = motionList:AddLine(label, stool_category_text(detailsByID[selected]),
+                seen[selected] and duration_text(detailsByID[selected]) or L("mmd_vmd_npc.ui.missing"))
             selectedLine.MotionID = selected
+            selectedLine.Meta = detailsByID[selected]
         end
 
         if selectedLine then
+            -- Purely visual re-selection: the motion convar already holds this
+            -- id, so suppress OnRowSelected (it would fire a console command +
+            -- an audio-settings net request per rebuild — i.e. per keystroke).
+            suppressRowSelect = true
             if motionList.SelectItem then
                 motionList:SelectItem(selectedLine)
             elseif selectedLine.SetSelected then
                 selectedLine:SetSelected(true)
             end
+            suppressRowSelect = false
         end
     end
 
+    -- The list/details hooks fire in bursts around every action; coalesce the
+    -- full Derma rebuild to once per frame.
+    local function refresh_motion_list()
+        timer.Create(hookID .. "_MotionRefresh", 0, 1, function()
+            refresh_motion_list_now()
+        end)
+    end
+
+    categoryCombo.OnSelect = function(_, _, _, value)
+        stoolCategoryFilter = tostring(value or "")
+        if cookie and cookie.Set then cookie.Set("mmdvmd_tool_category", stoolCategoryFilter) end
+        refresh_motion_list()
+    end
+    motionSearch.OnChange = function()
+        refresh_motion_list()
+    end
+    hook.Add("MMDVMDNPCMotionDetailsUpdated", hookID .. "_CategoryCombo", rebuild_stool_category_combo)
+
+    -- One-click wheel curation from the spawn menu: acts on the selected
+    -- motion, label follows the selection state.
+    local wheelQuickButton
+    local function update_wheel_quick_button()
+        if not IsValid(wheelQuickButton) then return end
+        local current = GetConVar("mmd_vmd_npc_motion")
+        local motionID = current and current:GetString() or ""
+        if motionID ~= "" and MMDVMDNPC.IsFavorite and MMDVMDNPC.IsFavorite(motionID) then
+            wheelQuickButton:SetText(L("mmd_vmd_npc.manager.wheel_remove", "★ Remove From Wheel"))
+        else
+            wheelQuickButton:SetText(L("mmd_vmd_npc.manager.wheel_add", "☆ Add To Wheel"))
+        end
+    end
+    wheelQuickButton = colored_button(motionTab, L("mmd_vmd_npc.manager.wheel_add", "☆ Add To Wheel"), Color(200, 150, 40), function()
+        local current = GetConVar("mmd_vmd_npc_motion")
+        local motionID = current and current:GetString() or ""
+        if motionID == "" or not MMDVMDNPC.ToggleFavorite then
+            notification.AddLegacy(L("mmd_vmd_npc.manager.wheel_select_first", "Select a motion from the list first."), NOTIFY_ERROR, 3)
+            return
+        end
+        local isAdded = MMDVMDNPC.ToggleFavorite(motionID)
+        if isAdded then
+            surface.PlaySound("garrysmod/content_downloaded.wav")
+            notification.AddLegacy(L("mmd_vmd_npc.manager.wheel_added", "Added to wheel!"), NOTIFY_GENERIC, 3)
+        else
+            surface.PlaySound("buttons/button15.wav")
+            notification.AddLegacy(L("mmd_vmd_npc.manager.wheel_removed", "Removed from wheel"), NOTIFY_CLEANUP, 3)
+        end
+        update_wheel_quick_button()
+    end)
+    update_wheel_quick_button()
+    -- Wheel membership can change from the Motion Manager while this panel is
+    -- open; keep the quick button's label truthful. (Registered here, after
+    -- update_wheel_quick_button exists, so the closure captures the local.)
+    hook.Add("MMDVMDNPCWheelFavoritesChanged", hookID .. "_WheelFav", update_wheel_quick_button)
+
     motionList.OnRowSelected = function(_, _, line)
+        if suppressRowSelect then return end
         if not line or not line.MotionID then return end
         RunConsoleCommand("mmd_vmd_npc_motion", line.MotionID)
         if MMDVMDNPC and MMDVMDNPC.RequestAudioSettings then
             MMDVMDNPC.RequestAudioSettings(line.MotionID)
         end
+        -- The convar write above is deferred a tick; refresh the wheel button
+        -- from the actually-clicked row.
+        timer.Simple(0, update_wheel_quick_button)
         if update_motion_details then
             timer.Simple(0, function()
                 if IsValid(motionInfo) then
@@ -702,6 +857,11 @@ function TOOL.BuildCPanel(panel)
     add_slider(playbackTab, L("mmd_vmd_npc.ui.thirdperson_distance"), "mmd_vmd_npc_thirdperson_distance", 40, 260, 0)
     add_slider(playbackTab, L("mmd_vmd_npc.ui.thirdperson_height"), "mmd_vmd_npc_thirdperson_height", -20, 90, 0)
 
+    section(motionTab, L("mmd_vmd_npc.ui.display_playback"), Color(150, 210, 255))
+    add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.hide_hud"), "mmd_vmd_npc_hide_hud", L("mmd_vmd_npc.ui.hide_hud_help"))
+    key_binder(motionTab, L("mmd_vmd_npc.ui.hide_hud_key"), "mmd_vmd_npc_hide_hud_key", Color(150, 210, 255))
+    add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.disable_jiggle"), "mmd_vmd_npc_disable_jiggle", L("mmd_vmd_npc.ui.disable_jiggle_help"))
+
     section(motionTab, L("mmd_vmd_npc.ui.eye_tracking"), Color(120, 210, 255))
     add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.enable_eye_tracking"), "mmd_vmd_npc_eye_track", L("mmd_vmd_npc.ui.enable_eye_tracking_help"))
     add_slider(motionTab, L("mmd_vmd_npc.ui.eye_smoothing"), "mmd_vmd_npc_eye_track_smooth", 0.1, 30, 2)
@@ -741,6 +901,9 @@ function TOOL.BuildCPanel(panel)
     add_slider(performanceTab, L("mmd_vmd_npc.ui.playback_updates_per_second"), "mmd_vmd_npc_playback_hz", MMDVMDNPC.MinPlaybackHz or 10, MMDVMDNPC.MaxPlaybackHz or 240, 0)
 
     section(advancedTab, L("mmd_vmd_npc.ui.tab.advanced"), Color(180, 180, 180))
+
+    add_slider(advancedTab, L("mmd_vmd_npc.ui.menu_scale"), "mmd_vmd_npc_menu_scale", 0.6, 2.0, 2)
+    advancedTab:Help(L("mmd_vmd_npc.ui.menu_scale_help"))
 
     advancedTab:CheckBox("Q: Show halos", "mmd_vmd_npc_show_halos") -- ADDED
 
@@ -925,7 +1088,10 @@ function TOOL.BuildCPanel(panel)
         if oldOnRemove then oldOnRemove(panel) end
         timer.Remove(hookID .. "_AudioOffsetSave")
         timer.Remove(hookID .. "_PauseWarning")
+        timer.Remove(hookID .. "_MotionRefresh")
         hook.Remove("MMDVMDNPCMotionListUpdated", hookID)
+        hook.Remove("MMDVMDNPCMotionDetailsUpdated", hookID .. "_CategoryCombo")
+        hook.Remove("MMDVMDNPCWheelFavoritesChanged", hookID .. "_WheelFav")
         hook.Remove("MMDVMDNPCTargetStatusUpdated", hookID .. "_Target")
         hook.Remove("MMDVMDNPCAssignmentStatusUpdated", hookID .. "_Assignments")
         hook.Remove("MMDVMDNPCBuildStatusUpdated", hookID .. "_Build")

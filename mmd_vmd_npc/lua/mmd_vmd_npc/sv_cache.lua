@@ -1,5 +1,10 @@
 MMDVMDNPC = MMDVMDNPC or {}
-MMDVMDNPC.Cache = MMDVMDNPC.Cache or {}
+-- Parsed-motion cache. Cleared unconditionally when this file (re)loads: the
+-- cache validity key is mtime+path+realm only, so an autorefresh that changes
+-- read_motion_file itself (new fields, new parsing) would otherwise keep
+-- serving objects in the OLD shape — and MotionMetadata would then persist
+-- that stale shape into _meta_index.dat under the new schema stamp.
+MMDVMDNPC.Cache = {}
 MMDVMDNPC.FlexAliases = MMDVMDNPC.FlexAliases or nil
 MMDVMDNPC.FlexOverrides = MMDVMDNPC.FlexOverrides or nil
 MMDVMDNPC.FlexOverrideUnassigned = MMDVMDNPC.FlexOverrideUnassigned or "__mmd_vmd_npc_unassigned__"
@@ -430,6 +435,13 @@ function MMDVMDNPC.MotionFileInfo(motionID)
     return motion_file_info(motionID)
 end
 
+-- Free-text fields sourced from motion JSON: strip NULs (net.WriteString
+-- truncates at them) and bound the length.
+local function clamp_meta_string(value, limit)
+    value = string.gsub(tostring(value or ""), "%z", "")
+    return string.sub(value, 1, limit or 256)
+end
+
 local function read_motion_file(info)
     local path = info and info.path or ""
     local realm = info and info.realm or "DATA"
@@ -452,11 +464,24 @@ local function read_motion_file(info)
         frameStart = number_or(parsed.frame_start, 0),
         frameEnd = number_or(parsed.frame_end, 0),
         frameCount = math.max(1, math.floor(number_or(parsed.frame_count, 1))),
-        displayName = tostring(parsed.display_name or parsed.motion_name or parsed.name or ""),
+        displayName = tostring(parsed.display_name or parsed.motion_name or parsed.name
+            or (istable(parsed.meta) and parsed.meta.display_name) or ""),
         sourceName = tostring(parsed.input_vmd or ""),
         sourcePath = tostring(parsed.baked_vmd or parsed.input_vmd or ""),
         modelPath = tostring(parsed.mmd_model or ""),
         isAddon = parsed.is_addon == true or (info and info.isAddon == true),
+        -- Descriptive metadata block written by the importer (all optional).
+        -- Values are free text from the importer table or third-party addon
+        -- JSONs: clamp them here (NUL-stripped, bounded) so they can never
+        -- blow up the persisted meta index or the chunked details net stream.
+        meta = istable(parsed.meta) and {
+            category = clamp_meta_string(parsed.meta.category, 128),
+            englishName = clamp_meta_string(parsed.meta.english_name, 256),
+            artist = clamp_meta_string(parsed.meta.artist, 256),
+            language = clamp_meta_string(parsed.meta.language, 64),
+            link = clamp_meta_string(parsed.meta.link, 512),
+            motionArtist = clamp_meta_string(parsed.meta.motion_artist, 256),
+        } or nil,
         filePath = path,
         fileRealm = realm,
         axis = parsed.axis or {},
@@ -548,6 +573,11 @@ end
 local motion_meta_index, save_motion_meta_index = make_index(MOTION_META_INDEX_PATH, "MMDVMDNPCMotionMetaSave")
 local built_header_index, save_built_header_index = make_index(BUILT_HEADER_INDEX_PATH, "MMDVMDNPCBuiltHeaderSave")
 
+-- Bump when the derived meta gains fields: index entries persisted by an older
+-- addon version lack them, and the mtime+size key alone would keep serving the
+-- stale shape forever (the motion files themselves did not change).
+local MOTION_META_SCHEMA = 2
+
 -- Motion metadata: served from the index whenever the file's mtime is unchanged
 -- so a full parse only happens for new/changed motions.
 function MMDVMDNPC.MotionMetadata(motionID)
@@ -561,14 +591,33 @@ function MMDVMDNPC.MotionMetadata(motionID)
     local size = file.Size(info.path, info.realm) or -1
     local idx = motion_meta_index()
     local cached = idx[info.id]
-    if istable(cached) and cached.modified == modified and cached.size == size and istable(cached.meta) then
+    if istable(cached) and cached.modified == modified and cached.size == size
+        and istable(cached.meta) and cached.meta.schema == MOTION_META_SCHEMA then
         return cached.meta
     end
 
     local motion, err = MMDVMDNPC.LoadMotion(info.id)
     if not motion then return nil, err end
 
+    -- Category rule: motions in the user's DATA folder are ALWAYS "User Import"
+    -- (the realm decides, not the JSON — a local import that was also exported
+    -- as a GMA carries is_addon=true but is still the user's own import). Only
+    -- motions mounted from addons use their authored category, with a fallback
+    -- bucket for addon motions that ship without one.
+    local motionMeta = motion.meta or {}
+    local category
+    if info.isAddon == true then
+        local authored = tostring(motionMeta.category or "")
+        -- "__"-prefixed names are reserved for the sentinels; an authored
+        -- category must not be able to impersonate "User Import".
+        if string.sub(authored, 1, 2) == "__" then authored = "" end
+        category = authored ~= "" and authored or MMDVMDNPC.CategoryAddonOther
+    else
+        category = MMDVMDNPC.CategoryUserImport
+    end
+
     local meta = {
+        schema = MOTION_META_SCHEMA,
         id = info.id,
         fps = motion.fps or MMDVMDNPC.VMDFPS or 30,
         frameStart = motion.frameStart or 0,
@@ -577,14 +626,23 @@ function MMDVMDNPC.MotionMetadata(motionID)
         duration = motion.duration or 0,
         boneCount = #(motion.boneTracks or {}),
         flexCount = #(motion.flexTracks or {}),
-        displayName = (motion.displayName and motion.displayName ~= "") and motion.displayName or info.id,
-        sourceName = motion.sourceName or "",
-        sourcePath = motion.sourcePath or "",
-        modelPath = motion.modelPath or "",
+        -- The name/source/music strings also come straight from the JSON and
+        -- are netted per entry: clamp them like the meta block.
+        displayName = clamp_meta_string((motion.displayName and motion.displayName ~= "") and motion.displayName or info.id, 256),
+        sourceName = clamp_meta_string(motion.sourceName, 256),
+        sourcePath = clamp_meta_string(motion.sourcePath, 256),
+        modelPath = clamp_meta_string(motion.modelPath, 256),
         modified = modified,
         isAddon = motion.isAddon == true,
-        musicSound = motion.music and motion.music.sound or "",
-        musicSource = motion.music and motion.music.source or "",
+        fromAddon = info.isAddon == true,
+        category = category,
+        englishName = tostring(motionMeta.englishName or ""),
+        artist = tostring(motionMeta.artist or ""),
+        language = tostring(motionMeta.language or ""),
+        link = tostring(motionMeta.link or ""),
+        motionArtist = tostring(motionMeta.motionArtist or ""),
+        musicSound = clamp_meta_string(motion.music and motion.music.sound, 256),
+        musicSource = clamp_meta_string(motion.music and motion.music.source, 256),
         musicSampleRate = motion.music and motion.music.sampleRate or 0,
         musicOffset = motion.defaultAudioOffset or (motion.music and motion.music.offset) or 0,
         hasCamera = motion.camera ~= nil,

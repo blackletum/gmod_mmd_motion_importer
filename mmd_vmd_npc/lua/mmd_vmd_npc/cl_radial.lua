@@ -19,6 +19,9 @@ function MMDVMDNPC.ToggleFavorite(name)
     end
 
     MMDVMDNPC.SaveRadial()
+    -- Every UI showing wheel membership (manager list/button, tool-panel quick
+    -- button) refreshes off this, so they can never disagree about the state.
+    hook.Run("MMDVMDNPCWheelFavoritesChanged")
     return not found
 end
 
@@ -158,24 +161,16 @@ function PANEL:Init()
     self:SetAlpha(0)
     self:AlphaTo(255, 0.1)
 
-    -- Motion favorites only; the Stop button and empty slots are drawn from the
-    -- fixed 9-slot layout, not from this list.
-    self.Motions = {}
-    for _, v in ipairs(MMDVMDNPC.RadialFavorites) do
-        if v ~= "toggle_cam_mode" and v ~= "stop_playback" then
-            self.Motions[#self.Motions + 1] = v
-        end
-    end
-
-    self.PageCount = math.max(1, math.ceil(#self.Motions / MOTIONS_PER_PAGE))
     self.Page = 0
     self.SelectedSlot = 0
     self.Segments = {}
     self.LerpAlpha = {}
 
     -- Larger ring; still derived from the viewport so it and the bottom toggles
-    -- stay on screen at low resolutions.
-    self.OuterRadius = math.min(360, ScrH() * 0.46)
+    -- stay on screen at low resolutions. The ScrH()/2 - 86 term reserves room
+    -- above the ring for the category dropdown (10px margin + 30px combo +
+    -- 46px gap) so it can never sit on the STOP slot's outer rim.
+    self.OuterRadius = math.min(360, ScrH() * 0.46, ScrH() / 2 - 86)
     self.InnerRadius = self.OuterRadius * 0.34
     self.TextRadius = (self.OuterRadius + self.InnerRadius) * 0.5
 
@@ -192,6 +187,102 @@ function PANEL:Init()
     -- imported camera animation (global mmd_vmd_npc_camera_auto option).
     self.CameraBtn = { w = 190, h = 50, hover = 0 }
 
+    -- Category filter above the ring: same categories as the Motion Manager
+    -- (addon categories + User Import), remembered across opens.
+    self.CategoryFilter = cookie and cookie.GetString and cookie.GetString("mmdvmd_wheel_category", "") or ""
+    local combo = vgui.Create("DComboBox", self)
+    self.CategoryCombo = combo
+    combo:SetSize(250, 30)
+    combo:SetPos(cx - 125, math.max(10, cy - self.OuterRadius - 46))
+    combo:SetSortItems(false)
+    combo:SetFont("DermaDefaultBold")
+    combo.OnSelect = function(_, _, _, value)
+        self.CategoryFilter = tostring(value or "")
+        if cookie and cookie.Set then cookie.Set("mmdvmd_wheel_category", self.CategoryFilter) end
+        self.Page = 0
+        self:RebuildMotions()
+    end
+    self:RebuildCategoryCombo()
+
+    self:RebuildMotions()
+
+    -- Categories need the streamed details; ask for them if this client has
+    -- not opened any motion UI yet, and refresh live when they arrive.
+    if MMDVMDNPC.RequestMotionDetails and #(MMDVMDNPC.MotionDetailsOrdered or {}) == 0 then
+        MMDVMDNPC.RequestMotionDetails()
+    end
+    local hookID = "MMDVMDNPCRadialDetails_" .. tostring(self)
+    self.DetailsHookID = hookID
+    hook.Add("MMDVMDNPCMotionDetailsUpdated", hookID, function()
+        if IsValid(self) then
+            self:RebuildCategoryCombo()
+            self:RebuildMotions()
+        end
+    end)
+end
+
+function PANEL:OnRemove()
+    if self.DetailsHookID then
+        hook.Remove("MMDVMDNPCMotionDetailsUpdated", self.DetailsHookID)
+    end
+end
+
+function PANEL:RebuildCategoryCombo()
+    local combo = self.CategoryCombo
+    if not IsValid(combo) then return end
+    -- Never rebuild under an open dropdown (Clear() rips the menu away
+    -- mid-pick); the next details update rebuilds it anyway.
+    if combo.IsMenuOpen and combo:IsMenuOpen() then return end
+    combo:Clear()
+    -- No select flags: AddChoice(select=true) fires OnSelect synchronously,
+    -- which would reset the page and rewrite the cookie on every details
+    -- refresh while the wheel is open. Display the selection via SetValue.
+    combo:AddChoice(WL("mmd_vmd_npc.category.all", "All Categories"), "")
+    local found = (self.CategoryFilter or "") == ""
+    if MMDVMDNPC.MotionCategories then
+        for _, category in ipairs(MMDVMDNPC.MotionCategories()) do
+            found = found or category == self.CategoryFilter
+            local label = MMDVMDNPC.CategoryDisplayName and MMDVMDNPC.CategoryDisplayName(category) or category
+            combo:AddChoice(label, category)
+        end
+    end
+    local function display_name(category)
+        if (category or "") == "" then return WL("mmd_vmd_npc.category.all", "All Categories") end
+        return MMDVMDNPC.CategoryDisplayName and MMDVMDNPC.CategoryDisplayName(category) or category
+    end
+    if found then
+        combo:SetValue(display_name(self.CategoryFilter))
+    elseif #(MMDVMDNPC.MotionDetailsOrdered or {}) == 0 then
+        -- Details not streamed yet: keep the remembered filter (and cookie);
+        -- this runs again when the details arrive and can truly validate it.
+        combo:SetValue(display_name(self.CategoryFilter))
+    else
+        self.CategoryFilter = ""
+        if cookie and cookie.Set then cookie.Set("mmdvmd_wheel_category", "") end
+        combo:SetValue(display_name(""))
+    end
+end
+
+-- Favorites, narrowed to the selected category. The Stop button and empty
+-- slots are drawn from the fixed 9-slot layout, not from this list.
+function PANEL:RebuildMotions()
+    self.Motions = {}
+    local details = MMDVMDNPC.MotionDetails or {}
+    for _, v in ipairs(MMDVMDNPC.RadialFavorites) do
+        if v ~= "toggle_cam_mode" and v ~= "stop_playback" then
+            local meta = details[v]
+            local matches = true
+            if MMDVMDNPC.MotionMatchesCategory then
+                matches = MMDVMDNPC.MotionMatchesCategory(meta, self.CategoryFilter)
+            end
+            if matches then
+                self.Motions[#self.Motions + 1] = v
+            end
+        end
+    end
+
+    self.PageCount = math.max(1, math.ceil(#self.Motions / MOTIONS_PER_PAGE))
+    self.Page = math.Clamp(self.Page or 0, 0, self.PageCount - 1)
     self:RebuildPageNames()
 end
 
@@ -236,9 +327,16 @@ function PANEL:Paint(w, h)
     self.IsOverToggle = isOverToggle
     self.IsOverCamera = isOverCamera
 
+    -- No ring selection while the category dropdown (or its open menu, which
+    -- overlaps the ring) has the mouse: releasing the wheel key mid-pick must
+    -- not fire a slot.
+    local combo = self.CategoryCombo
+    local comboBusy = IsValid(combo)
+        and ((combo.IsMenuOpen and combo:IsMenuOpen()) or combo:IsHovered())
+
     local step = 360 / SLOTS_PER_PAGE
     self.SelectedSlot = 0
-    if dist > innerRadius and dist < outerRadius and not isOverToggle and not isOverCamera then
+    if dist > innerRadius and dist < outerRadius and not isOverToggle and not isOverCamera and not comboBusy then
         local mouseAngle = math.deg(math.atan2(dy, dx)) + 90
         if mouseAngle < 0 then mouseAngle = mouseAngle + 360 end
         local adjustedAngle = (mouseAngle + step / 2) % 360
@@ -289,13 +387,17 @@ function PANEL:Paint(w, h)
         end
     end
 
-    -- Center: page indicator + scroll hint (only when there is more than 1 page).
+    -- Center: page indicator + scroll hint (only when there is more than 1 page),
+    -- or a hint when the current category filter matches nothing on the wheel.
     if self.PageCount > 1 then
         draw.SimpleText(
             string.format(WL("mmd_vmd_npc.radial.page_fmt", "Page %d / %d"), self.Page + 1, self.PageCount),
             "DermaDefaultBold", cx, cy - 9, Color(255, 255, 255), 1, 1)
         draw.SimpleText(WL("mmd_vmd_npc.radial.scroll_hint", "Scroll to switch pages"),
             "DermaDefault", cx, cy + 11, Color(180, 180, 180), 1, 1)
+    elseif #(self.Motions or {}) == 0 and (self.CategoryFilter or "") ~= "" then
+        draw.SimpleText(WL("mmd_vmd_npc.radial.category_empty", "No wheel dances in this category"),
+            "DermaDefault", cx, cy, Color(180, 180, 180), 1, 1)
     end
 
     -- Follow toggle

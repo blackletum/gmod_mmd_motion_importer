@@ -2934,6 +2934,31 @@ def build_motion_json_flex_tracks(vmd_path: Path) -> list[dict[str, object]]:
     return flexes
 
 
+# Column order of the importer's metadata table; also the canonical key set of
+# the motion JSON's "meta" block read by the GMod addon (sv_cache read_motion_file).
+MOTION_META_FIELDS = (
+    "category",
+    "display_name",
+    "english_name",
+    "artist",
+    "language",
+    "link",
+    "motion_artist",
+)
+
+
+def normalize_motion_meta(meta: dict | None, fallback_display_name: str) -> dict[str, str]:
+    """Coerce a user-supplied metadata mapping to the canonical string-only meta
+    block. Every canonical key is always present (empty string when unknown) so
+    downstream readers never need existence checks; display_name falls back to
+    the computed display name so the block is self-sufficient."""
+    source = meta or {}
+    block = {key: str(source.get(key) or "").strip() for key in MOTION_META_FIELDS}
+    if not block["display_name"]:
+        block["display_name"] = fallback_display_name
+    return block
+
+
 def write_motion_json(
     rotation_json_path: Path,
     output_dir: Path,
@@ -2945,6 +2970,7 @@ def write_motion_json(
     is_addon: bool = False,
     progress: ProgressCallback | None = None,
     camera_track: dict | None = None,
+    meta: dict | None = None,
 ) -> Path:
     if not rotation_json_path.exists():
         raise FileNotFoundError(rotation_json_path)
@@ -2976,9 +3002,12 @@ def write_motion_json(
             parsed["music"]["default_offset"] = offset
 
     display_name = motion_display_name(motion_name_source)
+    meta_block = normalize_motion_meta(meta, display_name)
+    display_name = meta_block["display_name"]
     parsed["motion_id"] = motion_id_with_vmd_hash(motion_name_source, flex_vmd_path)
     parsed["motion_name"] = display_name
     parsed["display_name"] = display_name
+    parsed["meta"] = meta_block
     if is_addon:
         parsed["is_addon"] = True
 

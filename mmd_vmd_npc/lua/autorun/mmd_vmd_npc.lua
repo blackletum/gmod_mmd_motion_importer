@@ -40,6 +40,7 @@ if SERVER then
     util.AddNetworkString("mmdvmd_stop_npc_playbacks_request")
     util.AddNetworkString("mmdvmd_force_self_reset_request")
     util.AddNetworkString("mmdvmd_play_status")
+    util.AddNetworkString("mmdvmd_chat_notice")
     util.AddNetworkString("mmdvmd_clear_built_request")
     util.AddNetworkString("mmdvmd_clear_built_done")
     util.AddNetworkString("mmdvmd_delete_motion_request")

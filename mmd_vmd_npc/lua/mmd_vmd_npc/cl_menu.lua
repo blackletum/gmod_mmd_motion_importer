@@ -35,26 +35,42 @@ local function LF(key, ...)
     return MMDVMDNPC.LFormat and MMDVMDNPC.LFormat(key, ...) or string.format(L(key, key), ...)
 end
 
-surface.CreateFont("MMDVMDNPCManagerText", {
-    font = "Tahoma",
-    size = 18,
-    weight = 500,
-    extended = true,
-})
+-- User-adjustable size for the Motion Manager and Raw Animation Debug windows.
+CreateClientConVar("mmd_vmd_npc_menu_scale", "1", true, false, "Size multiplier for the Motion Manager and debug windows")
 
-surface.CreateFont("MMDVMDNPCManagerTextBold", {
-    font = "Tahoma",
-    size = 18,
-    weight = 700,
-    extended = true,
-})
+function MMDVMDNPC.MenuScale()
+    local cv = GetConVar("mmd_vmd_npc_menu_scale")
+    return math.Clamp(cv and cv:GetFloat() or 1, 0.6, 2.0)
+end
 
-surface.CreateFont("MMDVMDNPCManagerDetails", {
-    font = "Tahoma",
-    size = 17,
-    weight = 500,
-    extended = true,
-})
+-- Named fonts, recreated at (base size * menu scale). Recreating a font under the
+-- same name updates every widget that references it by name on the next paint, so
+-- changing the scale live-resizes the manager/debug text without rebuilding panels.
+local MENU_FONT_BASE = {
+    MMDVMDNPCManagerText = { size = 18, weight = 500 },
+    MMDVMDNPCManagerTextBold = { size = 18, weight = 700 },
+    MMDVMDNPCManagerDetails = { size = 17, weight = 500 },
+    MMDVMDNPCDebugText = { size = 15, weight = 500 },
+    MMDVMDNPCDebugBold = { size = 15, weight = 700 },
+}
+
+local function rebuild_menu_fonts()
+    local scale = MMDVMDNPC.MenuScale()
+    for name, def in pairs(MENU_FONT_BASE) do
+        surface.CreateFont(name, {
+            font = "Tahoma",
+            size = math.max(8, math.floor(def.size * scale + 0.5)),
+            weight = def.weight,
+            extended = true,
+        })
+    end
+end
+rebuild_menu_fonts()
+if cvars and cvars.AddChangeCallback then
+    cvars.AddChangeCallback("mmd_vmd_npc_menu_scale", function()
+        rebuild_menu_fonts()
+    end, "MMDVMDNPCMenuScaleFonts")
+end
 
 local function set_manager_font(panel, fontName)
     if IsValid(panel) and panel.SetFont then
@@ -70,7 +86,7 @@ end
 
 local function style_manager_list_line(line)
     if not IsValid(line) then return end
-    if line.SetTall then line:SetTall(30) end
+    if line.SetTall then line:SetTall(math.floor(30 * MMDVMDNPC.MenuScale())) end
     if line.Columns then
         for _, label in ipairs(line.Columns) do
             set_manager_font(label, "MMDVMDNPCManagerText")
@@ -102,10 +118,25 @@ CreateClientConVar("mmd_vmd_npc_music_fade", "300", true, false, L("mmd_vmd_npc.
 CreateClientConVar("mmd_vmd_npc_loop_playback", "0", true, false, L("mmd_vmd_npc.ui.loop_playback"))
 CreateClientConVar("mmd_vmd_npc_build_frames_per_batch", tostring(MMDVMDNPC.DefaultBuildFramesPerBatch or 16), true, false, L("mmd_vmd_npc.ui.build_frames_per_batch"))
 CreateClientConVar("mmd_vmd_npc_playback_hz", tostring(MMDVMDNPC.DefaultPlaybackHz or 120), true, false, L("mmd_vmd_npc.ui.playback_updates_per_second"))
+CreateClientConVar("mmd_vmd_npc_hide_hud", "1", true, false, L("mmd_vmd_npc.ui.hide_hud"))
+CreateClientConVar("mmd_vmd_npc_hide_hud_key", "0", true, false, "Key code that toggles hiding the HUD during camera motion")
 CreateClientConVar("mmd_vmd_npc_flex_scale_all", "1", true, false, L("mmd_vmd_npc.debug.flex_scale_all"))
 CreateClientConVar("mmd_vmd_npc_flex_scale_eye", "1", true, false, L("mmd_vmd_npc.debug.flex_scale_eye"))
 CreateClientConVar("mmd_vmd_npc_flex_scale_brow", "1", true, false, L("mmd_vmd_npc.debug.flex_scale_brow"))
 CreateClientConVar("mmd_vmd_npc_flex_scale_mouth", "1", true, false, L("mmd_vmd_npc.debug.flex_scale_mouth"))
+
+-- Server-driven chat notices. Warnings print in red and play an alert sound so a
+-- glanced-away user still notices (e.g. the AI-not-disabled reminder).
+net.Receive("mmdvmd_chat_notice", function()
+    local message = net.ReadString()
+    local isWarning = net.ReadBool()
+    if isWarning then
+        chat.AddText(Color(255, 70, 70), "[MMD VMD] ", Color(255, 150, 150), message)
+        surface.PlaySound("buttons/button10.wav")
+    else
+        chat.AddText(Color(120, 200, 255), "[MMD VMD] ", color_white, message)
+    end
+end)
 
 local selected_options
 local play_ui_cue
@@ -367,10 +398,21 @@ net.Receive("mmdvmd_list_response", function()
     end
 end)
 
+-- Details arrive in chunks (64KB net cap; see sv_commands send_motion_details).
+-- Accumulate into a pending buffer and only swap the live tables + fire the
+-- update hook on the final chunk, so the UI never renders a half list.
+local pendingMotionDetails = nil
+
 net.Receive("mmdvmd_motion_details_response", function()
+    local reset = net.ReadBool()
+    local done = net.ReadBool()
     local count = net.ReadUInt(16)
-    local details = {}
-    local ordered = {}
+
+    if reset or not pendingMotionDetails then
+        pendingMotionDetails = { details = {}, ordered = {} }
+    end
+    local details = pendingMotionDetails.details
+    local ordered = pendingMotionDetails.ordered
 
     for _ = 1, count do
         local id = net.ReadString()
@@ -384,22 +426,65 @@ net.Receive("mmdvmd_motion_details_response", function()
             duration = net.ReadFloat(),
             boneCount = net.ReadUInt(16),
             flexCount = net.ReadUInt(16),
-            modified = net.ReadFloat(),
+            modified = net.ReadUInt(32),
             sourceName = net.ReadString(),
             musicSound = net.ReadString(),
             musicSource = net.ReadString(),
             isAddon = net.ReadBool(),
             built = net.ReadBool(),
             hasCamera = net.ReadBool(),
+            fromAddon = net.ReadBool(),
+            category = net.ReadString(),
+            englishName = net.ReadString(),
+            artist = net.ReadString(),
+            language = net.ReadString(),
+            link = net.ReadString(),
+            motionArtist = net.ReadString(),
         }
         details[id] = meta
         ordered[#ordered + 1] = meta
     end
 
+    if not done then return end
+    pendingMotionDetails = nil
     MMDVMDNPC.MotionDetails = details
     MMDVMDNPC.MotionDetailsOrdered = ordered
     hook.Run("MMDVMDNPCMotionDetailsUpdated", ordered, details)
 end)
+
+-- The distinct categories present in the current details, for filter dropdowns:
+-- User Import first, authored addon categories alphabetical, addon-other last.
+function MMDVMDNPC.MotionCategories()
+    local seen, authored = {}, {}
+    local hasUser, hasOther = false, false
+    for _, meta in ipairs(MMDVMDNPC.MotionDetailsOrdered or {}) do
+        local category = tostring(meta.category or "")
+        if category == "" or category == MMDVMDNPC.CategoryUserImport then
+            hasUser = true
+        elseif category == MMDVMDNPC.CategoryAddonOther then
+            hasOther = true
+        elseif not seen[category] then
+            seen[category] = true
+            authored[#authored + 1] = category
+        end
+    end
+    table.sort(authored, function(a, b) return string.lower(a) < string.lower(b) end)
+    local out = {}
+    if hasUser then out[#out + 1] = MMDVMDNPC.CategoryUserImport end
+    for _, category in ipairs(authored) do out[#out + 1] = category end
+    if hasOther then out[#out + 1] = MMDVMDNPC.CategoryAddonOther end
+    return out
+end
+
+-- Shared filter predicate: does this motion belong to the selected category?
+-- "" or "*" means All.
+function MMDVMDNPC.MotionMatchesCategory(meta, category)
+    category = tostring(category or "")
+    if category == "" or category == "*" then return true end
+    local own = tostring(istable(meta) and meta.category or "")
+    if own == "" then own = MMDVMDNPC.CategoryUserImport end
+    return own == category
+end
 
 net.Receive("mmdvmd_pause_status_response", function()
     MMDVMDNPC.PauseStatus = {
@@ -1123,12 +1208,28 @@ local function clear_local_playback_pose(ent, built)
     setup_bones_now(ent)
 end
 
+-- Mirror of the server's root-motion split (sv_commands apply_built_sample). The
+-- server carries the pelvis horizontal on the entity origin via SetPos (which
+-- networks and interpolates to us) and keeps only the vertical in the pelvis bone
+-- manipulation. This client-side interpolated poser overrides the pelvis manip
+-- locally every frame, so if it kept the full horizontal it would stack on top of
+-- the networked origin and render the model at DOUBLE the travel. Read the mode
+-- from the replicated server convar and zero the horizontal to match; we must NOT
+-- SetPos here (the origin is server-owned; a client SetPos is overwritten by the
+-- next snapshot's interpolation and only causes jitter).
+local function root_motion_origin_active()
+    local cv = GetConVar("mmd_vmd_npc_root_motion_origin")
+    if cv == nil then return true end -- default-on; fail toward "no double offset"
+    return cv:GetBool()
+end
+
 local function apply_local_built_sample(ent, frameA, frameB, fraction, pelvisZOffset)
     frameA = frameA or {}
     frameB = frameB or frameA
     fraction = math.Clamp(tonumber(fraction) or 0, 0, 1)
     pelvisZOffset = tonumber(pelvisZOffset) or 0
     local pelvisBone = ent.LookupBone and ent:LookupBone(SOURCE_PELVIS) or nil
+    local rootMotion = root_motion_origin_active()
 
     for index, boneA in ipairs(frameA.bones or {}) do
         local boneB = (frameB.bones or {})[index] or boneA
@@ -1149,6 +1250,10 @@ local function apply_local_built_sample(ent, frameA, frameB, fraction, pelvisZOf
                 )
                 if pelvisBone and bone == pelvisBone then
                     pos.z = pos.z + pelvisZOffset
+                    if rootMotion then
+                        pos.x = 0
+                        pos.y = 0
+                    end
                 end
                 ent:ManipulateBonePosition(bone, pos)
             end
@@ -2665,21 +2770,51 @@ end
 -- skin's default (also light) text colour and become nearly invisible on it.
 -- Paint a known dark body under the content and force light text so the debug
 -- readouts are legible regardless of the active Derma skin.
-local DEBUG_TEXT_COLOR = Color(226, 231, 238)
+-- Light body + black text: a dark body left every UNstyled child widget
+-- (checkbox labels, combo boxes, list headers) rendering the skin's dark default
+-- text on a dark background, i.e. invisible. A light body makes every widget —
+-- styled or not — readable, and styled labels below use near-black text.
+local DEBUG_TEXT_COLOR = Color(20, 20, 20)
 
 local function paint_dark_frame_body(self, w, h)
     derma.SkinHook("Paint", "Frame", self, w, h)
-    surface.SetDrawColor(34, 38, 46, 255)
+    surface.SetDrawColor(236, 238, 242, 255)
     surface.DrawRect(4, 24, w - 8, h - 28)
 end
 
-local function style_debug_label(panel, color)
-    if IsValid(panel) and panel.SetTextColor then
-        panel:SetTextColor(color or DEBUG_TEXT_COLOR)
+local function style_debug_label(panel, color, bold)
+    if not IsValid(panel) then return end
+    local font = bold and "MMDVMDNPCDebugBold" or "MMDVMDNPCDebugText"
+    if panel.SetTextColor then panel:SetTextColor(color or DEBUG_TEXT_COLOR) end
+    if panel.SetFont then panel:SetFont(font) end
+    if panel.Label then
+        if panel.Label.SetTextColor then panel.Label:SetTextColor(color or DEBUG_TEXT_COLOR) end
+        if panel.Label.SetFont then panel.Label:SetFont(font) end
     end
-    if IsValid(panel) and panel.Label and panel.Label.SetTextColor then
-        panel.Label:SetTextColor(color or DEBUG_TEXT_COLOR)
+end
+
+-- Scale a debug DListView: row height + bold column headers track the menu scale.
+local function style_debug_list(list)
+    if not IsValid(list) then return end
+    if list.SetDataHeight then list:SetDataHeight(math.floor(18 * MMDVMDNPC.MenuScale())) end
+    if list.Columns then
+        for _, col in ipairs(list.Columns) do
+            if IsValid(col) then
+                if col.SetFont then col:SetFont("MMDVMDNPCDebugBold") end
+                if col.Header and IsValid(col.Header) and col.Header.SetFont then col.Header:SetFont("MMDVMDNPCDebugBold") end
+            end
+        end
     end
+end
+
+-- Apply the scaled debug font to a freshly added DListView row's cells.
+local function style_debug_list_line(line)
+    if IsValid(line) and line.Columns then
+        for _, cell in ipairs(line.Columns) do
+            if IsValid(cell) and cell.SetFont then cell:SetFont("MMDVMDNPCDebugText") end
+        end
+    end
+    return line
 end
 
 function MMDVMDNPC.CloseCameraDebugPanel()
@@ -2726,7 +2861,8 @@ function MMDVMDNPC.OpenCameraDebugPanel(debugFrame)
     end
     panel:SetTitle(LF("mmd_vmd_npc.camera.debug_title_fmt", motionID))
     panel.Paint = paint_dark_frame_body
-    panel:SetSize(math.min(420, ScrW() - 40), math.min(430, ScrH() - 40))
+    local cameraMenuScale = MMDVMDNPC.MenuScale()
+    panel:SetSize(math.min(math.floor(420 * cameraMenuScale), ScrW() - 40), math.min(math.floor(430 * cameraMenuScale), ScrH() - 40))
     panel:SetPos(24, math.floor(ScrH() * 0.2))
     panel:SetSizable(true)
     panel:SetDeleteOnClose(true)
@@ -2753,7 +2889,7 @@ function MMDVMDNPC.OpenCameraDebugPanel(debugFrame)
     help:SetTall(48)
     help:SetWrap(true)
     help:SetText(L("mmd_vmd_npc.camera.debug_help"))
-    style_debug_label(help, Color(180, 190, 205))
+    style_debug_label(help, Color(70, 70, 70))
 
     local scroll = vgui.Create("DScrollPanel", panel)
     scroll:Dock(FILL)
@@ -2864,7 +3000,8 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
         MMDVMDNPC.DebugFrame = frame
         local screenW = ScrW and ScrW() or 1280
         local screenH = ScrH and ScrH() or 720
-        frame:SetSize(math.min(screenW - 40, 1360), math.min(screenH - 40, 800))
+        local menuScale = MMDVMDNPC.MenuScale()
+        frame:SetSize(math.min(screenW - 40, math.floor(1360 * menuScale)), math.min(screenH - 40, math.floor(800 * menuScale)))
         frame:Center()
         frame:MakePopup()
         frame.Paint = paint_dark_frame_body
@@ -2875,9 +3012,9 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
         frame.TargetModelLabel = vgui.Create("DLabel", frame)
         frame.TargetModelLabel:Dock(TOP)
         frame.TargetModelLabel:DockMargin(8, 6, 8, 0)
-        frame.TargetModelLabel:SetTall(22)
-        frame.TargetModelLabel:SetTextColor(Color(80, 170, 255))
-        frame.TargetModelLabel:SetFont("DermaDefaultBold")
+        frame.TargetModelLabel:SetTall(math.floor(22 * MMDVMDNPC.MenuScale()))
+        frame.TargetModelLabel:SetTextColor(Color(30, 90, 170))
+        frame.TargetModelLabel:SetFont("MMDVMDNPCDebugBold")
         frame.TargetModelLabel:SetText(L("mmd_vmd_npc.debug.selected_model_none"))
 
         frame.Summary = vgui.Create("DLabel", frame)
@@ -2908,6 +3045,8 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
         frame.FlexRows:AddColumn(L("mmd_vmd_npc.debug.column_weight"))
         frame.FlexRows:AddColumn(L("mmd_vmd_npc.debug.column_scaled_weight"))
         frame.FlexRows:AddColumn(L("mmd_vmd_npc.debug.column_target"))
+        style_debug_list(frame.Rows)
+        style_debug_list(frame.FlexRows)
         frame.FlexRows.OnRowSelected = function(_, _, line)
             if not IsValid(frame.UnresolvedMorphCombo) or not line then return end
             local mmd = line:GetColumnText(1)
@@ -3290,7 +3429,7 @@ net.Receive("mmdvmd_debug_response", function()
 
     frame.Rows:Clear()
     for _, row in ipairs(rows) do
-        frame.Rows:AddLine(
+        style_debug_list_line(frame.Rows:AddLine(
             row.mmd,
             row.source,
             row.role,
@@ -3300,19 +3439,19 @@ net.Receive("mmdvmd_debug_response", function()
             fmt_vec(row.px, row.py, row.pz),
             row.disabled and "disabled"
                 or (row.resolved and fmt_angle(row.p, row.localYaw, row.r) or "unresolved")
-        )
+        ))
     end
 
     if IsValid(frame.FlexRows) then
         frame.FlexRows:Clear()
         for _, row in ipairs(flexRows) do
-            frame.FlexRows:AddLine(
+            style_debug_list_line(frame.FlexRows:AddLine(
                 row.mmd,
                 row.source,
                 fmt_num(row.weight),
                 fmt_num(row.scaledWeight ~= nil and row.scaledWeight or scaled_flex_weight(row)),
                 row.resolved and (tostring(row.resolvedName or "") .. " #" .. tostring(row.flexID)) or "unresolved"
-            )
+            ))
         end
     end
     refresh_flex_override_controls(frame, flexRows, targetEntIndex)
@@ -3975,18 +4114,21 @@ end)
 local function open_motion_browser()
     local frame = vgui.Create("DFrame")
     frame:SetTitle(L("mmd_vmd_npc.manager.title"))
-    local maxWidth = math.max(760, ScrW() - 80)
-    local maxHeight = math.max(560, ScrH() - 80)
-    local frameWidth = math.min(1180, maxWidth)
-    local frameHeight = math.min(760, maxHeight)
-    if maxWidth >= 900 then frameWidth = math.max(900, frameWidth) end
-    if maxHeight >= 620 then frameHeight = math.max(620, frameHeight) end
+    local menuScale = MMDVMDNPC.MenuScale()
+    local frameWidth = math.Clamp(math.floor(1180 * menuScale), 640, ScrW() - 40)
+    local frameHeight = math.Clamp(math.floor(760 * menuScale), 460, ScrH() - 40)
     frame:SetSize(frameWidth, frameHeight)
     if frame.SetSizable then frame:SetSizable(true) end
     if frame.SetMinWidth then frame:SetMinWidth(math.min(980, frameWidth)) end
     if frame.SetMinHeight then frame:SetMinHeight(math.min(660, frameHeight)) end
     frame:Center()
     frame:MakePopup()
+
+    -- Category filter state persists across opens (cookie, not convar, to keep
+    -- the console namespace clean). "" = all categories.
+    local categoryFilter = cookie and cookie.GetString and cookie.GetString("mmdvmd_manager_category", "") or ""
+    local schedule_populate   -- coalesced populate; assigned below
+    local rebuild_category_combo
 
     local top = vgui.Create("DPanel", frame)
     top:Dock(TOP)
@@ -3995,11 +4137,58 @@ local function open_motion_browser()
     local refresh = vgui.Create("DButton", top)
     refresh:Dock(RIGHT)
     refresh:SetZPos(1)
+    refresh:DockMargin(8, 8, 0, 8)
     style_manager_button(refresh, 150)
     refresh:SetText(L("mmd_vmd_npc.manager.refresh"))
     refresh.DoClick = function()
         request_list()
         request_motion_details()
+    end
+
+    local categoryCombo = vgui.Create("DComboBox", top)
+    categoryCombo:Dock(LEFT)
+    categoryCombo:SetZPos(2)
+    categoryCombo:SetWide(math.floor(220 * menuScale))
+    categoryCombo:DockMargin(0, 8, 8, 8)
+    categoryCombo:SetSortItems(false)
+    set_manager_font(categoryCombo, "MMDVMDNPCManagerText")
+    categoryCombo.OnSelect = function(_, _, _, value)
+        categoryFilter = tostring(value or "")
+        if cookie and cookie.Set then cookie.Set("mmdvmd_manager_category", categoryFilter) end
+        if schedule_populate then schedule_populate() end
+    end
+
+    rebuild_category_combo = function()
+        if not IsValid(categoryCombo) then return end
+        -- Never rebuild under an open dropdown (Clear() would rip the menu
+        -- away mid-pick); the next details update rebuilds it anyway.
+        if categoryCombo.IsMenuOpen and categoryCombo:IsMenuOpen() then return end
+        categoryCombo:Clear()
+        -- Choices are added WITHOUT the select flag: AddChoice(select=true)
+        -- fires OnSelect synchronously, which would rewrite the cookie and
+        -- re-populate as a side effect of every rebuild. Display via SetValue.
+        categoryCombo:AddChoice(L("mmd_vmd_npc.category.all", "All Categories"), "")
+        local found = categoryFilter == "" or categoryFilter == "*"
+        for _, category in ipairs(MMDVMDNPC.MotionCategories()) do
+            found = found or category == categoryFilter
+            categoryCombo:AddChoice(MMDVMDNPC.CategoryDisplayName(category), category)
+        end
+        if found then
+            categoryCombo:SetValue(categoryFilter == "" and L("mmd_vmd_npc.category.all", "All Categories")
+                or MMDVMDNPC.CategoryDisplayName(categoryFilter))
+        elseif #(MMDVMDNPC.MotionDetailsOrdered or {}) == 0 then
+            -- Details not streamed yet: KEEP the remembered filter (do not
+            -- wipe the cookie); this rebuild runs again when details arrive
+            -- and can then genuinely validate it.
+            categoryCombo:SetValue(MMDVMDNPC.CategoryDisplayName(categoryFilter))
+        else
+            -- The remembered category truly no longer exists (addon
+            -- unmounted): fall back to All instead of filtering everything out.
+            categoryFilter = ""
+            if cookie and cookie.Set then cookie.Set("mmdvmd_manager_category", "") end
+            categoryCombo:SetValue(L("mmd_vmd_npc.category.all", "All Categories"))
+            if schedule_populate then schedule_populate() end
+        end
     end
 
     -- FILL panels must dock after their edge-docked siblings; docking order in
@@ -4009,32 +4198,33 @@ local function open_motion_browser()
     local search = vgui.Create("DTextEntry", top)
     search:Dock(FILL)
     search:SetZPos(10)
+    search:DockMargin(0, 8, 0, 8)
     search:SetPlaceholderText(L("mmd_vmd_npc.manager.search_placeholder"))
     set_manager_font(search, "MMDVMDNPCManagerText")
 
     local list = vgui.Create("DListView", frame)
     list:Dock(FILL)
     list:SetZPos(100)
-    -- Min widths (not fixed) so the ten columns always share the available
-    -- width instead of summing past the frame and clipping the rightmost ones;
-    -- DListView has no horizontal scrollbar.
+    -- Min widths (not fixed) so the columns always share the available width
+    -- instead of summing past the frame and clipping the rightmost ones;
+    -- DListView has no horizontal scrollbar. Bone/flex counts and the raw
+    -- addon flag moved to the details pane — the list keeps what you scan for.
     local columns = {
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_motion_id")), 150 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_duration")), 66 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_frames")), 66 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_bones")), 56 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_flexes")), 56 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_music")), 56 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_camera")), 56 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_addon")), 72 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_built")), 66 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_wheel")), 60 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_motion_id")), 170 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_category")), 105 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_duration")), 64 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_frames")), 64 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_music")), 52 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_camera")), 52 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_built")), 64 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_wheel")), 56 },
     }
+    local WHEEL_COLUMN = 8
     for _, columnInfo in ipairs(columns) do
         local column, width = columnInfo[1], columnInfo[2]
         if IsValid(column) and column.SetMinWidth then column:SetMinWidth(width) end
     end
-    if list.SetDataHeight then list:SetDataHeight(30) end
+    if list.SetDataHeight then list:SetDataHeight(math.floor(30 * MMDVMDNPC.MenuScale())) end
     if IsValid(list.Header) and list.Header.SetTall then list.Header:SetTall(32) end
     for _, column in ipairs(list.Columns or {}) do
         if IsValid(column.Header) then
@@ -4049,6 +4239,50 @@ local function open_motion_browser()
     details:SetWrap(true)
     set_manager_font(details, "MMDVMDNPCManagerDetails")
     details:SetText(L("mmd_vmd_npc.manager.select_motion_details"))
+
+    -- One-line descriptive metadata (importer's 7-field table) + source link.
+    -- Hidden until a motion with any of those fields is selected.
+    local metaPanel = vgui.Create("DPanel", frame)
+    metaPanel:Dock(BOTTOM)
+    metaPanel:SetTall(28)
+    metaPanel:SetPaintBackground(false)
+    metaPanel:SetVisible(false)
+
+    local metaLink = vgui.Create("DButton", metaPanel)
+    metaLink:Dock(RIGHT)
+    style_manager_button(metaLink, 130)
+    metaLink:SetText(L("mmd_vmd_npc.manager.open_link", "Open Link"))
+    metaLink.MetaURL = ""
+    metaLink.DoClick = function(self)
+        if self.MetaURL ~= "" then gui.OpenURL(self.MetaURL) end
+    end
+
+    local metaLabel = vgui.Create("DLabel", metaPanel)
+    metaLabel:Dock(FILL)
+    set_manager_font(metaLabel, "MMDVMDNPCManagerDetails")
+    metaLabel:SetText("")
+
+    local function update_meta_panel(meta)
+        if not IsValid(metaPanel) then return end
+        meta = meta or {}
+        local parts = {}
+        local function add(labelKey, fallback, value)
+            value = tostring(value or "")
+            if value ~= "" then
+                parts[#parts + 1] = L(labelKey, fallback) .. ": " .. value
+            end
+        end
+        add("mmd_vmd_npc.meta.category", "Category", meta.category and meta.category ~= "" and MMDVMDNPC.CategoryDisplayName(meta.category) or "")
+        add("mmd_vmd_npc.meta.english_name", "English", meta.englishName)
+        add("mmd_vmd_npc.meta.artist", "Artist", meta.artist)
+        add("mmd_vmd_npc.meta.language", "Language", meta.language)
+        add("mmd_vmd_npc.meta.motion_artist", "Motion Artist", meta.motionArtist)
+        local link = tostring(meta.link or "")
+        metaLink.MetaURL = link
+        metaLink:SetVisible(link ~= "")
+        metaLabel:SetText(table.concat(parts, "    "))
+        metaPanel:SetVisible(#parts > 0 or link ~= "")
+    end
 
     local audioPanel = vgui.Create("DPanel", frame)
     audioPanel:Dock(BOTTOM)
@@ -4153,48 +4387,101 @@ local function open_motion_browser()
     local selectedMotion = nil
     local selectedMeta = nil
     local update_wheel_button -- assigned after the wheel button is created
+    local toggle_wheel_for    -- assigned after the wheel button is created
+    local lastPopulateSignature = nil
 
-    local function populate(motions)
+    local function wheel_cell_text(motionID)
+        local inWheel = MMDVMDNPC.IsFavorite and MMDVMDNPC.IsFavorite(motionID) or false
+        return inWheel and "★" or "☆", inWheel
+    end
+
+    local function populate()
         if not IsValid(list) then return end
-        local previouslySelected = selectedMotion
-        list:Clear()
         local query = string.lower(search:GetValue() or "")
         local rows = MMDVMDNPC.MotionDetailsOrdered or {}
         if #rows <= 0 then
-            for _, id in ipairs(motions or MMDVMDNPC.ClientMotions or {}) do
+            -- Details not streamed yet: show bare ids so the menu is usable
+            -- immediately (a fresh array — never mutate the shared cache table).
+            rows = {}
+            for _, id in ipairs(MMDVMDNPC.ClientMotions or {}) do
                 rows[#rows + 1] = { id = id }
             end
         end
 
-        local reselectLine = nil
+        -- Filter first and fingerprint the visible result: rebuilding hundreds
+        -- of Derma rows on every status hook is the menu's main cost, and most
+        -- hook fires change nothing the list shows.
+        local visible = {}
+        local signature = { categoryFilter, query }
         for _, meta in ipairs(rows) do
-            local displayName = motion_display_name(meta)
-            local haystack = string.lower(table.concat({
-                meta.id or "",
-                displayName,
-                meta.sourceName or "",
-                meta.musicSound or "",
-            }, " "))
-            if query == "" or string.find(haystack, query, 1, true) then
-                local inWheel = MMDVMDNPC.IsFavorite and MMDVMDNPC.IsFavorite(meta.id) or false
-                local line = list:AddLine(
+            if MMDVMDNPC.MotionMatchesCategory(meta, categoryFilter) then
+                local displayName = motion_display_name(meta)
+                local haystack = string.lower(table.concat({
+                    meta.id or "",
                     displayName,
-                    string.format("%.2fs", tonumber(meta.duration) or 0),
-                    tostring(meta.frameCount or ((meta.frameEnd or 0) - (meta.frameStart or 0) + 1)),
-                    tostring(meta.boneCount or 0),
-                    tostring(meta.flexCount or 0),
-                    (meta.musicSound and meta.musicSound ~= "") and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
-                    meta.hasCamera and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
-                    meta.isAddon and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
-                    meta.built and L("mmd_vmd_npc.ui.built") or L("mmd_vmd_npc.ui.missing"),
-                    inWheel and ("★ " .. L("mmd_vmd_npc.ui.yes")) or L("mmd_vmd_npc.ui.no")
-                )
-                line.MotionID = meta.id
-                line.Meta = meta
-                style_manager_list_line(line)
-                if previouslySelected and tostring(meta.id) == tostring(previouslySelected) then
-                    reselectLine = line
+                    meta.englishName or "",
+                    meta.artist or "",
+                    meta.motionArtist or "",
+                    meta.sourceName or "",
+                    meta.musicSound or "",
+                }, " "))
+                if query == "" or string.find(haystack, query, 1, true) then
+                    local wheelText = wheel_cell_text(meta.id)
+                    visible[#visible + 1] = { meta = meta, displayName = displayName, wheelText = wheelText }
+                    -- Everything a row DISPLAYS (or hands to update_selection
+                    -- via line.Meta) must be part of the fingerprint, or a
+                    -- re-import with unchanged id would never refresh the row.
+                    -- meta.modified (file mtime) covers all content changes.
+                    signature[#signature + 1] = table.concat({
+                        tostring(meta.id), displayName, tostring(meta.built),
+                        wheelText, tostring(meta.category or ""),
+                        tostring(meta.modified or ""), tostring(meta.duration or ""),
+                        tostring(meta.frameCount or ""), tostring(meta.musicSound or ""),
+                        tostring(meta.hasCamera),
+                    }, "\1")
                 end
+            end
+        end
+        local signatureText = table.concat(signature, "\2")
+        if signatureText == lastPopulateSignature then return end
+        lastPopulateSignature = signatureText
+
+        local previouslySelected = selectedMotion
+        list:Clear()
+        local reselectLine = nil
+        for _, row in ipairs(visible) do
+            local meta = row.meta
+            local line = list:AddLine(
+                row.displayName,
+                -- nil category = details not streamed yet; show blank, not a
+                -- confident (and possibly wrong) "User Import".
+                meta.category and MMDVMDNPC.CategoryDisplayName(meta.category) or "",
+                string.format("%.2fs", tonumber(meta.duration) or 0),
+                tostring(meta.frameCount or ((meta.frameEnd or 0) - (meta.frameStart or 0) + 1)),
+                (meta.musicSound and meta.musicSound ~= "") and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
+                meta.hasCamera and L("mmd_vmd_npc.ui.yes") or L("mmd_vmd_npc.ui.no"),
+                meta.built and L("mmd_vmd_npc.ui.built") or L("mmd_vmd_npc.ui.missing"),
+                row.wheelText
+            )
+            line.MotionID = meta.id
+            line.Meta = meta
+            style_manager_list_line(line)
+            -- The wheel cell is a one-click toggle: no hunting for the button
+            -- below when curating the wheel from a long list.
+            local wheelCell = line.Columns and line.Columns[WHEEL_COLUMN]
+            if IsValid(wheelCell) then
+                wheelCell:SetMouseInputEnabled(true)
+                wheelCell:SetCursor("hand")
+                wheelCell:SetTooltip(L("mmd_vmd_npc.manager.wheel_toggle_tip", "Click to add or remove this dance on the wheel"))
+                wheelCell.OnMousePressed = function(_, code)
+                    if code ~= MOUSE_LEFT then return end
+                    list:ClearSelection()
+                    list:SelectItem(line)
+                    if toggle_wheel_for then toggle_wheel_for(meta.id) end
+                end
+            end
+            if previouslySelected and tostring(meta.id) == tostring(previouslySelected) then
+                reselectLine = line
             end
         end
 
@@ -4208,7 +4495,22 @@ local function open_motion_browser()
             if IsValid(details) then
                 details:SetText(L("mmd_vmd_npc.manager.select_motion_details"))
             end
+            update_meta_panel(nil)
+            if update_wheel_button then update_wheel_button() end
+            if IsValid(offsetEntry) then offsetEntry:SetValue(0) end
         end
+    end
+
+    -- Hooks fire in bursts (list + details + status all refresh around a single
+    -- action); coalesce to at most one Derma rebuild per frame.
+    local populateQueued = false
+    schedule_populate = function()
+        if populateQueued then return end
+        populateQueued = true
+        timer.Simple(0, function()
+            populateQueued = false
+            if IsValid(frame) then populate() end
+        end)
     end
 
     local function update_selection(line)
@@ -4235,6 +4537,7 @@ local function open_motion_browser()
             tostring(meta.sourceName or "")
         ))
         offsetEntry:SetValue(tonumber(MMDVMDNPC.AudioOffsets[selectedMotion or ""]) or 0)
+        update_meta_panel(meta)
         if update_wheel_button then update_wheel_button() end
     end
 
@@ -4250,7 +4553,7 @@ local function open_motion_browser()
     end
 
     search.OnChange = function()
-        populate()
+        schedule_populate()
     end
 
     local controls = vgui.Create("DPanel", frame)
@@ -4299,25 +4602,49 @@ local function open_motion_browser()
             and MMDVMDNPC.IsFavorite and MMDVMDNPC.IsFavorite(selectedMotion)
         if inWheel then
             star:SetText(L("mmd_vmd_npc.manager.wheel_remove", "★ Remove From Wheel"))
+            star:SetTextColor(Color(255, 200, 90))
         else
             star:SetText(L("mmd_vmd_npc.manager.wheel_add", "☆ Add To Wheel"))
+            star:SetTextColor(Color(255, 255, 255))
         end
     end
     update_wheel_button()
 
+    -- Shared by the star button and the per-row wheel cells. Updates only the
+    -- affected row's cell instead of rebuilding the whole list.
+    -- Debounced PER MOTION ID (not per widget): both presses of a double-click
+    -- reach here, and the favorites-changed hook rebuilds the list between
+    -- them, so any state stored on the cell/button would not survive to block
+    -- the second press (it would toggle add+remove).
+    local wheelToggleNext = {}
+    toggle_wheel_for = function(motionID)
+        if not motionID or motionID == "" then return end
+        if (wheelToggleNext[motionID] or 0) > RealTime() then return end
+        wheelToggleNext[motionID] = RealTime() + 0.35
+        local isAdded = MMDVMDNPC.ToggleFavorite(motionID)
+        if isAdded then
+            surface.PlaySound("garrysmod/content_downloaded.wav")
+            notification.AddLegacy(L("mmd_vmd_npc.manager.wheel_added", "Added to wheel!"), NOTIFY_GENERIC, 3)
+        else
+            surface.PlaySound("buttons/button15.wav")
+            notification.AddLegacy(L("mmd_vmd_npc.manager.wheel_removed", "Removed from wheel"), NOTIFY_CLEANUP, 3)
+        end
+        update_wheel_button()
+        if IsValid(list) then
+            for _, line in ipairs(list:GetLines() or {}) do
+                if line.MotionID == motionID then
+                    local cell = line.Columns and line.Columns[WHEEL_COLUMN]
+                    if IsValid(cell) then cell:SetText((wheel_cell_text(motionID))) end
+                end
+            end
+        end
+        -- The next populate() must not skip this change.
+        lastPopulateSignature = nil
+    end
+
     star.DoClick = function()
         if selectedMotion and selectedMotion ~= "" then
-            local isAdded = MMDVMDNPC.ToggleFavorite(selectedMotion)
-
-            if isAdded then
-                surface.PlaySound("garrysmod/content_downloaded.wav")
-                notification.AddLegacy(L("mmd_vmd_npc.manager.wheel_added", "Added to wheel!"), NOTIFY_GENERIC, 3)
-            else
-                surface.PlaySound("buttons/button15.wav")
-                notification.AddLegacy(L("mmd_vmd_npc.manager.wheel_removed", "Removed from wheel"), NOTIFY_CLEANUP, 3)
-            end
-            update_wheel_button()
-            if IsValid(list) then populate() end
+            toggle_wheel_for(selectedMotion)
         else
             notification.AddLegacy(L("mmd_vmd_npc.manager.wheel_select_first", "Select a motion from the list first."), NOTIFY_ERROR, 3)
         end
@@ -4326,19 +4653,19 @@ local function open_motion_browser()
     local rename = vgui.Create("DButton", controls)
     rename:Dock(LEFT)
     style_manager_button(rename, 110)
-    rename:SetText("RENAME")
-    -- rename:SetTextColor(Color(100, 255, 100))
+    rename:SetText(L("mmd_vmd_npc.manager.rename", "Rename"))
     rename.DoClick = function()
         if selectedMotion and selectedMotion ~= "" then
             Derma_StringRequest(
-                "Rename",
-                "Name for: " .. selectedMotion,
-                MMDVMDNPC.GetNiceName(selectedMotion), 
+                L("mmd_vmd_npc.manager.rename_title", "Rename"),
+                LF("mmd_vmd_npc.manager.rename_prompt_fmt", tostring(selectedMotion)),
+                MMDVMDNPC.GetNiceName(selectedMotion),
                 function(text)
                     if text and text ~= "" then
                         MMDVMDNPC.CustomNames[selectedMotion] = text
                         MMDVMDNPC.SaveCustomNames()
-                        notification.AddLegacy("Saved!", NOTIFY_GENERIC, 3)
+                        notification.AddLegacy(L("mmd_vmd_npc.manager.rename_saved", "Saved!"), NOTIFY_GENERIC, 3)
+                        lastPopulateSignature = nil
                         if IsValid(list) then populate() end
                     end
                 end
@@ -4398,6 +4725,13 @@ local function open_motion_browser()
         end
     end
 
+    -- Consistent breathing room between the action buttons; the strip itself
+    -- stays transparent so the frame reads as one surface.
+    controls:SetPaintBackground(false)
+    for _, button in ipairs({ open, build, play, star, rename, stop, clearModel, clearAll, deleteMotion }) do
+        if IsValid(button) then button:DockMargin(0, 8, 8, 8) end
+    end
+
     audioPreview.DoClick = function()
         local meta = selectedMeta or (selectedMotion and MMDVMDNPC.MotionDetails[selectedMotion]) or {}
         local volume = GetConVar("mmd_vmd_npc_music_volume")
@@ -4416,8 +4750,16 @@ local function open_motion_browser()
     end
 
     local hookID = "MMDVMDNPCMotionBrowser_" .. tostring(frame)
-    hook.Add("MMDVMDNPCMotionListUpdated", hookID, populate)
-    hook.Add("MMDVMDNPCMotionDetailsUpdated", hookID .. "_Details", populate)
+    hook.Add("MMDVMDNPCMotionListUpdated", hookID, function() schedule_populate() end)
+    hook.Add("MMDVMDNPCMotionDetailsUpdated", hookID .. "_Details", function()
+        if rebuild_category_combo then rebuild_category_combo() end
+        schedule_populate()
+    end)
+    hook.Add("MMDVMDNPCWheelFavoritesChanged", hookID .. "_Wheel", function()
+        if update_wheel_button then update_wheel_button() end
+        lastPopulateSignature = nil
+        schedule_populate()
+    end)
     hook.Add("MMDVMDNPCAudioSettingsUpdated", hookID .. "_Audio", function(motionID, offset)
         if motionID == selectedMotion and IsValid(offsetEntry) then
             offsetEntry:SetValue(offset)
@@ -4426,10 +4768,12 @@ local function open_motion_browser()
     frame.OnRemove = function()
         hook.Remove("MMDVMDNPCMotionListUpdated", hookID)
         hook.Remove("MMDVMDNPCMotionDetailsUpdated", hookID .. "_Details")
+        hook.Remove("MMDVMDNPCWheelFavoritesChanged", hookID .. "_Wheel")
         hook.Remove("MMDVMDNPCAudioSettingsUpdated", hookID .. "_Audio")
         stop_audio_preview()
     end
 
+    rebuild_category_combo()
     populate()
     request_list()
     request_motion_details()

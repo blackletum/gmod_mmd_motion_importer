@@ -687,3 +687,50 @@ hook.Add("Think", "MMDVMDNPCCameraHotkey", function()
     end
     hotkeyWasDown = down
 end)
+
+-- Hide HUD during camera motion --------------------------------------------------
+
+local function camera_motion_active()
+    return MMDVMDNPC.CameraAnimActive == true
+        or (MMDVMDNPC.CameraDebugPreviewRenderable and MMDVMDNPC.CameraDebugPreviewRenderable() == true)
+end
+
+-- While an imported camera animation drives the view, hide every standard HUD
+-- element (health, ammo, crosshair, ...) so the shot is clean. Gated by the
+-- default-on `mmd_vmd_npc_hide_hud` option; returning nil leaves the HUD alone.
+hook.Add("HUDShouldDraw", "MMDVMDNPCHideHUD", function(name)
+    local cv = GetConVar("mmd_vmd_npc_hide_hud")
+    if cv and not cv:GetBool() then return end
+    if camera_motion_active() then return false end
+end)
+
+local hideHudKeyWasDown = false
+
+hook.Add("Think", "MMDVMDNPCHideHudHotkey", function()
+    local key = math.floor(convar_number("mmd_vmd_npc_hide_hud_key", 0))
+    if key <= 0 then
+        hideHudKeyWasDown = false
+        return
+    end
+
+    local down
+    if MOUSE_FIRST and key >= MOUSE_FIRST then
+        down = input.IsMouseDown and input.IsMouseDown(key) or false
+    else
+        down = input.IsKeyDown and input.IsKeyDown(key) or false
+    end
+
+    local suppressed = gui.IsGameUIVisible()
+        or (vgui and vgui.CursorVisible and vgui.CursorVisible())
+        or (vgui and vgui.GetKeyboardFocus and IsValid(vgui.GetKeyboardFocus()))
+    if not suppressed then
+        local ply = LocalPlayer()
+        suppressed = IsValid(ply) and ply.IsTyping and ply:IsTyping() or false
+    end
+
+    if down and not hideHudKeyWasDown and not suppressed then
+        local cv = GetConVar("mmd_vmd_npc_hide_hud")
+        RunConsoleCommand("mmd_vmd_npc_hide_hud", (cv and cv:GetBool()) and "0" or "1")
+    end
+    hideHudKeyWasDown = down
+end)

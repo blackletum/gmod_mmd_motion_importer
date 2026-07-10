@@ -13,6 +13,11 @@ MMDVMDNPC.AudioOffsetPath = MMDVMDNPC.SettingsRoot .. "/audio_offsets.json"
 MMDVMDNPC.FlexOverridePath = MMDVMDNPC.SettingsRoot .. "/flex_overrides.json"
 MMDVMDNPC.CacheExtension = ".json"
 MMDVMDNPC.BuiltFormat = "mmd_vmd_npc_built_v1"
+-- Category sentinels: never valid authored category names (authored categories
+-- come from the importer's metadata table, plain text). Localized at display
+-- time via MMDVMDNPC.CategoryDisplayName.
+MMDVMDNPC.CategoryUserImport = "__user_import"
+MMDVMDNPC.CategoryAddonOther = "__addon_other"
 MMDVMDNPC.VMDFPS = 30
 MMDVMDNPC.DefaultFPS = 30
 MMDVMDNPC.MinStartDelay = 2
@@ -423,6 +428,14 @@ MMDVMDNPC.I18N.en = {
     ["mmd_vmd_npc.lighting.rtx_radius"] = "Light sphere radius",
     ["mmd_vmd_npc.lighting.rtx_softness"] = "Cone edge softness",
     ["mmd_vmd_npc.lighting.rtx_volumetric"] = "Volumetric intensity",
+    ["mmd_vmd_npc.ui.display_playback"] = "Display & Playback",
+    ["mmd_vmd_npc.ui.hide_hud"] = "Hide HUD during camera motion",
+    ["mmd_vmd_npc.ui.hide_hud_help"] = "While an imported camera animation drives the view, hide the HUD (health, ammo, crosshair, ...). On by default; bind a key below to toggle it in-game.",
+    ["mmd_vmd_npc.ui.hide_hud_key"] = "Hide HUD toggle key",
+    ["mmd_vmd_npc.ui.disable_jiggle"] = "Disable jigglebones during playback",
+    ["mmd_vmd_npc.ui.disable_jiggle_help"] = "Turn off the model's jigglebones (hair, cloth, ...) while a motion plays so they do not fight the imported pose. Restored when playback stops.",
+    ["mmd_vmd_npc.ui.menu_scale"] = "Menu size",
+    ["mmd_vmd_npc.ui.menu_scale_help"] = "Scales the Motion Manager and Raw Animation Debug windows (and their text) up or down. 1.0 is default.",
     ["mmd_vmd_npc.status.ai_enabled_warning"] = "Warning: NPC AI is enabled (ai_disabled 0), so NPCs may walk or fight during the dance. Run ai_disabled 1 for a clean performance. Playing anyway.",
     ["mmd_vmd_npc.ui.selected_motion_none"] = "Selected motion: none",
     ["mmd_vmd_npc.ui.selected_motion_fmt"] = "Selected motion: %s",
@@ -585,7 +598,7 @@ MMDVMDNPC.I18N.en = {
     ["mmd_vmd_npc.debug.flex_scale_mouth"] = "Mouth flex scale",
 
     ["mmd_vmd_npc.manager.title"] = "Motion Manager",
-    ["mmd_vmd_npc.manager.search_placeholder"] = "Search motion id, source, or music",
+    ["mmd_vmd_npc.manager.search_placeholder"] = "Search name, artist, id, source, or music",
     ["mmd_vmd_npc.manager.refresh"] = "Refresh",
     ["mmd_vmd_npc.manager.column_motion_id"] = "Motion ID",
     ["mmd_vmd_npc.manager.column_duration"] = "Duration",
@@ -622,6 +635,22 @@ MMDVMDNPC.I18N.en = {
     ["mmd_vmd_npc.manager.delete_title"] = "Delete MMD VMD Motion",
     ["mmd_vmd_npc.manager.delete_confirm"] = "Delete",
     ["mmd_vmd_npc.manager.cancel"] = "Cancel",
+    ["mmd_vmd_npc.manager.column_category"] = "Category",
+    ["mmd_vmd_npc.manager.open_link"] = "Open Link",
+    ["mmd_vmd_npc.manager.wheel_toggle_tip"] = "Click to add or remove this dance on the wheel",
+    ["mmd_vmd_npc.manager.rename"] = "Rename",
+    ["mmd_vmd_npc.manager.rename_title"] = "Rename",
+    ["mmd_vmd_npc.manager.rename_prompt_fmt"] = "Display name for: %s",
+    ["mmd_vmd_npc.manager.rename_saved"] = "Saved!",
+    ["mmd_vmd_npc.category.all"] = "All Categories",
+    ["mmd_vmd_npc.category.user_import"] = "User Import",
+    ["mmd_vmd_npc.category.addon_other"] = "Addon (Other)",
+    ["mmd_vmd_npc.meta.category"] = "Category",
+    ["mmd_vmd_npc.meta.english_name"] = "English",
+    ["mmd_vmd_npc.meta.artist"] = "Artist",
+    ["mmd_vmd_npc.meta.language"] = "Language",
+    ["mmd_vmd_npc.meta.motion_artist"] = "Motion Artist",
+    ["mmd_vmd_npc.radial.category_empty"] = "No wheel dances in this category",
 }
 
 local function merge_i18n(overrides)
@@ -742,6 +771,14 @@ MMDVMDNPC.I18N.zh = merge_i18n({
     ["mmd_vmd_npc.lighting.rtx_radius"] = "光源球体半径",
     ["mmd_vmd_npc.lighting.rtx_softness"] = "光锥边缘柔和度",
     ["mmd_vmd_npc.lighting.rtx_volumetric"] = "体积光强度",
+    ["mmd_vmd_npc.ui.display_playback"] = "显示与播放",
+    ["mmd_vmd_npc.ui.hide_hud"] = "镜头动画时隐藏 HUD",
+    ["mmd_vmd_npc.ui.hide_hud_help"] = "当导入的镜头动画控制视角时，隐藏 HUD（血量、弹药、准星等）。默认开启；可在下方绑定一个键在游戏中切换。",
+    ["mmd_vmd_npc.ui.hide_hud_key"] = "隐藏 HUD 切换键",
+    ["mmd_vmd_npc.ui.disable_jiggle"] = "播放时禁用抖动骨骼",
+    ["mmd_vmd_npc.ui.disable_jiggle_help"] = "播放动作时关闭模型的抖动骨骼（头发、布料等），避免它们与导入的姿势冲突。停止播放后恢复。",
+    ["mmd_vmd_npc.ui.menu_scale"] = "菜单大小",
+    ["mmd_vmd_npc.ui.menu_scale_help"] = "缩放动作管理器和原始动画调试窗口（及其文字）的大小。1.0 为默认。",
     ["mmd_vmd_npc.status.ai_enabled_warning"] = "警告：NPC AI 已启用（ai_disabled 0），NPC 可能在舞蹈中走动或战斗。运行 ai_disabled 1 可获得干净的演出。仍将继续播放。",
     ["mmd_vmd_npc.ui.tab.motion"] = "动作",
     ["mmd_vmd_npc.ui.tab.build_playback"] = "构建与播放",
@@ -886,7 +923,7 @@ MMDVMDNPC.I18N.zh = merge_i18n({
     ["mmd_vmd_npc.debug.play_preview"] = "播放",
     ["mmd_vmd_npc.debug.pause_preview"] = "暂停",
     ["mmd_vmd_npc.manager.title"] = "动作管理器",
-    ["mmd_vmd_npc.manager.search_placeholder"] = "搜索动作 ID、来源或音乐",
+    ["mmd_vmd_npc.manager.search_placeholder"] = "搜索名称、作者、ID、来源或音乐",
     ["mmd_vmd_npc.manager.refresh"] = "刷新",
     ["mmd_vmd_npc.manager.column_motion_id"] = "动作 ID",
     ["mmd_vmd_npc.manager.column_duration"] = "时长",
@@ -896,6 +933,22 @@ MMDVMDNPC.I18N.zh = merge_i18n({
     ["mmd_vmd_npc.manager.column_music"] = "音乐",
     ["mmd_vmd_npc.manager.column_camera"] = "镜头",
     ["mmd_vmd_npc.manager.column_addon"] = "来自插件",
+    ["mmd_vmd_npc.manager.column_category"] = "类别",
+    ["mmd_vmd_npc.manager.open_link"] = "打开链接",
+    ["mmd_vmd_npc.manager.wheel_toggle_tip"] = "点击将该舞蹈加入或移出转盘",
+    ["mmd_vmd_npc.manager.rename"] = "重命名",
+    ["mmd_vmd_npc.manager.rename_title"] = "重命名",
+    ["mmd_vmd_npc.manager.rename_prompt_fmt"] = "为 %s 设置显示名称",
+    ["mmd_vmd_npc.manager.rename_saved"] = "已保存！",
+    ["mmd_vmd_npc.category.all"] = "全部类别",
+    ["mmd_vmd_npc.category.user_import"] = "用户导入",
+    ["mmd_vmd_npc.category.addon_other"] = "插件（其他）",
+    ["mmd_vmd_npc.meta.category"] = "类别",
+    ["mmd_vmd_npc.meta.english_name"] = "英文名",
+    ["mmd_vmd_npc.meta.artist"] = "歌曲作者",
+    ["mmd_vmd_npc.meta.language"] = "语言",
+    ["mmd_vmd_npc.meta.motion_artist"] = "动作作者",
+    ["mmd_vmd_npc.radial.category_empty"] = "该类别下转盘上没有舞蹈",
     ["mmd_vmd_npc.manager.column_built"] = "已构建",
     ["mmd_vmd_npc.manager.select_motion_details"] = "选择一个动作以查看详情。",
     ["mmd_vmd_npc.manager.details_fmt"] = "%s\nFPS %s | 帧 %s-%s | 时长 %.2fs | 骨骼 %s | 表情 %s | 音乐 %s | 镜头 %s | 来源 %s",
@@ -1026,6 +1079,14 @@ MMDVMDNPC.I18N.ja = merge_i18n({
     ["mmd_vmd_npc.lighting.rtx_radius"] = "ライト球体の半径",
     ["mmd_vmd_npc.lighting.rtx_softness"] = "コーン端のソフトネス",
     ["mmd_vmd_npc.lighting.rtx_volumetric"] = "ボリューメトリック強度",
+    ["mmd_vmd_npc.ui.display_playback"] = "表示と再生",
+    ["mmd_vmd_npc.ui.hide_hud"] = "カメラモーション中に HUD を非表示",
+    ["mmd_vmd_npc.ui.hide_hud_help"] = "インポートしたカメラアニメが視点を制御している間、HUD（体力・弾薬・クロスヘアなど）を隠します。既定でオン。下でキーを割り当ててゲーム中に切り替えられます。",
+    ["mmd_vmd_npc.ui.hide_hud_key"] = "HUD 非表示の切替キー",
+    ["mmd_vmd_npc.ui.disable_jiggle"] = "再生中にジグルボーンを無効化",
+    ["mmd_vmd_npc.ui.disable_jiggle_help"] = "モーション再生中はモデルのジグルボーン（髪・布など）をオフにして、インポートしたポーズと競合しないようにします。停止時に復元されます。",
+    ["mmd_vmd_npc.ui.menu_scale"] = "メニューサイズ",
+    ["mmd_vmd_npc.ui.menu_scale_help"] = "モーションマネージャーと Raw アニメーションデバッグウィンドウ（および文字）の大きさを拡大/縮小します。1.0 が既定です。",
     ["mmd_vmd_npc.status.ai_enabled_warning"] = "警告：NPC AI が有効です（ai_disabled 0）。ダンス中に NPC が歩いたり戦ったりする場合があります。きれいな演出には ai_disabled 1 を実行してください。このまま再生します。",
     ["mmd_vmd_npc.ui.tab.motion"] = "モーション",
     ["mmd_vmd_npc.ui.tab.build_playback"] = "ビルドと再生",
@@ -1147,7 +1208,7 @@ MMDVMDNPC.I18N.ja = merge_i18n({
     ["mmd_vmd_npc.ui.eye_status_fmt"] = "目ボーン：L=%s | R=%s",
     ["mmd_vmd_npc.ui.eye_bone_fmt"] = "%s（#%d）",
     ["mmd_vmd_npc.manager.title"] = "モーション管理",
-    ["mmd_vmd_npc.manager.search_placeholder"] = "モーション ID、ソース、音楽を検索",
+    ["mmd_vmd_npc.manager.search_placeholder"] = "名前・アーティスト・ID・ソース・音楽を検索",
     ["mmd_vmd_npc.manager.refresh"] = "更新",
     ["mmd_vmd_npc.manager.column_motion_id"] = "モーション ID",
     ["mmd_vmd_npc.manager.column_duration"] = "長さ",
@@ -1157,6 +1218,22 @@ MMDVMDNPC.I18N.ja = merge_i18n({
     ["mmd_vmd_npc.manager.column_music"] = "音楽",
     ["mmd_vmd_npc.manager.column_camera"] = "カメラ",
     ["mmd_vmd_npc.manager.column_addon"] = "アドオン由来",
+    ["mmd_vmd_npc.manager.column_category"] = "カテゴリ",
+    ["mmd_vmd_npc.manager.open_link"] = "リンクを開く",
+    ["mmd_vmd_npc.manager.wheel_toggle_tip"] = "クリックでホイールに追加 / 削除",
+    ["mmd_vmd_npc.manager.rename"] = "名前変更",
+    ["mmd_vmd_npc.manager.rename_title"] = "名前変更",
+    ["mmd_vmd_npc.manager.rename_prompt_fmt"] = "%s の表示名",
+    ["mmd_vmd_npc.manager.rename_saved"] = "保存しました！",
+    ["mmd_vmd_npc.category.all"] = "すべてのカテゴリ",
+    ["mmd_vmd_npc.category.user_import"] = "ユーザーインポート",
+    ["mmd_vmd_npc.category.addon_other"] = "アドオン（その他）",
+    ["mmd_vmd_npc.meta.category"] = "カテゴリ",
+    ["mmd_vmd_npc.meta.english_name"] = "英語名",
+    ["mmd_vmd_npc.meta.artist"] = "アーティスト",
+    ["mmd_vmd_npc.meta.language"] = "言語",
+    ["mmd_vmd_npc.meta.motion_artist"] = "モーション作者",
+    ["mmd_vmd_npc.radial.category_empty"] = "このカテゴリのダンスはホイールにありません",
     ["mmd_vmd_npc.manager.column_built"] = "ビルド済み",
     ["mmd_vmd_npc.manager.select_motion_details"] = "詳細を見るモーションを選択してください。",
     ["mmd_vmd_npc.manager.play_music"] = "音楽を再生",
@@ -2057,6 +2134,18 @@ end
 
 function MMDVMDNPC.LFormat(key, ...)
     return string.format(MMDVMDNPC.L(key, key), ...)
+end
+
+-- Sentinel categories localize; authored ones display as written.
+function MMDVMDNPC.CategoryDisplayName(category)
+    category = tostring(category or "")
+    if category == "" or category == MMDVMDNPC.CategoryUserImport then
+        return MMDVMDNPC.L("mmd_vmd_npc.category.user_import", "User Import")
+    end
+    if category == MMDVMDNPC.CategoryAddonOther then
+        return MMDVMDNPC.L("mmd_vmd_npc.category.addon_other", "Addon (Other)")
+    end
+    return category
 end
 
 if CLIENT then

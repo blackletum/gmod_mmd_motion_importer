@@ -167,6 +167,7 @@ class ImportWorker(QtCore.QThread):
                 is_addon=bool(self.settings.get("export_addon")),
                 progress=self._log,
                 camera_track=camera_track,
+                meta=dict(self.settings.get("motion_meta") or {}),
             )
             self._log(I18N.t("log.wrote_motion_json", path=output_json))
             addon_gma = ""
@@ -563,11 +564,11 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
         self.retranslate_path_rows()
 
-        if hasattr(self, "motion_name_label"):
-            self.motion_name_label.setText(self.tr("inputs.motion_name.label"))
-            self.motion_name_badge.setText(self.tr("field.optional"))
-            self.motion_name_hint.setText(self.tr("inputs.motion_name.hint"))
-            self.motion_name_edit.setPlaceholderText(self.tr("inputs.motion_name.placeholder"))
+        if hasattr(self, "motion_meta_label"):
+            self.motion_meta_label.setText(self.tr("inputs.motion_meta.label"))
+            self.motion_meta_badge.setText(self.tr("field.optional"))
+            self.motion_meta_hint.setText(self.tr("inputs.motion_meta.hint"))
+            self._retranslate_motion_meta_headers()
         if hasattr(self, "flex_group"):
             self.flex_group.setTitle(self.tr("inputs.flex_group.title"))
             self.add_flex_button.setText(self.tr("inputs.flex.add"))
@@ -705,18 +706,35 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
         name_layout = QtWidgets.QGridLayout()
         name_header = QtWidgets.QHBoxLayout()
-        self.motion_name_label = QtWidgets.QLabel(self.tr("inputs.motion_name.label"))
-        self.motion_name_badge = QtWidgets.QLabel(self.tr("field.optional"))
-        self.motion_name_badge.setObjectName("optionalBadge")
-        self.motion_name_hint = QtWidgets.QLabel(self.tr("inputs.motion_name.hint"))
-        self.motion_name_hint.setObjectName("fieldHint")
-        name_header.addWidget(self.motion_name_label)
-        name_header.addWidget(self.motion_name_badge)
-        name_header.addWidget(self.motion_name_hint, 1)
-        self.motion_name_edit = QtWidgets.QLineEdit()
-        self.motion_name_edit.setPlaceholderText(self.tr("inputs.motion_name.placeholder"))
+        self.motion_meta_label = QtWidgets.QLabel(self.tr("inputs.motion_meta.label"))
+        self.motion_meta_badge = QtWidgets.QLabel(self.tr("field.optional"))
+        self.motion_meta_badge.setObjectName("optionalBadge")
+        self.motion_meta_hint = QtWidgets.QLabel(self.tr("inputs.motion_meta.hint"))
+        self.motion_meta_hint.setObjectName("fieldHint")
+        name_header.addWidget(self.motion_meta_label)
+        name_header.addWidget(self.motion_meta_badge)
+        name_header.addWidget(self.motion_meta_hint, 1)
+        self.motion_meta_table = QtWidgets.QTableWidget(1, len(import_vmd.MOTION_META_FIELDS))
+        self.motion_meta_table.verticalHeader().setVisible(False)
+        self.motion_meta_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.motion_meta_table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.motion_meta_table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.motion_meta_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.motion_meta_table.setTabKeyNavigation(True)
+        for column in range(len(import_vmd.MOTION_META_FIELDS)):
+            self.motion_meta_table.setItem(0, column, QtWidgets.QTableWidgetItem(""))
+        self._retranslate_motion_meta_headers()
+        # One header row + one editable row; lock the height so the table reads
+        # as a form field instead of a grid that grabs vertical space.
+        self.motion_meta_table.resizeRowsToContents()
+        meta_table_height = (
+            self.motion_meta_table.horizontalHeader().sizeHint().height()
+            + self.motion_meta_table.rowHeight(0)
+            + 2 * self.motion_meta_table.frameWidth()
+        )
+        self.motion_meta_table.setFixedHeight(meta_table_height)
         name_layout.addLayout(name_header, 0, 0)
-        name_layout.addWidget(self.motion_name_edit, 1, 0)
+        name_layout.addWidget(self.motion_meta_table, 1, 0)
         layout.addLayout(name_layout)
 
         self.flex_group = QtWidgets.QGroupBox(self.tr("inputs.flex_group.title"))
@@ -989,11 +1007,19 @@ class ImporterWindow(QtWidgets.QMainWindow):
             for value in flex_values or []:
                 if value:
                     self.flex_list.addItem(str(value))
-            motion_name = self.settings_store.value("motion_name", "", str)
-            if motion_name:
-                self.motion_name_edit.setText(str(motion_name))
+            for field in import_vmd.MOTION_META_FIELDS:
+                value = self.settings_store.value(f"meta_{field}", "", str)
+                if value:
+                    self.set_motion_meta_value(field, str(value))
+            # Migrate the pre-table single "motion_name" setting into the
+            # Display Name column the first time (never clobber a saved value).
+            legacy_name = str(self.settings_store.value("motion_name", "", str) or "").strip()
+            if legacy_name and not self.motion_meta_value("display_name"):
+                self.set_motion_meta_value("display_name", legacy_name)
+            display_name = self.motion_meta_value("display_name")
+            if display_name:
                 body_stem = Path(self.body_row.value()).stem.strip()
-                if body_stem and str(motion_name).strip() == body_stem:
+                if body_stem and display_name == body_stem:
                     self._motion_name_autofill = body_stem
             audio_offset = self.settings_store.value("audio_offset_centis", 0, int)
             self.set_audio_offset_value(int(audio_offset or 0), persist=False)
@@ -1009,11 +1035,39 @@ class ImporterWindow(QtWidgets.QMainWindow):
         # Wiping music/flex is destructive, so only do it when the user actually
         # picks a new body VMD via Browse — not on every keystroke of a typed path.
         self.body_row.pathBrowsed.connect(self.on_body_vmd_selected)
-        self.motion_name_edit.textChanged.connect(lambda _value: self.save_persisted_settings())
+        self.motion_meta_table.itemChanged.connect(self._on_motion_meta_changed)
         self.export_addon_check.toggled.connect(lambda _value: self.save_persisted_settings())
 
+    def _retranslate_motion_meta_headers(self) -> None:
+        for column, field in enumerate(import_vmd.MOTION_META_FIELDS):
+            item = QtWidgets.QTableWidgetItem(self.tr(f"inputs.meta.{field}"))
+            item.setToolTip(self.tr(f"inputs.meta.{field}.tooltip"))
+            self.motion_meta_table.setHorizontalHeaderItem(column, item)
+
+    def _motion_meta_item(self, field: str) -> QtWidgets.QTableWidgetItem:
+        column = import_vmd.MOTION_META_FIELDS.index(field)
+        item = self.motion_meta_table.item(0, column)
+        if item is None:
+            item = QtWidgets.QTableWidgetItem("")
+            self.motion_meta_table.setItem(0, column, item)
+        return item
+
+    def motion_meta_value(self, field: str) -> str:
+        return self._motion_meta_item(field).text().strip()
+
+    def set_motion_meta_value(self, field: str, value: str) -> None:
+        self._motion_meta_item(field).setText(str(value or ""))
+
+    def motion_meta_dict(self) -> dict[str, str]:
+        return {field: self.motion_meta_value(field) for field in import_vmd.MOTION_META_FIELDS}
+
+    def _on_motion_meta_changed(self, _item: QtWidgets.QTableWidgetItem) -> None:
+        if self._loading_settings:
+            return
+        self.save_persisted_settings()
+
     def _motion_name_is_autofilled(self) -> bool:
-        current = self.motion_name_edit.text().strip()
+        current = self.motion_meta_value("display_name")
         return current == "" or current == (self._motion_name_autofill or "")
 
     def on_body_vmd_changed(self, value: str) -> None:
@@ -1026,7 +1080,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         candidate = Path(str(value or "")).stem.strip()
         if self._motion_name_is_autofilled():
             self._motion_name_autofill = candidate
-            self.motion_name_edit.setText(candidate)
+            self.set_motion_meta_value("display_name", candidate)
         self.save_persisted_settings()
 
     def on_body_vmd_selected(self, value: str) -> None:
@@ -1036,7 +1090,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         candidate = Path(str(value or "")).stem.strip()
         if self._motion_name_is_autofilled():
             self._motion_name_autofill = candidate
-            self.motion_name_edit.setText(candidate)
+            self.set_motion_meta_value("display_name", candidate)
         # A genuinely new source motion was chosen: its old music/flex/camera no longer apply.
         self.music_row.set_value("")
         self.camera_row.set_value("")
@@ -1048,7 +1102,9 @@ class ImporterWindow(QtWidgets.QMainWindow):
             return
         for key, row in self._path_rows().items():
             self.settings_store.setValue(key, row.value())
-        self.settings_store.setValue("motion_name", self.motion_name_edit.text().strip())
+        for field in import_vmd.MOTION_META_FIELDS:
+            self.settings_store.setValue(f"meta_{field}", self.motion_meta_value(field))
+        self.settings_store.setValue("motion_name", self.motion_meta_value("display_name"))
         self.settings_store.setValue("audio_offset_centis", int(round(self.current_audio_offset_seconds() * 100)))
         self.settings_store.setValue("flex_vmds", self.flex_vmd_paths())
         self.settings_store.setValue("export_addon", self.export_addon_check.isChecked())
@@ -1366,7 +1422,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         export_addon = self.export_addon_check.isChecked()
         addon_gma_path = ""
         if export_addon:
-            default_name = import_vmd.slugify(self.motion_name_edit.text().strip() or self.body_row.value() or "motion")
+            default_name = import_vmd.slugify(self.motion_meta_value("display_name") or self.body_row.value() or "motion")
             default_path = Path.home() / "Desktop" / f"MMDMotionPlayer_{default_name}.gma"
             addon_gma_path, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self,
@@ -1384,7 +1440,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             "body_vmd": self.body_row.value(),
             "music_path": self.music_row.value(),
             "camera_vmd": self.camera_row.value(),
-            "motion_name": self.motion_name_edit.text().strip(),
+            "motion_name": self.motion_meta_value("display_name"),
+            "motion_meta": self.motion_meta_dict(),
             "audio_offset": self.current_audio_offset_seconds(),
             "gmod_dir": self.gmod_row.value(),
             "flex_vmds": self.flex_vmd_paths(),
@@ -1853,6 +1910,19 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
 
 def main() -> int:
+    # The preview viewport is a QOpenGLWidget, which makes the ENTIRE window
+    # composite its backing store through OpenGL. With the default swap interval
+    # of 1 (vsync), every backing-store flush blocks until the next vertical blank
+    # (~16 ms at 60 Hz) — including the many tiny repaints emitted while dragging a
+    # text selection or typing into a field. That made text interaction feel laggy
+    # while the rest of the UI (which repaints far less often) did not. Disabling
+    # vsync on the default surface format removes the per-flush vblank stall; the
+    # preview still renders at its ~60 Hz timer cadence, just without the wait.
+    # Must run before the QApplication and any OpenGL context is created.
+    surface_format = QtGui.QSurfaceFormat.defaultFormat()
+    surface_format.setSwapInterval(0)
+    QtGui.QSurfaceFormat.setDefaultFormat(surface_format)
+
     app = QtWidgets.QApplication(sys.argv)
     app.setOrganizationName("MMDVMDNPC")
     app.setApplicationName(I18N.t("app.title"))

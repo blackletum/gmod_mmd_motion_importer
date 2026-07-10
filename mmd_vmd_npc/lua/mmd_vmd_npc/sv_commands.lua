@@ -795,9 +795,17 @@ local function send_audio_settings(ply, motionID)
     net.Send(ply)
 end
 
+-- Belt-and-suspenders for the details stream: meta strings are clamped at
+-- parse time (sv_cache clamp_meta_string), but entries can come from an old
+-- persisted index or any future caller, so never write an unbounded string.
+local function net_safe_string(value, limit)
+    value = string.gsub(tostring(value or ""), "%z", "")
+    return string.sub(value, 1, limit or 256)
+end
+
 local function write_motion_details_entry(meta, built)
-    net.WriteString(meta.id or "")
-    net.WriteString(meta.displayName or meta.id or "")
+    net.WriteString(net_safe_string(meta.id))
+    net.WriteString(net_safe_string(meta.displayName or meta.id))
     net.WriteUInt(math.max(1, tonumber(meta.fps) or MMDVMDNPC.VMDFPS or 30), 16)
     net.WriteUInt(math.max(0, tonumber(meta.frameStart) or 0), 32)
     net.WriteUInt(math.max(0, tonumber(meta.frameEnd) or 0), 32)
@@ -805,14 +813,47 @@ local function write_motion_details_entry(meta, built)
     net.WriteFloat(tonumber(meta.duration) or 0)
     net.WriteUInt(math.Clamp(tonumber(meta.boneCount) or 0, 0, 65535), 16)
     net.WriteUInt(math.Clamp(tonumber(meta.flexCount) or 0, 0, 65535), 16)
-    net.WriteFloat(tonumber(meta.modified) or 0)
-    net.WriteString(meta.sourceName or "")
-    net.WriteString(meta.musicSound or "")
-    net.WriteString(meta.musicSource or "")
+    -- Unix mtime as UInt32, NOT WriteFloat: float32 buckets current-epoch
+    -- values to ~128s, hiding same-bucket re-imports from the client's
+    -- change detection (the manager's populate signature keys on this).
+    net.WriteUInt(math.max(0, math.floor(tonumber(meta.modified) or 0)), 32)
+    net.WriteString(net_safe_string(meta.sourceName))
+    net.WriteString(net_safe_string(meta.musicSound))
+    net.WriteString(net_safe_string(meta.musicSource))
     net.WriteBool(meta.isAddon == true)
     net.WriteBool(built == true)
     net.WriteBool(meta.hasCamera == true)
+    -- v2 descriptive metadata (category system). Reader must stay in lockstep
+    -- with cl_menu's mmdvmd_motion_details_response handler.
+    net.WriteBool(meta.fromAddon == true)
+    net.WriteString(net_safe_string(meta.category, 128))
+    net.WriteString(net_safe_string(meta.englishName))
+    net.WriteString(net_safe_string(meta.artist))
+    net.WriteString(net_safe_string(meta.language, 64))
+    net.WriteString(net_safe_string(meta.link, 512))
+    net.WriteString(net_safe_string(meta.motionArtist))
 end
+
+-- Upper bound of one entry's wire size (fixed fields + every clamped string
+-- with its terminator). Used to keep each chunk safely under the 64KB cap.
+local function motion_details_entry_bytes(meta)
+    local bytes = 40 -- numeric/bool fields + string terminators, rounded up
+    for _, value in ipairs({
+        meta.id, meta.displayName, meta.sourceName, meta.musicSound,
+        meta.musicSource, meta.category, meta.englishName, meta.artist,
+        meta.language, meta.link, meta.motionArtist,
+    }) do
+        bytes = bytes + math.min(#tostring(value or ""), 512) + 1
+    end
+    return bytes
+end
+
+-- Net messages are hard-capped at 64KB, so the details are streamed in chunks
+-- (the client accumulates until the done flag). Chunks are bounded BOTH by
+-- entry count and by accumulated bytes: strings are clamped, but 40 worst-case
+-- entries could still exceed the cap on count alone.
+local MOTION_DETAILS_CHUNK = 40
+local MOTION_DETAILS_BYTE_BUDGET = 45000
 
 local function send_motion_details(ply, options)
     local list = MMDVMDNPC.ListMotions()
@@ -832,12 +873,53 @@ local function send_motion_details(ply, options)
         end
     end
 
-    net.Start("mmdvmd_motion_details_response")
-        net.WriteUInt(math.min(#entries, 65535), 16)
-        for i = 1, math.min(#entries, 65535) do
-            write_motion_details_entry(entries[i].meta, entries[i].built)
+    local total = math.min(#entries, 65535)
+    local index = 1
+    local first = true
+    repeat
+        local chunkStart = index
+        local count = 0
+        local bytes = 0
+        while index <= total and count < MOTION_DETAILS_CHUNK do
+            local cost = motion_details_entry_bytes(entries[index].meta)
+            if count > 0 and bytes + cost > MOTION_DETAILS_BYTE_BUDGET then break end
+            count = count + 1
+            bytes = bytes + cost
+            index = index + 1
         end
-    net.Send(ply)
+        local done = index > total
+        net.Start("mmdvmd_motion_details_response")
+            net.WriteBool(first)   -- first chunk: reset accumulator
+            net.WriteBool(done)    -- last chunk: commit
+            net.WriteUInt(count, 16)
+            for i = chunkStart, chunkStart + count - 1 do
+                write_motion_details_entry(entries[i].meta, entries[i].built)
+            end
+        net.Send(ply)
+        first = false
+    until done
+end
+
+-- Coalesce request bursts: the client re-requests details after nearly every
+-- UI action (and a client could spam the net message); at most one full
+-- metadata walk + stream per player per half second, with the latest options.
+local MOTION_DETAILS_MIN_INTERVAL = 0.5
+
+local function queue_motion_details(ply, options)
+    if not IsValid(ply) then return end
+    local now = CurTime()
+    local nextAllowed = tonumber(ply.MMDVMDNPCDetailsNext) or 0
+    ply.MMDVMDNPCDetailsOptions = options
+    if now < nextAllowed then
+        timer.Create("MMDVMDNPCDetails" .. ply:EntIndex(), nextAllowed - now, 1, function()
+            if not IsValid(ply) then return end
+            ply.MMDVMDNPCDetailsNext = CurTime() + MOTION_DETAILS_MIN_INTERVAL
+            send_motion_details(ply, ply.MMDVMDNPCDetailsOptions)
+        end)
+        return
+    end
+    ply.MMDVMDNPCDetailsNext = now + MOTION_DETAILS_MIN_INTERVAL
+    send_motion_details(ply, options)
 end
 
 local function ai_disabled_enabled()
@@ -874,6 +956,16 @@ end
 -- Non-blocking notice: applying a dance to an NPC while AI thinking is on lets the
 -- NPC wander/fight mid-performance. We warn (once per few seconds so a group action
 -- does not spam) and then let the build/playback proceed anyway.
+-- Push a chat line to one player. isWarning => the client prints it red and plays
+-- an alert sound (see the mmdvmd_chat_notice receiver in cl_menu.lua).
+local function send_chat_notice(ply, message, isWarning)
+    if not IsValid(ply) then return end
+    net.Start("mmdvmd_chat_notice")
+        net.WriteString(tostring(message or ""))
+        net.WriteBool(isWarning == true)
+    net.Send(ply)
+end
+
 local function warn_if_ai_enabled(ply, ent)
     if not IsValid(ply) then return end
     if not is_playable_npc(ent) or is_playback_proxy(ent) then return end
@@ -889,9 +981,8 @@ local function warn_if_ai_enabled(ply, ent)
         "mmd_vmd_npc.status.ai_enabled_warning",
         "Warning: NPC AI is enabled (ai_disabled 0), so NPCs may walk or fight during the dance. Run ai_disabled 1 for a clean performance. Playing anyway."
     )
-    -- Chat first so the notice always reaches the player even if the status net
-    -- message is dropped for any reason.
-    MMDVMDNPC.Chat(ply, message)
+    -- Red + alert sound in chat so a user looking at the NPC still notices.
+    send_chat_notice(ply, message, true)
     send_play_status(ply, "warning", message, ent)
 end
 
@@ -1110,8 +1201,21 @@ clear_all_bone_manipulations = function(ent)
         if ent.ManipulateBoneAngles then ent:ManipulateBoneAngles(bone, ZERO_ANGLE, true) end
         if ent.ManipulateBonePosition then ent:ManipulateBonePosition(bone, ZERO_VECTOR) end
         if ent.ManipulateBoneScale then ent:ManipulateBoneScale(bone, ONE_SCALE) end
+        -- 0 = model default: restores any jigglebones disabled during playback.
+        if ent.ManipulateBoneJiggle then ent:ManipulateBoneJiggle(bone, 0) end
     end
     setup_bones_now(ent)
+end
+
+-- Type 2 = "force disable jiggle bone" for every bone, so a model's jigglebones
+-- stop fighting the imported pose while a motion plays. Reset by
+-- clear_all_bone_manipulations (type 0) on stop.
+local function disable_all_bone_jiggle(ent)
+    if not is_usable_npc(ent) or not ent.ManipulateBoneJiggle then return end
+    local count = ent:GetBoneCount() or 0
+    for bone = 0, count - 1 do
+        ent:ManipulateBoneJiggle(bone, 2)
+    end
 end
 
 clear_all_flex_weights = function(ent)
@@ -1960,33 +2064,56 @@ local function built_matches_scope(built, motionID, model)
     return true
 end
 
-local function header_matches_scope(header, motionID, model)
-    if not istable(header) then return false end
-    if header.format ~= MMDVMDNPC.BuiltFormat then return false end
-    if tostring(header.motion_id or "") ~= tostring(motionID or "") then return false end
-    if model ~= nil and tostring(header.model or "") ~= tostring(model or "") then return false end
-    return true
-end
 
 local function remove_matching_built_cache(motionID, model)
     local removed = 0
-    local files = file.Find(MMDVMDNPC.BuiltRoot .. "/*" .. MMDVMDNPC.CacheExtension, "DATA", "nameasc")
+    local id = tostring(motionID or "")
+    if id == "" then return 0 end
 
-    for _, name in ipairs(files or {}) do
+    local wantModel = model ~= nil and tostring(model) or nil
+
+    -- BuiltPath() names files "<id>_<modelName>[_<modelHash>]_<opts>.json". Both
+    -- the motion id and the model's safe name may themselves contain '_', so a
+    -- filename PREFIX cannot be parsed back into (id, model) unambiguously — e.g.
+    -- "motion_2_alyx_..._tw0..." is an equally valid file for id "motion" (model
+    -- "2_alyx") and for id "motion_2" (model "alyx"), and a bare-digit CRC segment
+    -- is indistinguishable from a numeric tail of a sibling model name ("miku" vs
+    -- "miku_2"). Matching by filename alone therefore over-deletes sibling motions'
+    -- / models' caches (confirmed review finding). We instead use the fast glob
+    -- only to NARROW to candidates, then confirm each against the exact
+    -- motion_id/model via the cheap mtime-keyed header index (BuiltHeader): once a
+    -- file is indexed (every build notes its header) this reads no file body, so
+    -- the clear stays fast — no full-directory JSON scan — but is collision-free.
+    local function drop(path)
+        MMDVMDNPC.BuiltCache[path] = nil
+        if MMDVMDNPC.ForgetBuiltHeader then MMDVMDNPC.ForgetBuiltHeader(path) end
+        file.Delete(path)
+        removed = removed + 1
+    end
+
+    local glob
+    if wantModel ~= nil then
+        glob = id .. "_" .. MMDVMDNPC.SafeModelName(model) .. "_*" .. MMDVMDNPC.CacheExtension
+    else
+        glob = id .. "_*" .. MMDVMDNPC.CacheExtension
+    end
+
+    local seen = {}
+    for _, name in ipairs(file.Find(MMDVMDNPC.BuiltRoot .. "/" .. glob, "DATA") or {}) do
         local path = MMDVMDNPC.BuiltRoot .. "/" .. name
-        -- Match on the lightweight header (index-cached, keyed by mtime) instead
-        -- of parsing the whole baked animation just to read 3 fields.
+        seen[path] = true
         local header = MMDVMDNPC.BuiltHeader and MMDVMDNPC.BuiltHeader(path, MMDVMDNPC.BuiltCache[path]) or nil
-        if header_matches_scope(header, motionID, model) then
-            MMDVMDNPC.BuiltCache[path] = nil
-            if MMDVMDNPC.ForgetBuiltHeader then MMDVMDNPC.ForgetBuiltHeader(path) end
-            file.Delete(path)
-            removed = removed + 1
+        if header and tostring(header.motion_id or "") == id
+            and (wantModel == nil or tostring(header.model or "") == wantModel) then
+            drop(path)
         end
     end
 
+    -- Defensive: drop any in-memory cache entries the glob could not cover (e.g. a
+    -- BuiltCache path whose on-disk file was already removed). Skip already-handled
+    -- paths so the removed count is not double-incremented.
     for path, built in pairs(MMDVMDNPC.BuiltCache) do
-        if built_matches_scope(built, motionID, model) then
+        if not seen[path] and built_matches_scope(built, motionID, model) then
             MMDVMDNPC.BuiltCache[path] = nil
             if MMDVMDNPC.ForgetBuiltHeader then MMDVMDNPC.ForgetBuiltHeader(path) end
             removed = removed + 1
@@ -2164,7 +2291,7 @@ function MMDVMDNPC.DeleteMotionForPlayer(ply, motionID)
     send_delete_motion_done(ply, deleted, id, message, removedBuilt, musicPath, musicRemoved)
     send_play_status(ply, deleted and "deleted_motion" or "error", message)
     send_motion_list(ply)
-    send_motion_details(ply, normalize_options(false, false, false, false))
+    queue_motion_details(ply, normalize_options(false, false, false, false))
     return deleted, message
 end
 
@@ -2347,8 +2474,14 @@ end
 -- manipulations are range-limited by the engine, which visibly froze dances
 -- that walk far from the start point (the imported/built data itself holds the
 -- full travel); SetPos has full range and clients interpolate it smoothly.
+-- Replicated so the client-side interpolated poser (cl_menu apply_local_built_sample)
+-- can mirror this split exactly: when root motion is on, the SERVER carries the
+-- pelvis horizontal on the entity origin (SetPos) and zeroes it in the bone
+-- manipulation. If the client poser kept the full horizontal in its own manip it
+-- would stack on top of the networked origin -> the model renders at DOUBLE the
+-- travel on the initiating player's screen. The client must know the mode.
 local cv_root_motion_origin = CreateConVar(
-    "mmd_vmd_npc_root_motion_origin", "1", FCVAR_ARCHIVE,
+    "mmd_vmd_npc_root_motion_origin", "1", bit.bor(FCVAR_ARCHIVE, FCVAR_REPLICATED),
     "Carry the dance's root travel on the entity origin so characters can walk any distance (0 = legacy bone-offset only)"
 )
 
@@ -2622,6 +2755,12 @@ local function start_playback_on_entity(ply, ent, motionID, options, playbackSet
 
     force_reference_pose(playbackEnt)
     clear_all_bone_manipulations(playbackEnt)
+    -- Optional: kill the model's jigglebones for the duration of this dance so
+    -- they don't fight the imported pose. The tool convar is USERINFO, so it is
+    -- readable server-side for every play path (tool, wheel, group).
+    if IsValid(ply) and ply:GetInfoNum("mmd_vmd_npc_disable_jiggle", 0) == 1 then
+        disable_all_bone_jiggle(playbackEnt)
+    end
     clear_all_flex_weights(playbackEnt)
     freeze_player_target(playbackEnt, true)
 
@@ -3291,7 +3430,7 @@ end)
 
 net.Receive("mmdvmd_motion_details_request", function(_, ply)
     local options = normalize_options(net.ReadBool(), net.ReadBool(), net.ReadBool(), net.ReadBool())
-    send_motion_details(ply, options)
+    queue_motion_details(ply, options)
 end)
 
 net.Receive("mmdvmd_pause_status_request", function(_, ply)
@@ -3382,7 +3521,7 @@ net.Receive("mmdvmd_flex_override_save", function(_, ply)
         string.format("saved flex mapping for %s; removed %d built cache(s) for this model", tostring(mmdName ~= "" and mmdName or sourceName), removed),
         ent
     )
-    send_motion_details(ply, MMDVMDNPC.ToolOptions())
+    queue_motion_details(ply, MMDVMDNPC.ToolOptions())
 end)
 
 net.Receive("mmdvmd_flex_override_clear", function(_, ply)
@@ -3405,7 +3544,7 @@ net.Receive("mmdvmd_flex_override_clear", function(_, ply)
         string.format("cleared flex mapping for %s; removed %d built cache(s) for this model", tostring(mmdName ~= "" and mmdName or sourceName), removed),
         ent
     )
-    send_motion_details(ply, MMDVMDNPC.ToolOptions())
+    queue_motion_details(ply, MMDVMDNPC.ToolOptions())
 end)
 
 net.Receive("mmdvmd_flex_override_unassign", function(_, ply)
@@ -3428,7 +3567,7 @@ net.Receive("mmdvmd_flex_override_unassign", function(_, ply)
         string.format("unassigned flex mapping for %s; removed %d built cache(s) for this model", tostring(mmdName ~= "" and mmdName or sourceName), removed),
         ent
     )
-    send_motion_details(ply, MMDVMDNPC.ToolOptions())
+    queue_motion_details(ply, MMDVMDNPC.ToolOptions())
 end)
 
 net.Receive("mmdvmd_select_target", function(_, ply)
