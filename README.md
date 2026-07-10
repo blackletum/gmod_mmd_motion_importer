@@ -1,3 +1,4 @@
+<img width="3388" height="1512" alt="ReleaseTC" src="https://github.com/user-attachments/assets/c7504fdf-0048-454c-9d61-2d0879c3a02a" />
 # GMod MMD Motion Importer
 Visit: https://steamcommunity.com/sharedfiles/filedetails/?id=3718373357
 
