@@ -2782,20 +2782,25 @@ def write_cache(vmd_path: Path, output_dir: Path, debug_retarget: bool = False) 
 
 
 def compact_morph_keyframes(frames: list[MorphFrame]) -> list[list[float]]:
+    # These keys are played back with LINEAR interpolation, so a key may only
+    # be dropped when it is the INTERIOR of a constant run — same weight as
+    # both the previous kept key and the next key. Dropping any key whose
+    # weight merely equals the last kept one (the old rule) also removed the
+    # LAST key of a run, turning an instant 0->1 pop at frame N into a ramp
+    # that starts at the previous value change, potentially hundreds of frames
+    # earlier (bikkuri read 0.94 at frame 202 instead of 0 because its
+    # (210, 0.0) hold key was deleted and only (214, 1.0) survived).
+    ordered = sorted(frames, key=lambda item: item.frame)
+    count = len(ordered)
     keys: list[list[float]] = []
-    last_weight: float | None = None
-    for frame in sorted(frames, key=lambda item: item.frame):
+    for index, frame in enumerate(ordered):
         weight = max(0.0, min(1.0, float(frame.weight)))
-        if last_weight is None or abs(weight - last_weight) > 0.000001 or not keys:
-            keys.append([int(frame.frame), round(weight, 6)])
-            last_weight = weight
-
-    if frames:
-        final = max(frames, key=lambda item: item.frame)
-        final_weight = max(0.0, min(1.0, float(final.weight)))
-        if not keys or keys[-1][0] != final.frame:
-            keys.append([int(final.frame), round(final_weight, 6)])
-
+        if index > 0 and index < count - 1:
+            prev_weight = keys[-1][1]
+            next_weight = max(0.0, min(1.0, float(ordered[index + 1].weight)))
+            if abs(weight - prev_weight) <= 0.000001 and abs(next_weight - weight) <= 0.000001:
+                continue
+        keys.append([int(frame.frame), round(weight, 6)])
     return keys
 
 
@@ -2809,19 +2814,20 @@ def combine_morph_frames_additive(frame_sets: list[list[MorphFrame]]) -> list[Mo
         return []
 
     sample_frames = sorted({int(frame.frame) for frames in active_sets for frame in frames})
+    weights = [
+        max(0.0, min(1.0, sum(sample_morph(frames, frame) for frames in active_sets)))
+        for frame in sample_frames
+    ]
+    # Same run-boundary rule as compact_morph_keyframes: linear playback means
+    # only interior keys of constant runs are redundant.
     combined: list[MorphFrame] = []
-    last_weight: float | None = None
-    for frame in sample_frames:
-        weight = sum(sample_morph(frames, frame) for frames in active_sets)
-        weight = max(0.0, min(1.0, weight))
-        if last_weight is None or abs(weight - last_weight) > 0.000001 or not combined:
-            combined.append(MorphFrame(frame, weight))
-            last_weight = weight
-
-    final_frame = max(sample_frames)
-    if combined and combined[-1].frame != final_frame:
-        final_weight = sum(sample_morph(frames, final_frame) for frames in active_sets)
-        combined.append(MorphFrame(final_frame, max(0.0, min(1.0, final_weight))))
+    count = len(sample_frames)
+    for index, frame in enumerate(sample_frames):
+        weight = weights[index]
+        if index > 0 and index < count - 1:
+            if abs(weight - combined[-1].weight) <= 0.000001 and abs(weights[index + 1] - weight) <= 0.000001:
+                continue
+        combined.append(MorphFrame(frame, weight))
     return combined
 
 
