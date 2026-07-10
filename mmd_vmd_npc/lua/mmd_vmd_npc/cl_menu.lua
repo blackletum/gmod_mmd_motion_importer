@@ -3974,6 +3974,13 @@ local function forget_client_motion(motionID)
             MMDVMDNPC.ClientBuiltCache[path] = nil
         end
     end
+    -- Deleting a motion also takes it off the radial wheel: the manager can
+    -- only toggle motions still in its list, so a leftover favorite would be
+    -- unremovable from the UI. (ToggleFavorite REMOVES here because the id is
+    -- present; it also persists and fires MMDVMDNPCWheelFavoritesChanged.)
+    if MMDVMDNPC.IsFavorite and MMDVMDNPC.IsFavorite(motionID) and MMDVMDNPC.ToggleFavorite then
+        MMDVMDNPC.ToggleFavorite(motionID)
+    end
 
     local current = GetConVar("mmd_vmd_npc_motion")
     if current and current:GetString() == motionID then
@@ -4210,8 +4217,9 @@ local function open_motion_browser()
     -- DListView has no horizontal scrollbar. Bone/flex counts and the raw
     -- addon flag moved to the details pane — the list keeps what you scan for.
     local columns = {
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_motion_id")), 170 },
-        { list:AddColumn(L("mmd_vmd_npc.manager.column_category")), 105 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_motion_id")), 160 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_english")), 110 },
+        { list:AddColumn(L("mmd_vmd_npc.manager.column_category")), 100 },
         { list:AddColumn(L("mmd_vmd_npc.manager.column_duration")), 64 },
         { list:AddColumn(L("mmd_vmd_npc.manager.column_frames")), 64 },
         { list:AddColumn(L("mmd_vmd_npc.manager.column_music")), 52 },
@@ -4219,7 +4227,7 @@ local function open_motion_browser()
         { list:AddColumn(L("mmd_vmd_npc.manager.column_built")), 64 },
         { list:AddColumn(L("mmd_vmd_npc.manager.column_wheel")), 56 },
     }
-    local WHEEL_COLUMN = 8
+    local WHEEL_COLUMN = 9
     for _, columnInfo in ipairs(columns) do
         local column, width = columnInfo[1], columnInfo[2]
         if IsValid(column) and column.SetMinWidth then column:SetMinWidth(width) end
@@ -4252,9 +4260,14 @@ local function open_motion_browser()
     metaLink:Dock(RIGHT)
     style_manager_button(metaLink, 130)
     metaLink:SetText(L("mmd_vmd_npc.manager.open_link", "Open Link"))
+    metaLink:SetTooltip(L("mmd_vmd_npc.ui.link_warning"))
     metaLink.MetaURL = ""
     metaLink.DoClick = function(self)
-        if self.MetaURL ~= "" then gui.OpenURL(self.MetaURL) end
+        local url = self.MetaURL
+        if url == "" then return end
+        -- gui.OpenURL silently ignores scheme-less URLs ("www.youtube.com/...").
+        if not string.match(url, "^https?://") then url = "https://" .. url end
+        gui.OpenURL(url)
     end
 
     local metaLabel = vgui.Create("DLabel", metaPanel)
@@ -4435,6 +4448,7 @@ local function open_motion_browser()
                     signature[#signature + 1] = table.concat({
                         tostring(meta.id), displayName, tostring(meta.built),
                         wheelText, tostring(meta.category or ""),
+                        tostring(meta.englishName or ""),
                         tostring(meta.modified or ""), tostring(meta.duration or ""),
                         tostring(meta.frameCount or ""), tostring(meta.musicSound or ""),
                         tostring(meta.hasCamera),
@@ -4453,6 +4467,7 @@ local function open_motion_browser()
             local meta = row.meta
             local line = list:AddLine(
                 row.displayName,
+                tostring(meta.englishName or ""),
                 -- nil category = details not streamed yet; show blank, not a
                 -- confident (and possibly wrong) "User Import".
                 meta.category and MMDVMDNPC.CategoryDisplayName(meta.category) or "",

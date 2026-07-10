@@ -297,12 +297,20 @@ end
 
 function PANEL:RebuildPageNames()
     self.SlotNames = {}
+    self.SlotMissing = {}
+    -- Only trust "missing" once the server's details have streamed; an empty
+    -- cache just means this client has not requested them yet.
+    local details = MMDVMDNPC.MotionDetails or {}
+    local haveDetails = next(details) ~= nil
     for i = 1, SLOTS_PER_PAGE do
         local kind, id = self:SlotAction(i)
         if kind == "stop" then
             self.SlotNames[i] = { WL("mmd_vmd_npc.radial.stop", "STOP") }
         elseif kind == "motion" then
             self.SlotNames[i] = WrapText(MMDVMDNPC.GetNiceName(id or "Unknown"), "DermaDefaultBold", 150)
+            -- A favorite whose motion JSON no longer exists (deleted by hand):
+            -- unplayable, drawn red, removable with right-click.
+            self.SlotMissing[i] = haveDetails and details[id] == nil or false
         else
             self.SlotNames[i] = {}
         end
@@ -377,6 +385,8 @@ function PANEL:Paint(w, h)
             local col
             if isStop then
                 col = isSelected and Color(255, 160, 160) or Color(232, 96, 96)
+            elseif self.SlotMissing and self.SlotMissing[i] then
+                col = isSelected and Color(255, 140, 140) or Color(210, 100, 100)
             else
                 col = isSelected and Color(255, 255, 255) or Color(188, 188, 188)
             end
@@ -398,6 +408,12 @@ function PANEL:Paint(w, h)
     elseif #(self.Motions or {}) == 0 and (self.CategoryFilter or "") ~= "" then
         draw.SimpleText(WL("mmd_vmd_npc.radial.category_empty", "No wheel dances in this category"),
             "DermaDefault", cx, cy, Color(180, 180, 180), 1, 1)
+    end
+
+    -- Hovering a favorite whose motion file is gone: say so and how to fix it.
+    if self.SelectedSlot > 1 and self.SlotMissing and self.SlotMissing[self.SelectedSlot] then
+        draw.SimpleText(WL("mmd_vmd_npc.radial.missing_hint", "Motion file is missing — right-click to remove it from the wheel"),
+            "DermaDefaultBold", cx, cy + (self.PageCount > 1 and 32 or 0), Color(255, 150, 150), 1, 1)
     end
 
     -- Follow toggle
@@ -443,6 +459,25 @@ function PANEL:OnMousePressed(mouseCode)
             self:ToggleCameraAuto()
         elseif self.SelectedSlot > 0 then
             self:ExecuteSelection(self.SelectedSlot)
+        end
+    elseif mouseCode == MOUSE_RIGHT and self.SelectedSlot > 1 then
+        -- Right-click removes the hovered dance from the wheel. This is the
+        -- only in-game way to drop a favorite whose motion JSON was deleted
+        -- by hand (it no longer appears in the Motion Manager's list, so the
+        -- manager's toggle can never reach it). The wheel stays open.
+        local kind, id = self:SlotAction(self.SelectedSlot)
+        if kind == "motion" and id and MMDVMDNPC.ToggleFavorite then
+            MMDVMDNPC.ToggleFavorite(id)
+            surface.PlaySound("buttons/button15.wav")
+            notification.AddLegacy(
+                string.format(WL("mmd_vmd_npc.radial.removed_fmt", "Removed from wheel: %s"),
+                    MMDVMDNPC.GetNiceName and MMDVMDNPC.GetNiceName(id) or id),
+                NOTIFY_CLEANUP or 1, 3)
+            -- Slots reflow after the removal, so a key-release right after
+            -- would execute whatever dance slid under the cursor; the release
+            -- handler treats a very recent removal as "just close".
+            self.LastRemovalTime = RealTime()
+            self:RebuildMotions()
         end
     end
 end
@@ -514,7 +549,9 @@ end)
 
 concommand.Add("-mmd_wheel", function()
     if IsValid(radialMenuInstance) and not radialMenuInstance.Closed then
-        if radialMenuInstance.SelectedSlot and radialMenuInstance.SelectedSlot > 0 then
+        local recentRemoval = radialMenuInstance.LastRemovalTime
+            and (RealTime() - radialMenuInstance.LastRemovalTime) < 0.6
+        if radialMenuInstance.SelectedSlot and radialMenuInstance.SelectedSlot > 0 and not recentRemoval then
             radialMenuInstance:ExecuteSelection(radialMenuInstance.SelectedSlot)
         else
             radialMenuInstance:CloseMenu()

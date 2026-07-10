@@ -13,7 +13,7 @@ import numpy as np
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-    from PySide6.QtOpenGLWidgets import QOpenGLWidget
+    from PySide6.QtOpenGL import QOpenGLWindow
 except Exception as exc:  # pragma: no cover - GUI dependency guard
     raise RuntimeError("PySide6 is required for the importer preview UI") from exc
 
@@ -143,12 +143,20 @@ def _rotation_between(a: np.ndarray, b: np.ndarray, max_angle: float) -> np.ndar
     return _axis_angle_matrix(axis, angle)
 
 
-class PreviewWidget(QOpenGLWidget):
+# A QOpenGLWindow embedded via QWidget.createWindowContainer, NOT a
+# QOpenGLWidget: the mere presence of a QOpenGLWidget in the widget tree —
+# even on a never-shown tab — switches the ENTIRE top-level window from raster
+# to GPU-composited flushing, which made every text-field repaint (drag
+# selection, typing) several times slower app-wide (and far worse when Qt
+# falls back to software OpenGL in the packaged exe). A native GL child window
+# confines the OpenGL pipeline to the preview viewport; the rest of the UI
+# keeps the fast raster backing store.
+class PreviewWidget(QOpenGLWindow):
     frameChanged = QtCore.Signal(int, float)
     statsChanged = QtCore.Signal(str)
 
     def __init__(self, parent=None) -> None:
-        super().__init__(parent)
+        super().__init__()
         self.scene_data: PreviewScene | None = None
         self.playing = False
         self.loop = True
@@ -163,7 +171,10 @@ class PreviewWidget(QOpenGLWidget):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(16)
-        self.setMinimumSize(480, 300)
+        # QWindow wants a QSize (no (w, h) overload); the widget container in
+        # the GUI mirrors this minimum. QWindow needs no setMouseTracking —
+        # move events are always delivered, and only drags are used anyway.
+        self.setMinimumSize(QtCore.QSize(480, 300))
 
         self._positions: np.ndarray | None = None
         self._normals: np.ndarray | None = None
@@ -210,7 +221,10 @@ class PreviewWidget(QOpenGLWidget):
         self._enabled_ik_count = 0
         self._first_ik_warning = ""
         self._show_debug_center_marker = False
-        self.setMouseTracking(True)
+
+    def rect(self) -> QtCore.QRect:
+        # QWindow has no rect(); the painter overlays use it like QWidget's.
+        return QtCore.QRect(0, 0, self.width(), self.height())
 
     def load_scene(
         self,
@@ -693,7 +707,7 @@ class PreviewWidget(QOpenGLWidget):
         self._emit_stats()
 
     def _gl_viewport_size(self) -> tuple[int, int]:
-        dpr = max(1.0, float(self.devicePixelRatioF()))
+        dpr = max(1.0, float(self.devicePixelRatio()))
         return max(1, int(round(self.width() * dpr))), max(1, int(round(self.height() * dpr)))
 
     def _release_gl_resources(self) -> None:

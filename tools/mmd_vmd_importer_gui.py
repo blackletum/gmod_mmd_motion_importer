@@ -836,7 +836,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.preview_link_hint.setWordWrap(True)
         layout.addWidget(self.preview_link_hint)
         self.preview = PreviewWidget()
-        layout.addWidget(self.preview, 1)
+        # The preview is a native QOpenGLWindow inside a container so OpenGL
+        # never forces the whole top-level window into GPU compositing (which
+        # made every text-field repaint app-wide several times slower).
+        self.preview_tab = tab
+        self.preview_container = QtWidgets.QWidget.createWindowContainer(self.preview, tab)
+        self.preview_container.setMinimumSize(480, 300)
+        layout.addWidget(self.preview_container, 1)
         controls_top = QtWidgets.QHBoxLayout()
         controls_top.setSpacing(8)
         controls_scrub = QtWidgets.QHBoxLayout()
@@ -1201,7 +1207,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             )
             self.preview.set_follow_camera(self.follow_camera_check.isChecked())
             self.follow_camera_check.setEnabled(self.preview.has_camera_motion())
-            self.tabs.setCurrentWidget(self.preview.parentWidget())
+            self.tabs.setCurrentWidget(self.preview_tab)
             self.append_log(
                 self.tr(
                     "log.preview_loaded",
@@ -1910,14 +1916,13 @@ class ImporterWindow(QtWidgets.QMainWindow):
 
 
 def main() -> int:
-    # The preview viewport is a QOpenGLWidget, which makes the ENTIRE window
-    # composite its backing store through OpenGL. With the default swap interval
-    # of 1 (vsync), every backing-store flush blocks until the next vertical blank
-    # (~16 ms at 60 Hz) — including the many tiny repaints emitted while dragging a
-    # text selection or typing into a field. That made text interaction feel laggy
-    # while the rest of the UI (which repaints far less often) did not. Disabling
-    # vsync on the default surface format removes the per-flush vblank stall; the
-    # preview still renders at its ~60 Hz timer cadence, just without the wait.
+    # The preview viewport is a native QOpenGLWindow in a window container, so
+    # the top-level window keeps its fast raster backing store (a QOpenGLWidget
+    # here — even on a hidden tab — forced the WHOLE window through GPU
+    # compositing and made every text-field repaint several times slower).
+    # Still disable vsync on the default format: it only affects the preview
+    # window's own swapchain now, whose cadence comes from its 16 ms timer —
+    # without this its paints would additionally block on the vertical blank.
     # Must run before the QApplication and any OpenGL context is created.
     surface_format = QtGui.QSurfaceFormat.defaultFormat()
     surface_format.setSwapInterval(0)

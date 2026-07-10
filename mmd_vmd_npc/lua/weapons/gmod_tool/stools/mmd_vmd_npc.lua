@@ -459,6 +459,76 @@ function TOOL.BuildCPanel(panel)
     pauseWarningLabel:SetVisible(false)
     motionTab:AddItem(pauseWarningLabel)
 
+    -- Metadata of the selected motion (the importer's 7-field table), shown
+    -- right under the selection. Hidden until a motion with metadata is picked.
+    local motionMetaLabel = vgui.Create("DLabel")
+    motionMetaLabel:SetText("")
+    bounded_label(motionMetaLabel, "DermaDefault", Color(210, 220, 230), compactPanel and 34 or 40)
+    motionMetaLabel:SetVisible(false)
+    motionTab:AddItem(motionMetaLabel)
+
+    -- Source link: a read-only text entry so the URL can be selected/copied,
+    -- plus an Open button. The button opens the ORIGINAL metadata URL (stored
+    -- on the row), never edited entry text.
+    local linkRow = vgui.Create("DPanel")
+    linkRow:SetTall(26)
+    linkRow:SetPaintBackground(false)
+    linkRow:SetVisible(false)
+    linkRow.MetaURL = ""
+    local linkOpen = vgui.Create("DButton", linkRow)
+    linkOpen:Dock(RIGHT)
+    linkOpen:SetWide(100)
+    linkOpen:SetText(L("mmd_vmd_npc.manager.open_link", "Open Link"))
+    linkOpen:SetTooltip(L("mmd_vmd_npc.ui.link_warning"))
+    linkOpen.DoClick = function()
+        local url = linkRow.MetaURL
+        if url == "" then return end
+        -- gui.OpenURL silently ignores scheme-less URLs ("www.youtube.com/...").
+        if not string.match(url, "^https?://") then url = "https://" .. url end
+        gui.OpenURL(url)
+    end
+    local linkEntry = vgui.Create("DTextEntry", linkRow)
+    linkEntry:Dock(FILL)
+    linkEntry:DockMargin(0, 0, 6, 0)
+    linkEntry:SetEditable(false)
+    motionTab:AddItem(linkRow)
+
+    local linkWarning = vgui.Create("DLabel")
+    linkWarning:SetText(L("mmd_vmd_npc.ui.link_warning"))
+    bounded_label(linkWarning, "DermaDefaultBold", Color(255, 170, 70), compactPanel and 28 or 34)
+    linkWarning:SetVisible(false)
+    motionTab:AddItem(linkWarning)
+
+    local function update_selected_meta(meta)
+        if not IsValid(motionMetaLabel) or not IsValid(linkRow) or not IsValid(linkWarning) then return end
+        meta = istable(meta) and meta or nil
+        local parts = {}
+        local function add(labelKey, fallback, value)
+            value = tostring(value or "")
+            if value ~= "" then
+                parts[#parts + 1] = L(labelKey, fallback) .. ": " .. value
+            end
+        end
+        if meta then
+            add("mmd_vmd_npc.meta.category", "Category",
+                (meta.category and meta.category ~= "" and MMDVMDNPC.CategoryDisplayName) and MMDVMDNPC.CategoryDisplayName(meta.category) or "")
+            add("mmd_vmd_npc.meta.english_name", "English", meta.englishName)
+            add("mmd_vmd_npc.meta.artist", "Artist", meta.artist)
+            add("mmd_vmd_npc.meta.language", "Language", meta.language)
+            add("mmd_vmd_npc.meta.motion_artist", "Motion Artist", meta.motionArtist)
+        end
+        motionMetaLabel:SetText(table.concat(parts, "  |  "))
+        motionMetaLabel:SetVisible(#parts > 0)
+        local link = meta and tostring(meta.link or "") or ""
+        linkRow.MetaURL = link
+        -- Only rewrite when changed: the details hooks fire in bursts and an
+        -- unconditional SetValue would drop an in-progress copy selection.
+        if IsValid(linkEntry) and linkEntry:GetValue() ~= link then linkEntry:SetValue(link) end
+        linkRow:SetVisible(link ~= "")
+        linkWarning:SetVisible(link ~= "")
+        motionTab:InvalidateLayout()
+    end
+
     local function convar_number(name)
         local cvar = GetConVar(name)
         if not cvar then return 0 end
@@ -484,25 +554,10 @@ function TOOL.BuildCPanel(panel)
 
     timer.Create(hookID .. "_PauseWarning", 0.5, 0, request_pause_status)
 
-    local audioOffsetSlider = vgui.Create("DNumSlider")
-    audioOffsetSlider:SetText(L("mmd_vmd_npc.ui.music_offset"))
-    audioOffsetSlider:SetMin(-5)
-    audioOffsetSlider:SetMax(5)
-    audioOffsetSlider:SetDecimals(2)
-    audioOffsetSlider:SetValue(0)
-    audioOffsetSlider:SetTall(42)
-    motionTab:AddItem(audioOffsetSlider)
-
-    add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.play_imported_music"), "mmd_vmd_npc_music_enabled", L("mmd_vmd_npc.ui.play_imported_music_help"))
-    add_slider(motionTab, L("mmd_vmd_npc.ui.music_volume"), "mmd_vmd_npc_music_volume", 0, 2, 2)
-    add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.music_omni"), "mmd_vmd_npc_music_omni", L("mmd_vmd_npc.ui.music_omni_help"))
-    add_slider(motionTab, L("mmd_vmd_npc.ui.music_range"), "mmd_vmd_npc_music_range", 100, 5000, 0)
-    add_slider(motionTab, L("mmd_vmd_npc.ui.music_fade"), "mmd_vmd_npc_music_fade", 10, 2000, 0)
-    motionTab:Help(L("mmd_vmd_npc.ui.music_range_help"))
-    add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.loop_playback"), "mmd_vmd_npc_loop_playback", L("mmd_vmd_npc.ui.loop_playback_help"))
-
     -- Category + text filter row above the motion list (same category set as
-    -- the Motion Manager: addon categories + "User Import").
+    -- the Motion Manager: addon categories + "User Import"). The motion table
+    -- lives directly under the selected-motion header; the music settings
+    -- follow it further down.
     local stoolCategoryFilter = cookie and cookie.GetString and cookie.GetString("mmdvmd_tool_category", "") or ""
     local filterRow = vgui.Create("DPanel")
     filterRow:SetTall(26)
@@ -521,6 +576,8 @@ function TOOL.BuildCPanel(panel)
     motionList:SetTall(compactPanel and 190 or 250)
     motionList:SetMultiSelect(false)
     motionList:AddColumn(L("mmd_vmd_npc.ui.column.motion"))
+    local englishColumn = motionList:AddColumn(L("mmd_vmd_npc.manager.column_english"))
+    if IsValid(englishColumn) and englishColumn.SetMinWidth then englishColumn:SetMinWidth(85) end
     local categoryColumn = motionList:AddColumn(L("mmd_vmd_npc.manager.column_category"))
     if IsValid(categoryColumn) and categoryColumn.SetMinWidth then categoryColumn:SetMinWidth(90) end
     motionList:AddColumn(L("mmd_vmd_npc.ui.column.duration"))
@@ -610,10 +667,14 @@ function TOOL.BuildCPanel(panel)
         local detailsByID = MMDVMDNPC.MotionDetails or {}
         local query = string.lower(IsValid(motionSearch) and motionSearch:GetValue() or "")
 
+        local function english_text(meta)
+            return istable(meta) and tostring(meta.englishName or "") or ""
+        end
+
         local function add_row(id, meta)
             seen[id] = true
             if not stool_row_matches(meta, id, query) then return end
-            local line = motionList:AddLine(motion_display_name(meta or id), stool_category_text(meta), duration_text(meta))
+            local line = motionList:AddLine(motion_display_name(meta or id), english_text(meta), stool_category_text(meta), duration_text(meta))
             line.MotionID = id
             line.Meta = meta
             if id == selected then selectedLine = line end
@@ -635,7 +696,8 @@ function TOOL.BuildCPanel(panel)
         -- from the list (deleted) or hidden by the active filters.
         if selected ~= "" and not selectedLine then
             local label = seen[selected] and motion_display_name(selected) or selected
-            selectedLine = motionList:AddLine(label, stool_category_text(detailsByID[selected]),
+            selectedLine = motionList:AddLine(label, english_text(detailsByID[selected]),
+                stool_category_text(detailsByID[selected]),
                 seen[selected] and duration_text(detailsByID[selected]) or L("mmd_vmd_npc.ui.missing"))
             selectedLine.MotionID = selected
             selectedLine.Meta = detailsByID[selected]
@@ -727,6 +789,23 @@ function TOOL.BuildCPanel(panel)
             end)
         end
     end
+
+    local audioOffsetSlider = vgui.Create("DNumSlider")
+    audioOffsetSlider:SetText(L("mmd_vmd_npc.ui.music_offset"))
+    audioOffsetSlider:SetMin(-5)
+    audioOffsetSlider:SetMax(5)
+    audioOffsetSlider:SetDecimals(2)
+    audioOffsetSlider:SetValue(0)
+    audioOffsetSlider:SetTall(42)
+    motionTab:AddItem(audioOffsetSlider)
+
+    add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.play_imported_music"), "mmd_vmd_npc_music_enabled", L("mmd_vmd_npc.ui.play_imported_music_help"))
+    add_slider(motionTab, L("mmd_vmd_npc.ui.music_volume"), "mmd_vmd_npc_music_volume", 0, 2, 2)
+    add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.music_omni"), "mmd_vmd_npc_music_omni", L("mmd_vmd_npc.ui.music_omni_help"))
+    add_slider(motionTab, L("mmd_vmd_npc.ui.music_range"), "mmd_vmd_npc_music_range", 100, 5000, 0)
+    add_slider(motionTab, L("mmd_vmd_npc.ui.music_fade"), "mmd_vmd_npc_music_fade", 10, 2000, 0)
+    motionTab:Help(L("mmd_vmd_npc.ui.music_range_help"))
+    add_checkbox_with_help(motionTab, L("mmd_vmd_npc.ui.loop_playback"), "mmd_vmd_npc_loop_playback", L("mmd_vmd_npc.ui.loop_playback_help"))
 
     audioOffsetSlider.OnValueChanged = function(_, value)
         if audioOffsetSuppress then return end
@@ -1045,6 +1124,7 @@ function TOOL.BuildCPanel(panel)
         if IsValid(selectedMotionLabel) then
             selectedMotionLabel:SetText(motionID ~= "" and LF("mmd_vmd_npc.ui.selected_motion_fmt", shorten_text(motion_display_name(meta or motionID), textLimit)) or L("mmd_vmd_npc.ui.selected_motion_none"))
         end
+        update_selected_meta(meta)
         if IsValid(audioOffsetSlider) then
             audioOffsetSuppress = true
             audioOffsetSlider:SetValue(math.Clamp(tonumber(MMDVMDNPC.AudioOffsets and MMDVMDNPC.AudioOffsets[motionID] or 0) or 0, -5, 5))
