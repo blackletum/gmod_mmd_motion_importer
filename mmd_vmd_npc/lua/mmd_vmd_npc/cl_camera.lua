@@ -17,7 +17,10 @@ MMDVMDNPC.CameraDebugPreview = MMDVMDNPC.CameraDebugPreview or nil
 
 CreateClientConVar("mmd_vmd_npc_camera_key", "0", true, false, "Key code that toggles the imported camera animation view")
 CreateClientConVar("mmd_vmd_npc_camera_auto", "1", true, false, "Automatically enter the imported camera animation when a dance you start has one")
-CreateClientConVar("mmd_vmd_npc_cam_scale", "1", true, false, "Camera animation: global position scale")
+CreateClientConVar("mmd_vmd_npc_cam_scale", "1", true, false, "Camera animation: legacy uniform position scale (migrated into the per-axis scales)")
+CreateClientConVar("mmd_vmd_npc_cam_scale_x", "1", true, false, "Camera animation: position scale forward")
+CreateClientConVar("mmd_vmd_npc_cam_scale_y", "1", true, false, "Camera animation: position scale left")
+CreateClientConVar("mmd_vmd_npc_cam_scale_z", "1", true, false, "Camera animation: position scale up")
 CreateClientConVar("mmd_vmd_npc_cam_offset_x", "0", true, false, "Camera animation: global offset forward")
 CreateClientConVar("mmd_vmd_npc_cam_offset_y", "0", true, false, "Camera animation: global offset left")
 CreateClientConVar("mmd_vmd_npc_cam_offset_z", "0", true, false, "Camera animation: global offset up")
@@ -26,6 +29,9 @@ CreateClientConVar("mmd_vmd_npc_cam_pitch", "0", true, false, "Camera animation:
 CreateClientConVar("mmd_vmd_npc_cam_fov", "0", true, false, "Camera animation: fov offset (degrees)")
 CreateClientConVar("mmd_vmd_npc_cam_collision", "1", true, false, "Camera animation: pull the camera in front of walls it would otherwise clip through")
 CreateClientConVar("mmd_vmd_npc_cam_max_distance", "2500", true, false, "Camera animation: cap the camera's distance to the subject (0 = unlimited)")
+CreateClientConVar("mmd_vmd_npc_cam_follow", "0", true, false, "Camera animation: rotate the view to keep the character in frame (experimental, play-time only)")
+CreateClientConVar("mmd_vmd_npc_cam_follow_margin", "0.33", true, false, "Camera follow: fraction of the half-frame the character may drift from center before the camera turns (0 = always centered)")
+CreateClientConVar("mmd_vmd_npc_cam_follow_speed", "8", true, false, "Camera follow: correction turn speed (per second)")
 
 -- Wall collision defaults on. New clients already get "1"; this one-time
 -- migration also turns it on for existing clients that saved it off during
@@ -36,6 +42,29 @@ hook.Add("InitPostEntity", "MMDVMDNPCCamCollisionDefaultOn", function()
     if marker and marker:GetBool() then return end
     RunConsoleCommand("mmd_vmd_npc_cam_collision_migrated", "1")
     RunConsoleCommand("mmd_vmd_npc_cam_collision", "1")
+end)
+
+-- The uniform position scale was split per axis. Carry a tuned legacy value
+-- into any axis still at its default, then neutralize the legacy convar. The
+-- marker makes this strictly one-time: the legacy convar stays live as a
+-- uniform multiplier afterwards, and a deliberate post-split legacy value must
+-- never be folded into (and corrupt) tuned per-axis values on a later session.
+CreateClientConVar("mmd_vmd_npc_cam_scale_split_migrated", "0", true, false)
+hook.Add("InitPostEntity", "MMDVMDNPCCamScaleSplitMigrate", function()
+    local marker = GetConVar("mmd_vmd_npc_cam_scale_split_migrated")
+    if marker and marker:GetBool() then return end
+    RunConsoleCommand("mmd_vmd_npc_cam_scale_split_migrated", "1")
+    local legacy = GetConVar("mmd_vmd_npc_cam_scale")
+    if not legacy then return end
+    local value = legacy:GetFloat()
+    if value ~= value or math.abs(value - 1) < 0.001 then return end
+    for _, axis in ipairs({ "x", "y", "z" }) do
+        local cvar = GetConVar("mmd_vmd_npc_cam_scale_" .. axis)
+        if cvar and math.abs(cvar:GetFloat() - 1) < 0.001 then
+            RunConsoleCommand("mmd_vmd_npc_cam_scale_" .. axis, tostring(value))
+        end
+    end
+    RunConsoleCommand("mmd_vmd_npc_cam_scale", "1")
 end)
 
 local function L(key, fallback)
@@ -146,12 +175,19 @@ end
 -- Global user transform (tuned from the camera debug panel) -------------------
 
 local function apply_global_transform(x, y, z, p, yw, r, fov)
-    local scale = math.Clamp(convar_number("mmd_vmd_npc_cam_scale", 1), 0.05, 20)
+    -- Per-axis scales in the character's local frame (x forward, y left, z up),
+    -- applied before the yaw offset so they follow the authored composition.
+    -- The legacy uniform scale still multiplies in (it is 1 after migration)
+    -- so setting it from the console is never silently dead.
+    local legacyScale = math.Clamp(convar_number("mmd_vmd_npc_cam_scale", 1), 0.05, 20)
+    local scaleX = math.Clamp(legacyScale * convar_number("mmd_vmd_npc_cam_scale_x", 1), 0.05, 20)
+    local scaleY = math.Clamp(legacyScale * convar_number("mmd_vmd_npc_cam_scale_y", 1), 0.05, 20)
+    local scaleZ = math.Clamp(legacyScale * convar_number("mmd_vmd_npc_cam_scale_z", 1), 0.05, 20)
     local yawOff = convar_number("mmd_vmd_npc_cam_yaw", 0)
     local pitchOff = convar_number("mmd_vmd_npc_cam_pitch", 0)
     local fovOff = convar_number("mmd_vmd_npc_cam_fov", 0)
 
-    x, y, z = x * scale, y * scale, z * scale
+    x, y, z = x * scaleX, y * scaleY, z * scaleZ
     if math.abs(yawOff) > 0.001 then
         local rad = math.rad(yawOff)
         local c, s = math.cos(rad), math.sin(rad)
@@ -286,14 +322,132 @@ local function apply_camera_collision(anchorEnt, pivot, camPos, vfov)
     return pivot + dir * capped, math.Clamp(widened, vfov, math.max(vfov, CAMERA_MAX_ADJUSTED_FOV))
 end
 
+-- Experimental "follow character" (mmd_vmd_npc_cam_follow): rotate the animated
+-- view just enough to keep the dancing character near the center of frame —
+-- inside the central third by default (margin 0.33 of the half-frame). Pure
+-- render-time correction on the sampled view: builds, the imported keys and the
+-- debug preview (which must show the authored path verbatim) are untouched.
+local function camera_follow_enabled()
+    local cvar = GetConVar("mmd_vmd_npc_cam_follow")
+    return cvar ~= nil and cvar:GetBool()
+end
+
+-- Screen position maps to angle by tan, so the margin converts through
+-- atan(margin * tan(halfFov)) rather than a linear fraction of the fov.
+local function follow_max_offset(marginFrac, halfFovDeg)
+    return math.deg(math.atan(marginFrac * math.tan(math.rad(halfFovDeg))))
+end
+
+-- Cut / loop-wrap detection for the follow smoothing, on the RAW sampled keys
+-- (pre scale/anchor, so the user transform and world placement cannot skew the
+-- thresholds). The per-render-frame delta is widened by how many track frames
+-- this render frame advanced, so fast-but-smooth authored motion at low client
+-- fps is not mistaken for a cut; a backward frame jump (loop wrap) keeps the
+-- base thresholds.
+local function camera_follow_cut(track, frame, x, y, z, p, yw)
+    local cut = false
+    if track.followPrevFrame ~= nil then
+        local adv = frame - track.followPrevFrame
+        local widen = adv >= 0 and math.Clamp(adv, 1, 4) or 1
+        local posDelta = math.max(
+            math.abs(x - track.followPrevX),
+            math.abs(y - track.followPrevY),
+            math.abs(z - track.followPrevZ))
+        local angDelta = math.max(
+            math.abs(normalize_angle(p - track.followPrevP)),
+            math.abs(normalize_angle(yw - track.followPrevYw)))
+        cut = posDelta > CUT_POSITION_DELTA * widen or angDelta > CUT_ANGLE_DELTA * widen
+    end
+    track.followPrevFrame = frame
+    track.followPrevX, track.followPrevY, track.followPrevZ = x, y, z
+    track.followPrevP, track.followPrevYw = p, yw
+    return cut
+end
+
+-- Positive local yaw offset = subject left of view center; +rotation around
+-- the view's own up axis turns the camera left. Positive local pitch offset =
+-- subject below center (Source pitch-down positive); +rotation around the
+-- view's right axis pitches the camera up, hence the negation. The pitch turn
+-- uses the post-yaw right axis so the pair exactly inverts the yaw-then-pitch
+-- (atan2) decomposition of the subject offset: a full correction centers the
+-- subject precisely, whatever the authored roll.
+local function follow_corrected_angles(camAng, pitchCorr, yawCorr)
+    if math.abs(pitchCorr) < 0.001 and math.abs(yawCorr) < 0.001 then return camAng end
+    local corrected = Angle(camAng.p, camAng.y, camAng.r)
+    corrected:RotateAroundAxis(camAng:Up(), yawCorr)
+    corrected:RotateAroundAxis(corrected:Right(), -pitchCorr)
+    return corrected
+end
+
+local function apply_camera_follow(track, pivot, camPos, camAng, vfov, cutSnap)
+    local toSubject = pivot - camPos
+    if toSubject:LengthSqr() < 1 then
+        -- Degenerate close pass: no meaningful direction to retarget on; keep
+        -- holding the current correction so the view does not blip for a frame.
+        return follow_corrected_angles(camAng, track.followPitch or 0, track.followYaw or 0)
+    end
+
+    -- Subject offset decomposed in the VIEW's own (rolled) frame, so the
+    -- margin box is screen-aligned even on dutch angles, and a steep world
+    -- pitch cannot fake a huge yaw offset for a subject sitting near screen
+    -- center (the old desired.y - camAng.y decomposition blew up near the
+    -- poles). atan2 keeps it continuous when the subject is behind the camera:
+    -- that resolves to the shortest turn that brings it back into frame.
+    local dir = toSubject:GetNormalized()
+    local fwd = dir:Dot(camAng:Forward())
+    local left = -dir:Dot(camAng:Right())
+    local up = dir:Dot(camAng:Up())
+    local offYaw = math.deg(math.atan2(left, fwd))
+    local offPitch = math.deg(math.atan2(-up, math.sqrt(fwd * fwd + left * left)))
+
+    -- Frame half-angles: MMD fov is vertical and aspect-independent, the
+    -- horizontal half-angle follows from the real window aspect.
+    local halfV = math.Clamp(vfov, 1, 170) * 0.5
+    local halfH = math.deg(math.atan(math.tan(math.rad(halfV)) * (ScrW() / math.max(1, ScrH()))))
+
+    -- Turn only by the excess beyond the allowed drift, so the authored
+    -- composition survives wherever it already keeps the character framed.
+    local margin = math.Clamp(convar_number("mmd_vmd_npc_cam_follow_margin", 0.33), 0, 0.95)
+    local maxPitch = follow_max_offset(margin, halfV)
+    local maxYaw = follow_max_offset(margin, halfH)
+    local targetPitch = offPitch - math.Clamp(offPitch, -maxPitch, maxPitch)
+    local targetYaw = offYaw - math.Clamp(offYaw, -maxYaw, maxYaw)
+
+    -- Smooth toward the target correction; snap across authored camera cuts
+    -- and loop wraps so the correction does not visibly swing after the
+    -- picture itself already jumped.
+    local blend = math.Clamp(FrameTime() * math.Clamp(convar_number("mmd_vmd_npc_cam_follow_speed", 8), 0.5, 60), 0, 1)
+    if cutSnap then blend = 1 end
+    track.followPitch = lerp_angle(track.followPitch or 0, targetPitch, blend)
+    track.followYaw = lerp_angle(track.followYaw or 0, targetYaw, blend)
+
+    return follow_corrected_angles(camAng, track.followPitch, track.followYaw)
+end
+
 local function camera_view_for(track, anchorEnt, frame)
     local x, y, z, p, yw, r, fov = MMDVMDNPC.SampleCameraTrack(track, frame)
     if x == nil then return nil end
+
+    -- Follow bookkeeping runs on the raw sample, before the global transform.
+    local followActive = false
+    local followSnap = false
+    if track.debug ~= true and camera_follow_enabled() then
+        followActive = true
+        followSnap = camera_follow_cut(track, frame, x, y, z, p, yw)
+    else
+        track.followPitch, track.followYaw = nil, nil
+        track.followPrevFrame = nil
+    end
+
     x, y, z, p, yw, r, fov = apply_global_transform(x, y, z, p, yw, r, fov)
 
     local anchorPos, anchorAng = anchor_transform(anchorEnt, track)
     local worldPos, worldAng = LocalToWorld(Vector(x, y, z), Angle(p, yw, r), anchorPos, anchorAng)
-    worldPos, fov = apply_camera_collision(anchorEnt, camera_pivot(anchorEnt), worldPos, fov)
+    local pivot = camera_pivot(anchorEnt)
+    worldPos, fov = apply_camera_collision(anchorEnt, pivot, worldPos, fov)
+    if followActive then
+        worldAng = apply_camera_follow(track, pivot, worldPos, worldAng, fov, followSnap)
+    end
     return {
         origin = worldPos,
         angles = worldAng,

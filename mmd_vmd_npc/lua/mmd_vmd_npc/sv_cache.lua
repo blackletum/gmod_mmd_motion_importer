@@ -237,19 +237,21 @@ function MMDVMDNPC.ClearFlexOverrideForModel(modelPath, mmdName, sourceName)
     mmdName = tostring(mmdName or "")
     sourceName = tostring(sourceName or "")
 
-    if istable(modelOverrides.by_mmd) and mmdName ~= "" then
-        modelOverrides.by_mmd[mmdName] = nil
+    -- Track whether anything actually existed: returning true for a no-op made
+    -- "Clear Mapping" report success on morphs that had no saved mapping.
+    local removedAny = false
+    local function drop(map, key)
+        if istable(map) and key ~= "" and map[key] ~= nil then
+            map[key] = nil
+            removedAny = true
+        end
     end
-    if istable(modelOverrides.by_source) and sourceName ~= "" then
-        modelOverrides.by_source[sourceName] = nil
-    end
-    if istable(modelOverrides.by_mmd_norm) and mmdName ~= "" then
-        modelOverrides.by_mmd_norm[normalize_flex_name(mmdName)] = nil
-    end
-    if istable(modelOverrides.by_source_norm) and sourceName ~= "" then
-        modelOverrides.by_source_norm[normalize_flex_name(sourceName)] = nil
-    end
+    drop(modelOverrides.by_mmd, mmdName)
+    drop(modelOverrides.by_source, sourceName)
+    drop(modelOverrides.by_mmd_norm, mmdName ~= "" and normalize_flex_name(mmdName) or "")
+    drop(modelOverrides.by_source_norm, sourceName ~= "" and normalize_flex_name(sourceName) or "")
 
+    if not removedAny then return false end
     MMDVMDNPC.SaveFlexOverrides()
     return true
 end
@@ -578,6 +580,19 @@ local built_header_index, save_built_header_index = make_index(BUILT_HEADER_INDE
 -- stale shape forever (the motion files themselves did not change).
 local MOTION_META_SCHEMA = 2
 
+-- True when MotionMetadata(id) would be served straight from the persisted
+-- index — i.e. calling it costs no multi-MB JSON parse. Lets callers budget
+-- the expensive derives (send_motion_details time-slices them per tick).
+function MMDVMDNPC.HasMotionMetadataCached(motionID)
+    local info = motion_file_info(motionID)
+    if not info then return false end
+    local cached = motion_meta_index()[info.id]
+    if not istable(cached) or not istable(cached.meta) then return false end
+    if cached.meta.schema ~= MOTION_META_SCHEMA then return false end
+    return cached.modified == (info.modified or 0)
+        and cached.size == (file.Size(info.path, info.realm) or -1)
+end
+
 -- Motion metadata: served from the index whenever the file's mtime is unchanged
 -- so a full parse only happens for new/changed motions.
 function MMDVMDNPC.MotionMetadata(motionID)
@@ -596,6 +611,7 @@ function MMDVMDNPC.MotionMetadata(motionID)
         return cached.meta
     end
 
+    local hadCachedMotion = MMDVMDNPC.Cache[info.id] ~= nil
     local motion, err = MMDVMDNPC.LoadMotion(info.id)
     if not motion then return nil, err end
 
@@ -650,6 +666,15 @@ function MMDVMDNPC.MotionMetadata(motionID)
 
     idx[info.id] = { modified = modified, size = size, meta = meta }
     save_motion_meta_index()
+    -- The full parsed motion (multi-MB of baked tracks) was only needed to
+    -- derive this small header. Keeping every such motion resident would run
+    -- the game out of memory the first time a mounted pack brings dozens of
+    -- dances (menu open -> details walk -> N full parses all retained).
+    -- Playback/build reloads on demand; the persisted index makes this derive
+    -- a one-time cost per file.
+    if not hadCachedMotion then
+        MMDVMDNPC.Cache[info.id] = nil
+    end
     return meta
 end
 

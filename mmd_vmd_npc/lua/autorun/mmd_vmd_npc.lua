@@ -17,6 +17,8 @@ if SERVER then
     util.AddNetworkString("mmdvmd_debug_response")
     util.AddNetworkString("mmdvmd_debug_open")
     util.AddNetworkString("mmdvmd_debug_apply")
+    util.AddNetworkString("mmdvmd_debug_close")
+    util.AddNetworkString("mmdvmd_client_built_invalidate")
     util.AddNetworkString("mmdvmd_flex_override_save")
     util.AddNetworkString("mmdvmd_flex_override_clear")
     util.AddNetworkString("mmdvmd_flex_override_unassign")

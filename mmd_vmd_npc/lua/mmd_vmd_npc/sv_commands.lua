@@ -196,6 +196,11 @@ end
 
 hook.Add("PlayerDisconnected", "MMDVMDNPCDebugTargetCleanup", function(ply)
     if cleanup_self_proxy_for_player then cleanup_self_proxy_for_player(ply) end
+    local debugTarget = MMDVMDNPC.DebugTargets[ply]
+    if IsValid(debugTarget) and MMDVMDNPC.DebugFlexHolds then
+        MMDVMDNPC.DebugFlexHolds[debugTarget] = nil
+    end
+    if MMDVMDNPC.LastDebugFrame then MMDVMDNPC.LastDebugFrame[ply] = nil end
     MMDVMDNPC.DebugTargets[ply] = nil
     MMDVMDNPC.AssignedActors[ply] = nil
     if clear_build_job then clear_build_job(ply) else MMDVMDNPC.BuildJobs[ply] = nil end
@@ -432,14 +437,30 @@ local function has_active_animation_playback()
     return false
 end
 
+-- Debug-window flex poses being HELD per entity ({[flexID] = weight}). A
+-- one-shot SetFlexWeight from the debug apply is stomped back to neutral on
+-- the next tick by external flex drivers (the RPE living-body addon, NPC AI
+-- expressions), so the Think hook re-asserts these until ownership moves on
+-- (playback start / reference pose / debug close / entity gone).
+MMDVMDNPC.DebugFlexHolds = MMDVMDNPC.DebugFlexHolds or {}
+
+local function has_debug_flex_hold()
+    for ent in pairs(MMDVMDNPC.DebugFlexHolds) do
+        if IsValid(ent) then return true end
+        MMDVMDNPC.DebugFlexHolds[ent] = nil
+    end
+    return false
+end
+
 update_rpe_body_suppression = function()
     -- Only suppress the other addon's body/eye driving while a dance is
     -- ACTUALLY playing. Keying off a lingering NPC selection kept the cvars
     -- forced to 0 after the dance ended (and the NPC stayed selected), so the
     -- other addon never resumed until the selection was cleared. A play request
     -- creates the Playbacks entry before its countdown, so this still covers the
-    -- pre-roll where the NPC must hold the reference pose.
-    local needed = has_active_animation_playback()
+    -- pre-roll where the NPC must hold the reference pose. A held debug flex
+    -- pose counts too: the debug window's face would otherwise be overwritten.
+    local needed = has_active_animation_playback() or has_debug_flex_hold()
     local token = MMDVMDNPC.RPEBodySuppressionToken
     if needed and not token then
         MMDVMDNPC.RPEBodySuppressionToken = begin_scoped_cvar_suppression(RPE_BODY_SUPPRESSED_CVARS)
@@ -700,17 +721,37 @@ local function resolved_flex_name_on_entity(ent, flexName)
 end
 
 local function invalidate_built_for_model(modelPath)
-    local modelName = MMDVMDNPC.SafeModelName(modelPath or "")
-    if modelName == "" then return 0 end
+    modelPath = tostring(modelPath or "")
+    if modelPath == "" then return 0 end
 
+    -- Filenames cannot be parsed back into (id, model): both may contain '_',
+    -- and current files put a CRC segment between the model name and the
+    -- options suffix — the old "*_<model>_tw*" glob matched NOTHING, silently
+    -- deleting 0 caches. Confirm every candidate against the exact model via
+    -- the cheap mtime-keyed header index instead.
+    -- Narrow candidates with the safe-model-name glob FIRST (every file for
+    -- this model contains "_<safeName>_"): BuiltHeader falls back to a full
+    -- multi-MB parse for unindexed files, so header-confirming the whole
+    -- directory on a cold index would freeze the frame this click runs in.
     local removed = 0
-    local files = file.Find(MMDVMDNPC.BuiltRoot .. "/*_" .. modelName .. "_tw*.json", "DATA") or {}
-    for _, name in ipairs(files) do
+    local safeName = MMDVMDNPC.SafeModelName(modelPath)
+    for _, name in ipairs(file.Find(MMDVMDNPC.BuiltRoot .. "/*_" .. safeName .. "_*" .. MMDVMDNPC.CacheExtension, "DATA") or {}) do
         local path = MMDVMDNPC.BuiltRoot .. "/" .. name
-        file.Delete(path)
-        MMDVMDNPC.BuiltCache[path] = nil
-        removed = removed + 1
+        local header = MMDVMDNPC.BuiltHeader and MMDVMDNPC.BuiltHeader(path, MMDVMDNPC.BuiltCache[path]) or nil
+        if header and tostring(header.model or "") == modelPath then
+            file.Delete(path)
+            MMDVMDNPC.BuiltCache[path] = nil
+            if MMDVMDNPC.ForgetBuiltHeader then MMDVMDNPC.ForgetBuiltHeader(path) end
+            removed = removed + 1
+        end
     end
+
+    -- Clients keep their own built replicas (ClientBuiltCache) for the local
+    -- interpolated poser; tell them theirs are stale too, or they would keep
+    -- replaying the pre-edit build under the same path key.
+    net.Start("mmdvmd_client_built_invalidate")
+        net.WriteString(modelPath)
+    net.Broadcast()
     return removed
 end
 
@@ -855,24 +896,7 @@ end
 local MOTION_DETAILS_CHUNK = 40
 local MOTION_DETAILS_BYTE_BUDGET = 45000
 
-local function send_motion_details(ply, options)
-    local list = MMDVMDNPC.ListMotions()
-    local ent = MMDVMDNPC.DebugTargets[ply]
-    local hasTarget = is_usable_actor(ent)
-    local entries = {}
-
-    for _, id in ipairs(list) do
-        local meta = MMDVMDNPC.MotionMetadata and MMDVMDNPC.MotionMetadata(id) or nil
-        if meta then
-            local built = false
-            if hasTarget then
-                local path = MMDVMDNPC.BuiltPath(id, ent:GetModel() or "", options)
-                built = path ~= nil and (MMDVMDNPC.BuiltCache[path] ~= nil or file.Exists(path, "DATA"))
-            end
-            entries[#entries + 1] = { meta = meta, built = built }
-        end
-    end
-
+local function send_motion_details_chunks(ply, entries)
     local total = math.min(#entries, 65535)
     local index = 1
     local first = true
@@ -898,6 +922,66 @@ local function send_motion_details(ply, options)
         net.Send(ply)
         first = false
     until done
+end
+
+-- Building a details response derives metadata for every motion. For motions
+-- already in the persisted meta index that is trivially cheap — but every
+-- UNCACHED one costs a full util.JSONToTable of a multi-MB baked file. The
+-- first menu open after mounting a pack with dozens of dances used to run ALL
+-- of those parses inside one frame, freezing (and with enough motions,
+-- crashing) the game. The walk is therefore time-sliced: at most this many
+-- expensive parses per engine tick, cheap index hits unbudgeted.
+local MOTION_DETAILS_PARSES_PER_TICK = 1
+
+local detailsBuildCounter = 0
+
+local function send_motion_details(ply, options)
+    local list = MMDVMDNPC.ListMotions()
+    detailsBuildCounter = detailsBuildCounter + 1
+    local token = detailsBuildCounter
+    -- A newer request supersedes an in-flight walk (the newest options win and
+    -- the stale build stops touching the player).
+    ply.MMDVMDNPCDetailsToken = token
+
+    local entries = {}
+    local index = 1
+
+    local function finish()
+        -- The per-target "built" flag is resolved at send time so it reflects
+        -- the target as of the freshest data, not walk start.
+        local ent = MMDVMDNPC.DebugTargets[ply]
+        local hasTarget = is_usable_actor(ent)
+        for _, entry in ipairs(entries) do
+            if hasTarget then
+                local path = MMDVMDNPC.BuiltPath(entry.meta.id, ent:GetModel() or "", options)
+                entry.built = path ~= nil and (MMDVMDNPC.BuiltCache[path] ~= nil or file.Exists(path, "DATA"))
+            end
+        end
+        send_motion_details_chunks(ply, entries)
+    end
+
+    local function step()
+        if not IsValid(ply) or ply.MMDVMDNPCDetailsToken ~= token then return end
+        local parseBudget = MOTION_DETAILS_PARSES_PER_TICK
+        while index <= #list do
+            local id = list[index]
+            if not (MMDVMDNPC.HasMotionMetadataCached and MMDVMDNPC.HasMotionMetadataCached(id)) then
+                if parseBudget <= 0 then break end
+                parseBudget = parseBudget - 1
+            end
+            local meta = MMDVMDNPC.MotionMetadata and MMDVMDNPC.MotionMetadata(id) or nil
+            if meta then
+                entries[#entries + 1] = { meta = meta, built = false }
+            end
+            index = index + 1
+        end
+        if index > #list then
+            finish()
+        else
+            timer.Simple(0, step)
+        end
+    end
+    step()
 end
 
 -- Coalesce request bursts: the client re-requests details after nearly every
@@ -986,6 +1070,22 @@ local function warn_if_ai_enabled(ply, ent)
     send_play_status(ply, "warning", message, ent)
 end
 
+-- Selecting an NPC while NPC AI is enabled is REFUSED (the NPC would wander or
+-- fight mid-dance). Returns the denial message when blocked, nil when fine.
+-- Players/self-proxies are unaffected; playback/build paths keep the softer
+-- warn_if_ai_enabled for actors that were selected before AI got re-enabled.
+local function deny_select_if_ai_enabled(ply, ent)
+    if not IsValid(ply) then return nil end
+    if not is_playable_npc(ent) or is_playback_proxy(ent) then return nil end
+    if ai_thinking_disabled() then return nil end
+    local message = L(
+        "mmd_vmd_npc.status.ai_enabled_select_blocked",
+        "NPC selection blocked: NPC AI is enabled. Run ai_disabled 1 before selecting an NPC to dance."
+    )
+    send_chat_notice(ply, message, true)
+    return message
+end
+
 function MMDVMDNPC.SelectTargetForPlayer(ply, ent)
     if not IsValid(ply) then return false, L("mmd_vmd_npc.status.invalid_player", "invalid player") end
     if not is_usable_actor(ent) then
@@ -998,7 +1098,12 @@ function MMDVMDNPC.SelectTargetForPlayer(ply, ent)
         send_target_status(ply, message)
         return ok, message
     end
-    warn_if_ai_enabled(ply, ent)
+    local aiBlockMessage = deny_select_if_ai_enabled(ply, ent)
+    if aiBlockMessage then
+        send_target_status(ply, aiBlockMessage)
+        send_play_status(ply, "error", aiBlockMessage, ent)
+        return false, aiBlockMessage
+    end
     local ok, referenceOrErr = require_reference_sequence_for_actor(ply, ent, false)
     if not ok then return false, referenceOrErr end
 
@@ -1461,6 +1566,7 @@ pose_selected_npc_reference = function(ent)
         return true
     end
 
+    MMDVMDNPC.DebugFlexHolds[ent] = nil
     clear_all_bone_manipulations(ent)
     clear_all_flex_weights(ent)
     local ok, info = force_reference_pose(ent)
@@ -2629,6 +2735,7 @@ end
 
 function MMDVMDNPC.StopPlayback(ent, clearPose)
     if not is_usable_npc(ent) then return end
+    MMDVMDNPC.DebugFlexHolds[ent] = nil
     local state = MMDVMDNPC.Playbacks[ent]
     MMDVMDNPC.Playbacks[ent] = nil
     if update_rpe_body_suppression then update_rpe_body_suppression() end
@@ -2773,6 +2880,9 @@ local function start_playback_on_entity(ply, ent, motionID, options, playbackSet
     if not motion.music and built.music then
         motion.music = built.music
     end
+    -- Playback owns the face from here on; a lingering debug hold would fight
+    -- the sampled flex weights the moment the dance ends.
+    MMDVMDNPC.DebugFlexHolds[playbackEnt] = nil
     MMDVMDNPC.Playbacks[playbackEnt] = {
         ply = ply,
         initiator = ply,
@@ -3398,6 +3508,30 @@ hook.Add("Think", "MMDVMDNPCBuiltPlaybackThink", function()
     for ent, state in pairs(MMDVMDNPC.Playbacks) do
         update_playback_state(ent, state, now)
     end
+    -- Re-assert held debug flex poses every tick so external flex drivers
+    -- cannot stomp them back to neutral. Playback entities are skipped —
+    -- apply_built_sample owns their faces. INVARIANT: a hold is only valid
+    -- while its entity is still SOME player's debug target; anything else
+    -- (disconnect, target switch, alignment reshuffle) is an orphan that
+    -- would otherwise pin the face — and the RPE cvar suppression — forever.
+    for ent, held in pairs(MMDVMDNPC.DebugFlexHolds) do
+        local owned = false
+        if IsValid(ent) then
+            for _, target in pairs(MMDVMDNPC.DebugTargets or {}) do
+                if target == ent then
+                    owned = true
+                    break
+                end
+            end
+        end
+        if not owned then
+            MMDVMDNPC.DebugFlexHolds[ent] = nil
+        elseif not MMDVMDNPC.Playbacks[ent] and ent.SetFlexWeight then
+            for flexID, weight in pairs(held) do
+                ent:SetFlexWeight(flexID, weight)
+            end
+        end
+    end
     if update_rpe_body_suppression then update_rpe_body_suppression() end
 end)
 
@@ -3405,7 +3539,12 @@ function MMDVMDNPC.OpenDebugForPlayer(ply, ent, motionID, vmdFrame)
     if not IsValid(ply) then return false, L("mmd_vmd_npc.status.invalid_player", "invalid player") end
 
     if is_usable_npc(ent) then
-        MMDVMDNPC.SelectTargetForPlayer(ply, ent)
+        -- Selection can now be DENIED (NPC AI enabled): opening the debug
+        -- window anyway would bind it to the previous target, so fail cleanly.
+        local ok, err = MMDVMDNPC.SelectTargetForPlayer(ply, ent)
+        if not ok then
+            return false, err or actor_select_prompt()
+        end
     elseif ent ~= nil and IsValid(ent) then
         return false, actor_select_prompt()
     end
@@ -3453,11 +3592,23 @@ net.Receive("mmdvmd_audio_settings_save", function(_, ply)
     send_audio_settings(ply, id)
 end)
 
+MMDVMDNPC.LastDebugFrame = MMDVMDNPC.LastDebugFrame or {}
+
 net.Receive("mmdvmd_debug_request", function(_, ply)
     local motionID = net.ReadString()
     local frame = net.ReadInt(32)
+    -- Remembered so a flex-mapping change can push a refreshed frame back
+    -- immediately (no race against the client's blind re-request timer).
+    MMDVMDNPC.LastDebugFrame[ply] = { motionID = motionID, frame = frame }
     send_debug_frame(ply, motionID, frame)
 end)
+
+local function push_debug_frame_refresh(ply)
+    local last = MMDVMDNPC.LastDebugFrame[ply]
+    if last then
+        send_debug_frame(ply, last.motionID, last.frame)
+    end
+end
 
 net.Receive("mmdvmd_debug_apply", function(_, ply)
     local ent = net.ReadEntity()
@@ -3483,15 +3634,43 @@ net.Receive("mmdvmd_debug_apply", function(_, ply)
 
     local flexCount = math.Clamp(net.ReadUInt(16), 0, 4096)
     local maxFlexes = ent.GetFlexNum and (ent:GetFlexNum() or 0) or 0
+    local held = {}
     for _ = 1, flexCount do
         local flexID = net.ReadInt(16)
         local weight = math.Clamp(net.ReadFloat(), 0, 1)
         if ent.SetFlexWeight and flexID >= 0 and flexID < maxFlexes then
             ent:SetFlexWeight(flexID, weight)
+            held[flexID] = weight
         end
     end
 
+    -- Hold the applied face: without this the pose survives exactly one tick
+    -- before an external flex driver (RPE living body, NPC AI expressions)
+    -- resets it to neutral — "bones apply, face stays blank".
+    MMDVMDNPC.DebugFlexHolds[ent] = next(held) ~= nil and held or nil
+    if update_rpe_body_suppression then update_rpe_body_suppression() end
+
     setup_bones_now(ent)
+end)
+
+-- The debug window closed: drop the held flex pose and, when the target is not
+-- mid-playback, restore the clean reference state the debug session replaced.
+net.Receive("mmdvmd_debug_close", function(_, ply)
+    if not IsValid(ply) then return end
+    if MMDVMDNPC.LastDebugFrame then MMDVMDNPC.LastDebugFrame[ply] = nil end
+    local ent = MMDVMDNPC.DebugTargets[ply]
+    if is_usable_npc(ent) then
+        MMDVMDNPC.DebugFlexHolds[ent] = nil
+        -- Players are excluded from the restore: their anim system re-asserts
+        -- next tick anyway and a forced reference pose would visibly pop.
+        if not MMDVMDNPC.Playbacks[ent] and not is_playable_player(ent) then
+            clear_all_bone_manipulations(ent)
+            clear_all_flex_weights(ent)
+            force_reference_pose(ent)
+            setup_bones_now(ent)
+        end
+    end
+    if update_rpe_body_suppression then update_rpe_body_suppression() end
 end)
 
 net.Receive("mmdvmd_flex_override_save", function(_, ply)
@@ -3501,7 +3680,11 @@ net.Receive("mmdvmd_flex_override_save", function(_, ply)
     local sourceName = net.ReadString()
     local flexName = net.ReadString()
 
-    if not is_usable_npc(ent) or MMDVMDNPC.DebugTargets[ply] ~= ent then return end
+    if not is_usable_npc(ent) or MMDVMDNPC.DebugTargets[ply] ~= ent then
+        -- Silent returns here made the mapping buttons look dead; say why.
+        send_play_status(ply, "error", L("mmd_vmd_npc.status.flex_override_target_mismatch", "flex mapping not saved: the debug window's NPC is no longer your selected target"), ent)
+        return
+    end
     if not player_can_edit_content(ply) then return deny_edit_permission(ply) end
     local resolvedName = resolved_flex_name_on_entity(ent, flexName)
     if not resolvedName then
@@ -3522,6 +3705,9 @@ net.Receive("mmdvmd_flex_override_save", function(_, ply)
         ent
     )
     queue_motion_details(ply, MMDVMDNPC.ToolOptions())
+    -- Push the refreshed frame straight back so the debug window's table
+    -- updates immediately (no race with the client's blind 0.2s re-request).
+    push_debug_frame_refresh(ply)
 end)
 
 net.Receive("mmdvmd_flex_override_clear", function(_, ply)
@@ -3530,7 +3716,11 @@ net.Receive("mmdvmd_flex_override_clear", function(_, ply)
     local mmdName = net.ReadString()
     local sourceName = net.ReadString()
 
-    if not is_usable_npc(ent) or MMDVMDNPC.DebugTargets[ply] ~= ent then return end
+    if not is_usable_npc(ent) or MMDVMDNPC.DebugTargets[ply] ~= ent then
+        -- Silent returns here made the mapping buttons look dead; say why.
+        send_play_status(ply, "error", L("mmd_vmd_npc.status.flex_override_target_mismatch", "flex mapping not saved: the debug window's NPC is no longer your selected target"), ent)
+        return
+    end
     if not player_can_edit_content(ply) then return deny_edit_permission(ply) end
     if not MMDVMDNPC.ClearFlexOverrideForModel or not MMDVMDNPC.ClearFlexOverrideForModel(ent:GetModel() or "", mmdName, sourceName) then
         send_play_status(ply, "error", "no saved flex mapping was found", ent)
@@ -3545,6 +3735,9 @@ net.Receive("mmdvmd_flex_override_clear", function(_, ply)
         ent
     )
     queue_motion_details(ply, MMDVMDNPC.ToolOptions())
+    -- Push the refreshed frame straight back so the debug window's table
+    -- updates immediately (no race with the client's blind 0.2s re-request).
+    push_debug_frame_refresh(ply)
 end)
 
 net.Receive("mmdvmd_flex_override_unassign", function(_, ply)
@@ -3553,7 +3746,11 @@ net.Receive("mmdvmd_flex_override_unassign", function(_, ply)
     local mmdName = net.ReadString()
     local sourceName = net.ReadString()
 
-    if not is_usable_npc(ent) or MMDVMDNPC.DebugTargets[ply] ~= ent then return end
+    if not is_usable_npc(ent) or MMDVMDNPC.DebugTargets[ply] ~= ent then
+        -- Silent returns here made the mapping buttons look dead; say why.
+        send_play_status(ply, "error", L("mmd_vmd_npc.status.flex_override_target_mismatch", "flex mapping not saved: the debug window's NPC is no longer your selected target"), ent)
+        return
+    end
     if not player_can_edit_content(ply) then return deny_edit_permission(ply) end
     if not MMDVMDNPC.SetFlexUnassignedForModel or not MMDVMDNPC.SetFlexUnassignedForModel(ent:GetModel() or "", mmdName, sourceName) then
         send_play_status(ply, "error", "failed to unassign flex mapping", ent)
@@ -3568,6 +3765,9 @@ net.Receive("mmdvmd_flex_override_unassign", function(_, ply)
         ent
     )
     queue_motion_details(ply, MMDVMDNPC.ToolOptions())
+    -- Push the refreshed frame straight back so the debug window's table
+    -- updates immediately (no race with the client's blind 0.2s re-request).
+    push_debug_frame_refresh(ply)
 end)
 
 net.Receive("mmdvmd_select_target", function(_, ply)
@@ -3899,7 +4099,12 @@ function MMDVMDNPC.AssignActorForPlayer(ply, ent, motionID, options, playbackSet
         send_assignment_status(ply)
         return true, "removed"
     end
-    warn_if_ai_enabled(ply, ent)
+    local aiBlockMessage = deny_select_if_ai_enabled(ply, ent)
+    if aiBlockMessage then
+        send_play_status(ply, "error", aiBlockMessage, ent)
+        send_assignment_status(ply)
+        return false, aiBlockMessage
+    end
     local referenceOK, referenceErr = require_reference_sequence_for_actor(ply, ent, true)
     if not referenceOK then
         send_assignment_status(ply)
@@ -4139,11 +4344,43 @@ net.Receive("mmdvmd_assignment_align_request", function(_, ply)
     end
 end)
 
+-- The Force Reset button is the addon's panic button: beyond restoring the
+-- self view it cancels the player's build tasks, stops every dance they
+-- started (self and NPCs), clears the group assignments AND the selection.
 net.Receive("mmdvmd_force_self_reset_request", function(_, ply)
     if not IsValid(ply) then return end
+    if MMDVMDNPC.CancelBuildTasksForPlayer then
+        MMDVMDNPC.CancelBuildTasksForPlayer(ply)
+    end
+    -- Stop every dance THIS player started (the self playback is handled by
+    -- the force reset below). Scoped by playback owner — unlike the global
+    -- StopAllPlaybacksForPlayer — so one player's panic button can never end
+    -- another player's dances on a shared server.
+    local owned = {}
+    for ent, state in pairs(MMDVMDNPC.Playbacks or {}) do
+        if state and state.ply == ply and not state.selfProxy then
+            owned[#owned + 1] = ent
+        end
+    end
+    for _, ent in ipairs(owned) do
+        MMDVMDNPC.StopPlayback(ent, true)
+    end
+    if MMDVMDNPC.ClearAssignedActorsForPlayer then
+        MMDVMDNPC.ClearAssignedActorsForPlayer(ply, "all")
+    end
     if MMDVMDNPC.ForceResetSelfPlaybackForPlayer then
         MMDVMDNPC.ForceResetSelfPlaybackForPlayer(ply)
     end
+    -- ForceReset re-picks a target from the assignments; those are gone, so
+    -- drop the selection outright (and any held debug face) and tell the client.
+    local debugTarget = MMDVMDNPC.DebugTargets[ply]
+    if IsValid(debugTarget) and MMDVMDNPC.DebugFlexHolds then
+        MMDVMDNPC.DebugFlexHolds[debugTarget] = nil
+    end
+    if MMDVMDNPC.LastDebugFrame then MMDVMDNPC.LastDebugFrame[ply] = nil end
+    MMDVMDNPC.DebugTargets[ply] = nil
+    send_target_status(ply, L("mmd_vmd_npc.status.selection_cleared", "selection cleared"))
+    send_assignment_status(ply)
 end)
 
 net.Receive("mmdvmd_clear_built_request", function(_, ply)

@@ -125,8 +125,8 @@ TOOL.ClientConVar = {
     loop_playback = "0",
     camera_auto = "1",
     fast_build = "1",
-    build_frames_per_batch = "32",
-    playback_hz = "120",
+    build_frames_per_batch = "64",
+    playback_hz = "240",
 }
 
 if CLIENT then
@@ -437,6 +437,38 @@ function TOOL.BuildCPanel(panel)
             MMDVMDNPC.RequestForceSelfPlaybackReset()
         end
     end)
+
+    -- The motion wheel uses a REAL console bind (bind <key> +mmd_wheel), not a
+    -- convar, so this binder reads the live binding and rebinds on change.
+    local wheelBindRow = vgui.Create("DPanel")
+    wheelBindRow:SetTall(30)
+    wheelBindRow.Paint = nil
+    local wheelBindLabel = vgui.Create("DLabel", wheelBindRow)
+    wheelBindLabel:Dock(FILL)
+    wheelBindLabel:SetText(L("mmd_vmd_npc.ui.wheel_bind", "Motion wheel key"))
+    wheelBindLabel:SetTextColor(Color(255, 200, 90))
+    wheelBindLabel:SetFont("DermaDefaultBold")
+    local wheelBinder = vgui.Create("DBinder", wheelBindRow)
+    wheelBinder:Dock(RIGHT)
+    wheelBinder:SetWide(130)
+    do
+        local boundKey = input.LookupBinding and input.LookupBinding("+mmd_wheel")
+        local code = boundKey and input.GetKeyCode and input.GetKeyCode(boundKey)
+        if code and code > 0 then wheelBinder:SetValue(code) end
+    end
+    wheelBinder.OnChange = function(_, keyCode)
+        keyCode = tonumber(keyCode) or 0
+        local old = input.LookupBinding and input.LookupBinding("+mmd_wheel")
+        if old and old ~= "" then RunConsoleCommand("unbind", old) end
+        if keyCode > 0 and input.GetKeyName then
+            local name = input.GetKeyName(keyCode)
+            if name and name ~= "" then
+                RunConsoleCommand("bind", name, "+mmd_wheel")
+            end
+        end
+    end
+    motionTab:AddItem(wheelBindRow)
+    motionTab:Help(L("mmd_vmd_npc.ui.wheel_bind_help"))
 
     local hookID = "MMDVMDNPCToolPanel_" .. tostring(panel)
     local audioOffsetSuppress = false
@@ -971,13 +1003,14 @@ function TOOL.BuildCPanel(panel)
     section(performanceTab, L("mmd_vmd_npc.ui.build_performance"), Color(255, 190, 80))
     performanceTab:Help(L("mmd_vmd_npc.ui.build_performance_help"))
     add_checkbox_with_help(performanceTab, L("mmd_vmd_npc.ui.fast_build"), "mmd_vmd_npc_fast_build", L("mmd_vmd_npc.ui.fast_build_help"))
-    add_slider(performanceTab, L("mmd_vmd_npc.ui.build_frames_per_batch"), "mmd_vmd_npc_build_frames_per_batch", 1, 128, 0)
+    -- Cap the slider at the value every consumer actually clamps to
+    -- (clamp_build_frames_per_batch); a higher slider range silently lies.
+    add_slider(performanceTab, L("mmd_vmd_npc.ui.build_frames_per_batch"), "mmd_vmd_npc_build_frames_per_batch", MMDVMDNPC.MinBuildFramesPerBatch or 1, MMDVMDNPC.MaxBuildFramesPerBatch or 128, 0)
 
     section(performanceTab, L("mmd_vmd_npc.ui.playback_performance"), Color(100, 190, 255))
     performanceTab:Help(L("mmd_vmd_npc.ui.playback_performance_help"))
     -- Cap the slider at the value every consumer actually clamps to, so the UI
-    -- cannot display a rate (up to 480) that is silently reduced to 240.
-    add_slider(performanceTab, L("mmd_vmd_npc.ui.playback_updates_per_second"), "mmd_vmd_npc_playback_hz", MMDVMDNPC.MinPlaybackHz or 10, MMDVMDNPC.MaxPlaybackHz or 240, 0)
+    add_slider(performanceTab, L("mmd_vmd_npc.ui.playback_updates_per_second"), "mmd_vmd_npc_playback_hz", MMDVMDNPC.MinPlaybackHz or 10, MMDVMDNPC.MaxPlaybackHz or 480, 0)
 
     section(advancedTab, L("mmd_vmd_npc.ui.tab.advanced"), Color(180, 180, 180))
 
@@ -1007,12 +1040,17 @@ function TOOL.BuildCPanel(panel)
     key_binder(cameraTab, L("mmd_vmd_npc.camera.hotkey_label"), "mmd_vmd_npc_camera_key", Color(120, 200, 255))
     cameraTab:Help(L("mmd_vmd_npc.camera.hotkey_help"))
     add_checkbox_with_help(cameraTab, L("mmd_vmd_npc.camera.auto_option"), "mmd_vmd_npc_camera_auto", L("mmd_vmd_npc.camera.auto_option_help"))
+    add_checkbox_with_help(cameraTab, L("mmd_vmd_npc.camera.follow"), "mmd_vmd_npc_cam_follow", L("mmd_vmd_npc.camera.follow_help"))
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.follow_margin"), "mmd_vmd_npc_cam_follow_margin", 0, 0.9, 2)
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.follow_speed"), "mmd_vmd_npc_cam_follow_speed", 1, 30, 0)
     add_checkbox_with_help(cameraTab, L("mmd_vmd_npc.camera.collision"), "mmd_vmd_npc_cam_collision", L("mmd_vmd_npc.camera.collision_help"))
     add_slider(cameraTab, L("mmd_vmd_npc.camera.max_distance"), "mmd_vmd_npc_cam_max_distance", 0, 6000, 0)
 
     section(cameraTab, L("mmd_vmd_npc.camera.transform"), Color(120, 200, 255))
     cameraTab:Help(L("mmd_vmd_npc.camera.transform_help"))
-    add_slider(cameraTab, L("mmd_vmd_npc.camera.scale"), "mmd_vmd_npc_cam_scale", 0.1, 3, 2)
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.scale_x"), "mmd_vmd_npc_cam_scale_x", 0.1, 3, 2)
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.scale_y"), "mmd_vmd_npc_cam_scale_y", 0.1, 3, 2)
+    add_slider(cameraTab, L("mmd_vmd_npc.camera.scale_z"), "mmd_vmd_npc_cam_scale_z", 0.1, 3, 2)
     add_slider(cameraTab, L("mmd_vmd_npc.camera.offset_x"), "mmd_vmd_npc_cam_offset_x", -128, 128, 0)
     add_slider(cameraTab, L("mmd_vmd_npc.camera.offset_y"), "mmd_vmd_npc_cam_offset_y", -128, 128, 0)
     add_slider(cameraTab, L("mmd_vmd_npc.camera.offset_z"), "mmd_vmd_npc_cam_offset_z", -128, 128, 0)

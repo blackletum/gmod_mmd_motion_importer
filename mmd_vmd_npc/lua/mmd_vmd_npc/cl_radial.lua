@@ -140,9 +140,18 @@ end
 local SLOTS_PER_PAGE = 9
 local MOTIONS_PER_PAGE = SLOTS_PER_PAGE - 1 -- slot 1 is always the Stop button
 
+-- Dropdown value for the curated favorites view; every other value is a
+-- category filter over ALL known dances ("" = all categories).
+local FAVORITES_FILTER = "__favorites"
+
 local function camera_auto_on()
     local cvar = GetConVar("mmd_vmd_npc_camera_auto")
     return not cvar or cvar:GetBool()
+end
+
+local function camera_follow_on()
+    local cvar = GetConVar("mmd_vmd_npc_cam_follow")
+    return cvar ~= nil and cvar:GetBool()
 end
 
 local function WL(key, fallback)
@@ -182,10 +191,12 @@ function PANEL:Init()
         self.LerpAlpha[i] = 0
     end
 
-    self.ToggleBtn = { w = 190, h = 50, hover = 0 }
-    -- Second button beside FOLLOW: whether playing a motion auto-enters its
-    -- imported camera animation (global mmd_vmd_npc_camera_auto option).
-    self.CameraBtn = { w = 190, h = 50, hover = 0 }
+    -- Three buttons in a row under the ring: FOLLOW (self third-person camera
+    -- mode), CAMERA (auto-enter imported camera animation) and CENTER (force
+    -- the imported camera to keep the character in frame).
+    self.ToggleBtn = { w = 150, h = 50, hover = 0 }
+    self.CameraBtn = { w = 150, h = 50, hover = 0 }
+    self.CenterBtn = { w = 150, h = 50, hover = 0 }
 
     -- Category filter above the ring: same categories as the Motion Manager
     -- (addon categories + User Import), remembered across opens.
@@ -238,7 +249,8 @@ function PANEL:RebuildCategoryCombo()
     -- which would reset the page and rewrite the cookie on every details
     -- refresh while the wheel is open. Display the selection via SetValue.
     combo:AddChoice(WL("mmd_vmd_npc.category.all", "All Categories"), "")
-    local found = (self.CategoryFilter or "") == ""
+    combo:AddChoice(WL("mmd_vmd_npc.radial.favorites", "★ Favorites"), FAVORITES_FILTER)
+    local found = (self.CategoryFilter or "") == "" or self.CategoryFilter == FAVORITES_FILTER
     if MMDVMDNPC.MotionCategories then
         for _, category in ipairs(MMDVMDNPC.MotionCategories()) do
             found = found or category == self.CategoryFilter
@@ -248,6 +260,7 @@ function PANEL:RebuildCategoryCombo()
     end
     local function display_name(category)
         if (category or "") == "" then return WL("mmd_vmd_npc.category.all", "All Categories") end
+        if category == FAVORITES_FILTER then return WL("mmd_vmd_npc.radial.favorites", "★ Favorites") end
         return MMDVMDNPC.CategoryDisplayName and MMDVMDNPC.CategoryDisplayName(category) or category
     end
     if found then
@@ -263,22 +276,47 @@ function PANEL:RebuildCategoryCombo()
     end
 end
 
--- Favorites, narrowed to the selected category. The Stop button and empty
--- slots are drawn from the fixed 9-slot layout, not from this list.
+-- The wheel's motion list. The category views auto-populate with EVERY known
+-- dance of that scope (no manual adding needed); the ★ Favorites view is the
+-- user-curated list. The Stop button and empty slots come from the fixed
+-- 9-slot layout, not from this list.
 function PANEL:RebuildMotions()
     self.Motions = {}
-    local details = MMDVMDNPC.MotionDetails or {}
-    for _, v in ipairs(MMDVMDNPC.RadialFavorites) do
-        if v ~= "toggle_cam_mode" and v ~= "stop_playback" then
-            local meta = details[v]
-            local matches = true
-            if MMDVMDNPC.MotionMatchesCategory then
-                matches = MMDVMDNPC.MotionMatchesCategory(meta, self.CategoryFilter)
-            end
-            if matches then
+    local filter = self.CategoryFilter or ""
+
+    if filter == FAVORITES_FILTER then
+        -- Curated list, in the user's own order.
+        for _, v in ipairs(MMDVMDNPC.RadialFavorites) do
+            if v ~= "toggle_cam_mode" and v ~= "stop_playback" then
                 self.Motions[#self.Motions + 1] = v
             end
         end
+    else
+        local ordered = MMDVMDNPC.MotionDetailsOrdered or {}
+        if #ordered > 0 then
+            for _, meta in ipairs(ordered) do
+                local ok = true
+                if MMDVMDNPC.MotionMatchesCategory then
+                    ok = MMDVMDNPC.MotionMatchesCategory(meta, filter)
+                end
+                if ok then
+                    self.Motions[#self.Motions + 1] = tostring(meta.id or "")
+                end
+            end
+        elseif filter == "" then
+            -- Details not streamed yet: bare id list keeps the wheel usable
+            -- right after joining; the details hook rebuilds when they land.
+            for _, id in ipairs(MMDVMDNPC.ClientMotions or {}) do
+                self.Motions[#self.Motions + 1] = tostring(id or "")
+            end
+        end
+        -- Stable, scannable page order for the auto views.
+        table.sort(self.Motions, function(a, b)
+            local na = MMDVMDNPC.GetNiceName and MMDVMDNPC.GetNiceName(a) or a
+            local nb = MMDVMDNPC.GetNiceName and MMDVMDNPC.GetNiceName(b) or b
+            if na == nb then return a < b end
+            return string.lower(na) < string.lower(nb)
+        end)
     end
 
     self.PageCount = math.max(1, math.ceil(#self.Motions / MOTIONS_PER_PAGE))
@@ -297,6 +335,7 @@ end
 
 function PANEL:RebuildPageNames()
     self.SlotNames = {}
+    self.SlotSubNames = {}
     self.SlotMissing = {}
     -- Only trust "missing" once the server's details have streamed; an empty
     -- cache just means this client has not requested them yet.
@@ -307,7 +346,19 @@ function PANEL:RebuildPageNames()
         if kind == "stop" then
             self.SlotNames[i] = { WL("mmd_vmd_npc.radial.stop", "STOP") }
         elseif kind == "motion" then
-            self.SlotNames[i] = WrapText(MMDVMDNPC.GetNiceName(id or "Unknown"), "DermaDefaultBold", 150)
+            local nice = MMDVMDNPC.GetNiceName(id or "Unknown")
+            self.SlotNames[i] = WrapText(nice, "DermaDefaultBold", 150)
+            -- English name (from the imported metadata) as a dimmer sub line,
+            -- when it exists and adds information beyond the display name.
+            local meta = details[id]
+            local english = meta and tostring(meta.englishName or "") or ""
+            if english ~= "" and string.lower(english) ~= string.lower(nice) then
+                local wrapped = WrapText(english, "DermaDefault", 150)
+                if #wrapped > 2 then
+                    wrapped = { wrapped[1], wrapped[2] .. "…" }
+                end
+                self.SlotSubNames[i] = wrapped
+            end
             -- A favorite whose motion JSON no longer exists (deleted by hand):
             -- unplayable, drawn red, removable with right-click.
             self.SlotMissing[i] = haveDetails and details[id] == nil or false
@@ -327,13 +378,18 @@ function PANEL:Paint(w, h)
     local innerRadius = self.InnerRadius or 100
     local btnW, btnH = self.ToggleBtn.w, self.ToggleBtn.h
     local camW, camH = self.CameraBtn.w, self.CameraBtn.h
-    local btnX = cx - btnW - 5
-    local camX = cx + 5
+    local cenW, cenH = self.CenterBtn.w, self.CenterBtn.h
+    local gap = 8
+    local btnX = cx - (btnW + camW + cenW + gap * 2) / 2
+    local camX = btnX + btnW + gap
+    local cenX = camX + camW + gap
     local btnY = math.min(cy + outerRadius + 20, h - btnH - 10)
     local isOverToggle = mx > btnX and mx < btnX + btnW and my > btnY and my < btnY + btnH
     local isOverCamera = mx > camX and mx < camX + camW and my > btnY and my < btnY + camH
+    local isOverCenter = mx > cenX and mx < cenX + cenW and my > btnY and my < btnY + cenH
     self.IsOverToggle = isOverToggle
     self.IsOverCamera = isOverCamera
+    self.IsOverCenter = isOverCenter
 
     -- No ring selection while the category dropdown (or its open menu, which
     -- overlaps the ring) has the mouse: releasing the wheel key mid-pick must
@@ -344,7 +400,7 @@ function PANEL:Paint(w, h)
 
     local step = 360 / SLOTS_PER_PAGE
     self.SelectedSlot = 0
-    if dist > innerRadius and dist < outerRadius and not isOverToggle and not isOverCamera and not comboBusy then
+    if dist > innerRadius and dist < outerRadius and not isOverToggle and not isOverCamera and not isOverCenter and not comboBusy then
         local mouseAngle = math.deg(math.atan2(dy, dx)) + 90
         if mouseAngle < 0 then mouseAngle = mouseAngle + 360 end
         local adjustedAngle = (mouseAngle + step / 2) % 360
@@ -380,19 +436,28 @@ function PANEL:Paint(w, h)
             draw.SimpleText("—", "DermaDefaultBold", tx, ty, Color(95, 95, 95), 1, 1)
         else
             local lines = self.SlotNames[i] or {}
+            local subLines = self.SlotSubNames and self.SlotSubNames[i] or nil
             local lineHeight = 15
-            local totalHeight = #lines * lineHeight
-            local col
+            local subLineHeight = 13
+            local totalHeight = #lines * lineHeight + (subLines and #subLines * subLineHeight or 0)
+            local col, subCol
             if isStop then
                 col = isSelected and Color(255, 160, 160) or Color(232, 96, 96)
             elseif self.SlotMissing and self.SlotMissing[i] then
                 col = isSelected and Color(255, 140, 140) or Color(210, 100, 100)
+                subCol = isSelected and Color(225, 120, 120) or Color(175, 90, 90)
             else
                 col = isSelected and Color(255, 255, 255) or Color(188, 188, 188)
+                subCol = isSelected and Color(215, 215, 215) or Color(150, 150, 150)
             end
-            for k, line in ipairs(lines) do
-                local ly = ty - (totalHeight / 2) + (k - 1) * lineHeight + (lineHeight / 2)
-                draw.SimpleText(line, "DermaDefaultBold", tx, ly, col, 1, 1)
+            local textY = ty - totalHeight / 2
+            for _, line in ipairs(lines) do
+                draw.SimpleText(line, "DermaDefaultBold", tx, textY + lineHeight / 2, col, 1, 1)
+                textY = textY + lineHeight
+            end
+            for _, line in ipairs(subLines or {}) do
+                draw.SimpleText(line, "DermaDefault", tx, textY + subLineHeight / 2, subCol, 1, 1)
+                textY = textY + subLineHeight
             end
         end
     end
@@ -406,8 +471,10 @@ function PANEL:Paint(w, h)
         draw.SimpleText(WL("mmd_vmd_npc.radial.scroll_hint", "Scroll to switch pages"),
             "DermaDefault", cx, cy + 11, Color(180, 180, 180), 1, 1)
     elseif #(self.Motions or {}) == 0 and (self.CategoryFilter or "") ~= "" then
-        draw.SimpleText(WL("mmd_vmd_npc.radial.category_empty", "No wheel dances in this category"),
-            "DermaDefault", cx, cy, Color(180, 180, 180), 1, 1)
+        local emptyText = self.CategoryFilter == FAVORITES_FILTER
+            and WL("mmd_vmd_npc.radial.favorites_empty", "No favorites yet — add dances via the Motion Manager or menu")
+            or WL("mmd_vmd_npc.radial.category_empty", "No wheel dances in this category")
+        draw.SimpleText(emptyText, "DermaDefault", cx, cy, Color(180, 180, 180), 1, 1)
     end
 
     -- Hovering a favorite whose motion file is gone: say so and how to fix it.
@@ -440,6 +507,19 @@ function PANEL:Paint(w, h)
     local camName = camOn and "CAMERA: ON" or "CAMERA: OFF"
     local camCol = camOn and Color(100, 255, 100) or Color(255, 100, 100)
     draw.SimpleText(camName, "DermaDefaultBold", camX + camW / 2, btnY + camH / 2, camCol, 1, 1)
+
+    -- Force-follow-character toggle (experimental; details in the spawn menu)
+    self.CenterBtn.hover = Lerp(FrameTime() * 10, self.CenterBtn.hover, isOverCenter and 1 or 0)
+    draw.RoundedBox(8, cenX, btnY, cenW, cenH, Color(15, 15, 15, 220))
+    if self.CenterBtn.hover > 0.01 then
+        draw.RoundedBox(8, cenX, btnY, cenW, cenH, Color(50, 150, 255, 100 * self.CenterBtn.hover))
+    end
+    surface.SetDrawColor(255, 255, 255, 20 + (self.CenterBtn.hover * 50))
+    surface.DrawOutlinedRect(cenX, btnY, cenW, cenH, 1)
+    local cenOn = camera_follow_on()
+    local cenName = cenOn and "CENTER: ON" or "CENTER: OFF"
+    local cenCol = cenOn and Color(100, 255, 100) or Color(255, 100, 100)
+    draw.SimpleText(cenName, "DermaDefaultBold", cenX + cenW / 2, btnY + cenH / 2, cenCol, 1, 1)
 end
 
 function PANEL:OnMouseWheeled(delta)
@@ -457,14 +537,16 @@ function PANEL:OnMousePressed(mouseCode)
             self:ToggleCameraMode()
         elseif self.IsOverCamera then
             self:ToggleCameraAuto()
+        elseif self.IsOverCenter then
+            self:ToggleCameraFollow()
         elseif self.SelectedSlot > 0 then
             self:ExecuteSelection(self.SelectedSlot)
         end
     elseif mouseCode == MOUSE_RIGHT and self.SelectedSlot > 1 then
-        -- Right-click removes the hovered dance from the wheel. This is the
-        -- only in-game way to drop a favorite whose motion JSON was deleted
-        -- by hand (it no longer appears in the Motion Manager's list, so the
-        -- manager's toggle can never reach it). The wheel stays open.
+        -- Right-click removes the hovered dance from the FAVORITES view (the
+        -- only in-game way to drop a favorite whose motion JSON was deleted by
+        -- hand). Category views auto-populate, so there is nothing to remove.
+        if (self.CategoryFilter or "") ~= FAVORITES_FILTER then return end
         local kind, id = self:SlotAction(self.SelectedSlot)
         if kind == "motion" and id and MMDVMDNPC.ToggleFavorite then
             MMDVMDNPC.ToggleFavorite(id)
@@ -486,6 +568,14 @@ function PANEL:ToggleCameraAuto()
     local turnOn = not camera_auto_on()
     RunConsoleCommand("mmd_vmd_npc_camera_auto", turnOn and "1" or "0")
     notification.AddLegacy(WL("mmd_vmd_npc.camera.auto_option", "Enter camera animation automatically")
+        .. ": " .. (turnOn and "ON" or "OFF"), NOTIFY_HINT, 3)
+    surface.PlaySound("buttons/lightswitch2.wav")
+end
+
+function PANEL:ToggleCameraFollow()
+    local turnOn = not camera_follow_on()
+    RunConsoleCommand("mmd_vmd_npc_cam_follow", turnOn and "1" or "0")
+    notification.AddLegacy(WL("mmd_vmd_npc.camera.follow", "Force camera to follow character (experimental)")
         .. ": " .. (turnOn and "ON" or "OFF"), NOTIFY_HINT, 3)
     surface.PlaySound("buttons/lightswitch2.wav")
 end
@@ -559,15 +649,14 @@ concommand.Add("-mmd_wheel", function()
     end
 end)
 
--- Bind the wheel to K by default the first time only, without clobbering an
--- existing bind or a deliberate later unbind/rebind.
+-- Keep the wheel on its default key K: whenever the wheel is UNBOUND at
+-- session start and K is free, (re)claim it — the wheel should always have a
+-- working default. An existing +mmd_wheel bind (any key) is always respected,
+-- and an occupied K is never clobbered. The once-marker only limits the
+-- "please bind manually" hint, not the binding itself.
 CreateClientConVar("mmd_vmd_npc_wheel_bound_once", "0", true, false)
 
 hook.Add("InitPostEntity", "MMDVMDNPCWheelDefaultBind", function()
-    local marker = GetConVar("mmd_vmd_npc_wheel_bound_once")
-    if marker and marker:GetBool() then return end
-    RunConsoleCommand("mmd_vmd_npc_wheel_bound_once", "1")
-
     -- Already bound somewhere: respect it.
     if input.LookupBinding and input.LookupBinding("+mmd_wheel") then return end
 
@@ -575,6 +664,9 @@ hook.Add("InitPostEntity", "MMDVMDNPCWheelDefaultBind", function()
     -- (e.g. the default flashlight on K).
     local kBind = input.LookupKeyBinding and input.LookupKeyBinding(KEY_K)
     if kBind and kBind ~= "" then
+        local marker = GetConVar("mmd_vmd_npc_wheel_bound_once")
+        if marker and marker:GetBool() then return end
+        RunConsoleCommand("mmd_vmd_npc_wheel_bound_once", "1")
         timer.Simple(2, function()
             notification.AddLegacy(WL("mmd_vmd_npc.radial.bind_hint", "Bind the MMD motion wheel with: bind <key> +mmd_wheel"), NOTIFY_GENERIC, 8)
         end)
@@ -582,6 +674,7 @@ hook.Add("InitPostEntity", "MMDVMDNPCWheelDefaultBind", function()
     end
 
     RunConsoleCommand("bind", "k", "+mmd_wheel")
+    RunConsoleCommand("mmd_vmd_npc_wheel_bound_once", "1")
     timer.Simple(2, function()
         notification.AddLegacy(WL("mmd_vmd_npc.radial.default_bind", "MMD motion wheel bound to K. Rebind with: bind <key> +mmd_wheel"), NOTIFY_GENERIC, 8)
     end)

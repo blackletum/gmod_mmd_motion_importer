@@ -486,6 +486,20 @@ function MMDVMDNPC.MotionMatchesCategory(meta, category)
     return own == category
 end
 
+-- The server invalidated every built cache for a model (flex-mapping edit):
+-- drop our client-side replicas too, or the local interpolated poser would
+-- keep replaying the pre-edit build under the same path key while the server
+-- plays the rebuilt one — the two would visibly disagree.
+net.Receive("mmdvmd_client_built_invalidate", function()
+    local model = net.ReadString()
+    if model == "" then return end
+    for path, built in pairs(MMDVMDNPC.ClientBuiltCache or {}) do
+        if built and tostring(built.model or "") == model then
+            MMDVMDNPC.ClientBuiltCache[path] = nil
+        end
+    end
+end)
+
 net.Receive("mmdvmd_pause_status_response", function()
     MMDVMDNPC.PauseStatus = {
         svPause = net.ReadFloat(),
@@ -1199,12 +1213,9 @@ local function clear_local_playback_pose(ent, built)
         end
     end
 
-    if ent.SetFlexWeight then
-        for _, meta in ipairs(built.flexes or {}) do
-            local flexID = tonumber(meta.id) or -1
-            if flexID >= 0 then ent:SetFlexWeight(flexID, 0) end
-        end
-    end
+    -- Flexes are deliberately NOT touched here: the SERVER owns flex weights
+    -- (it clears them on stop and networks that); a clientside zeroing would
+    -- fight the networked values — the post-debug "expression flicker" bug.
     setup_bones_now(ent)
 end
 
@@ -1260,15 +1271,14 @@ local function apply_local_built_sample(ent, frameA, frameB, fraction, pelvisZOf
         end
     end
 
-    if ent.SetFlexWeight then
-        for index, flexA in ipairs(frameA.flexes or {}) do
-            local flexB = (frameB.flexes or {})[index] or flexA
-            local flexID = tonumber(flexA[1]) or -1
-            if flexID >= 0 then
-                ent:SetFlexWeight(flexID, math.Clamp(lerp_value(flexA[2], flexB[2], fraction), 0, 1))
-            end
-        end
-    end
+    -- Flexes are deliberately NOT written by this local poser (mirror of the
+    -- pelvis split above, but total): a clientside SetFlexWeight overrides the
+    -- networked server value on this client only, so any divergence between
+    -- the client's built replica and the server's (e.g. after a flex-mapping
+    -- edit rebuilt one side) rendered as the face flickering between the
+    -- correct expression and neutral. The server samples flexes every playback
+    -- tick and those weights network fine; bones are the only thing that needs
+    -- local smoothing.
 
     setup_bones_now(ent)
 end
@@ -2608,6 +2618,13 @@ end
 local function refresh_flex_override_controls(frame, flexRows, targetEntIndex)
     if not IsValid(frame) or not IsValid(frame.UnresolvedMorphCombo) or not IsValid(frame.ModelFlexCombo) then return end
 
+    -- Every debug response rebuilds these combos; without carrying the user's
+    -- picks over, both reset to the FIRST choice — so after each mapping click
+    -- the next Assign/Unassign/Clear silently acted on morph #001 / flex #0
+    -- instead of the row the user chose ("the buttons do nothing").
+    local prevMorph = frame.UnresolvedMorphCombo:GetValue()
+    local prevFlex = frame.ModelFlexCombo:GetValue()
+
     frame.TargetEntIndex = targetEntIndex or 0
     frame.UnresolvedFlexChoices = {}
     frame.ModelFlexChoices = {}
@@ -2629,7 +2646,8 @@ local function refresh_flex_override_controls(frame, flexRows, targetEntIndex)
     end
 
     if firstMotionFlex then
-        frame.UnresolvedMorphCombo:SetValue(firstMotionFlex)
+        local keepMorph = prevMorph ~= "" and frame.UnresolvedFlexChoices[prevMorph] ~= nil
+        frame.UnresolvedMorphCombo:SetValue(keepMorph and prevMorph or firstMotionFlex)
         frame.UnresolvedMorphCombo:SetEnabled(true)
     else
         frame.UnresolvedMorphCombo:SetValue(L("mmd_vmd_npc.debug.no_motion_flex"))
@@ -2651,7 +2669,8 @@ local function refresh_flex_override_controls(frame, flexRows, targetEntIndex)
     end
 
     if firstFlex then
-        frame.ModelFlexCombo:SetValue(firstFlex)
+        local keepFlex = prevFlex ~= "" and frame.ModelFlexChoices[prevFlex] ~= nil
+        frame.ModelFlexCombo:SetValue(keepFlex and prevFlex or firstFlex)
         frame.ModelFlexCombo:SetEnabled(true)
     else
         frame.ModelFlexCombo:SetValue(L("mmd_vmd_npc.debug.no_model_flex"))
@@ -2908,7 +2927,9 @@ function MMDVMDNPC.OpenCameraDebugPanel(debugFrame)
         return slider
     end
 
-    add_slider("mmd_vmd_npc.camera.scale", "mmd_vmd_npc_cam_scale", 0.25, 4, 2)
+    add_slider("mmd_vmd_npc.camera.scale_x", "mmd_vmd_npc_cam_scale_x", 0.25, 4, 2)
+    add_slider("mmd_vmd_npc.camera.scale_y", "mmd_vmd_npc_cam_scale_y", 0.25, 4, 2)
+    add_slider("mmd_vmd_npc.camera.scale_z", "mmd_vmd_npc_cam_scale_z", 0.25, 4, 2)
     add_slider("mmd_vmd_npc.camera.offset_x", "mmd_vmd_npc_cam_offset_x", -200, 200, 1)
     add_slider("mmd_vmd_npc.camera.offset_y", "mmd_vmd_npc_cam_offset_y", -200, 200, 1)
     add_slider("mmd_vmd_npc.camera.offset_z", "mmd_vmd_npc_cam_offset_z", -200, 200, 1)
@@ -2931,6 +2952,9 @@ function MMDVMDNPC.OpenCameraDebugPanel(debugFrame)
     reset:SetText(L("mmd_vmd_npc.camera.reset_transform"))
     reset.DoClick = function()
         RunConsoleCommand("mmd_vmd_npc_cam_scale", "1")
+        RunConsoleCommand("mmd_vmd_npc_cam_scale_x", "1")
+        RunConsoleCommand("mmd_vmd_npc_cam_scale_y", "1")
+        RunConsoleCommand("mmd_vmd_npc_cam_scale_z", "1")
         RunConsoleCommand("mmd_vmd_npc_cam_offset_x", "0")
         RunConsoleCommand("mmd_vmd_npc_cam_offset_y", "0")
         RunConsoleCommand("mmd_vmd_npc_cam_offset_z", "0")
@@ -2992,6 +3016,7 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
     motionID = tostring(motionID or "")
     if motionID == "" then return end
 
+    MMDVMDNPC.DebugMenuWanted = true
     vmdFrame = math.max(DEBUG_REFERENCE_FRAME, math.floor(tonumber(vmdFrame) or DEBUG_REFERENCE_FRAME))
 
     local frame = MMDVMDNPC.DebugFrame
@@ -3007,6 +3032,13 @@ function MMDVMDNPC.OpenDebugMenu(motionID, vmdFrame)
         frame.Paint = paint_dark_frame_body
         frame.OnClose = function()
             set_debug_preview_playing(frame, false)
+            -- No more debug frames wanted: an in-flight response arriving
+            -- after this must not silently reopen the window.
+            MMDVMDNPC.DebugMenuWanted = false
+            -- Tell the server so it drops the held flex pose and restores the
+            -- target's clean reference state (unless a dance is playing).
+            net.Start("mmdvmd_debug_close")
+            net.SendToServer()
         end
 
         frame.TargetModelLabel = vgui.Create("DLabel", frame)
@@ -3376,7 +3408,12 @@ net.Receive("mmdvmd_debug_response", function()
 
     local frame = MMDVMDNPC.DebugFrame
     if not IsValid(frame) or frame.MotionID ~= motionID then
-        MMDVMDNPC.OpenDebugMenu(motionID, activeFrame)
+        -- Only (re)open for a wanted session: a response still in flight when
+        -- the user closed the window must be dropped, not resurrect the menu
+        -- (its rebuild_debug_preview would stomp a running dance's pose).
+        if MMDVMDNPC.DebugMenuWanted then
+            MMDVMDNPC.OpenDebugMenu(motionID, activeFrame)
+        end
         return
     end
 
@@ -3443,6 +3480,12 @@ net.Receive("mmdvmd_debug_response", function()
     end
 
     if IsValid(frame.FlexRows) then
+        -- Preserve the scroll position across the rebuild: Clear() snaps the
+        -- list back to the top, so the row a mapping click just changed (often
+        -- deep in the 37-row list) scrolled out of view — making the change
+        -- invisible and the buttons look dead.
+        local flexScrollBar = frame.FlexRows.VBar
+        local flexScroll = IsValid(flexScrollBar) and flexScrollBar:GetScroll() or 0
         frame.FlexRows:Clear()
         for _, row in ipairs(flexRows) do
             style_debug_list_line(frame.FlexRows:AddLine(
@@ -3452,6 +3495,13 @@ net.Receive("mmdvmd_debug_response", function()
                 fmt_num(row.scaledWeight ~= nil and row.scaledWeight or scaled_flex_weight(row)),
                 row.resolved and (tostring(row.resolvedName or "") .. " #" .. tostring(row.flexID)) or "unresolved"
             ))
+        end
+        if IsValid(flexScrollBar) and flexScroll > 0 then
+            timer.Simple(0, function()
+                if IsValid(frame) and IsValid(flexScrollBar) then
+                    flexScrollBar:SetScroll(flexScroll)
+                end
+            end)
         end
     end
     refresh_flex_override_controls(frame, flexRows, targetEntIndex)
