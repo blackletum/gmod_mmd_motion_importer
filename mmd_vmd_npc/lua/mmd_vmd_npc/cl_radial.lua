@@ -649,19 +649,37 @@ concommand.Add("-mmd_wheel", function()
     end
 end)
 
--- Keep the wheel on its default key K: whenever the wheel is UNBOUND at
--- session start and K is free, (re)claim it — the wheel should always have a
--- working default. An existing +mmd_wheel bind (any key) is always respected,
--- and an occupied K is never clobbered. The once-marker only limits the
--- "please bind manually" hint, not the binding itself.
+-- The engine BLOCKS bind/unbind from Lua (RunConsoleCommand -> "Command is
+-- blocked!"), so the addon can never change a key bind itself. Whenever a bind
+-- change is wanted, tell the player the exact console command to run — in
+-- chat AND in the console — and put it on the clipboard so it is one paste
+-- away.
+function MMDVMDNPC.AskPlayerToBind(command, messageKey, noClipboard)
+    local msg = string.format(
+        WL(messageKey, "Open the console (~) and run: %s"),
+        command)
+    -- Only clobber the clipboard for player-initiated changes (the binder
+    -- widget), never from automatic session-start hints.
+    if not noClipboard and SetClipboardText then SetClipboardText(command) end
+    if chat and chat.AddText then
+        chat.AddText(Color(255, 170, 60), "[MMD VMD] ", Color(235, 235, 235), msg)
+    end
+    print("[MMD VMD] " .. msg)
+end
+
+-- Default key K: the wheel should always have a working key, but since the
+-- addon cannot bind it (see above), an unbound wheel with K free asks the
+-- player to run the bind command each session until they do. An existing
+-- +mmd_wheel bind (any key) is always respected, and an occupied K only gets
+-- the once-per-install manual-bind hint.
 CreateClientConVar("mmd_vmd_npc_wheel_bound_once", "0", true, false)
 
 hook.Add("InitPostEntity", "MMDVMDNPCWheelDefaultBind", function()
     -- Already bound somewhere: respect it.
     if input.LookupBinding and input.LookupBinding("+mmd_wheel") then return end
 
-    -- Only claim K if it is actually free; never clobber an existing key bind
-    -- (e.g. the default flashlight on K).
+    -- K taken by something else (e.g. a flashlight bind): the player must pick
+    -- their own key; hint once.
     local kBind = input.LookupKeyBinding and input.LookupKeyBinding(KEY_K)
     if kBind and kBind ~= "" then
         local marker = GetConVar("mmd_vmd_npc_wheel_bound_once")
@@ -673,9 +691,13 @@ hook.Add("InitPostEntity", "MMDVMDNPCWheelDefaultBind", function()
         return
     end
 
-    RunConsoleCommand("bind", "k", "+mmd_wheel")
-    RunConsoleCommand("mmd_vmd_npc_wheel_bound_once", "1")
-    timer.Simple(2, function()
-        notification.AddLegacy(WL("mmd_vmd_npc.radial.default_bind", "MMD motion wheel bound to K. Rebind with: bind <key> +mmd_wheel"), NOTIFY_GENERIC, 8)
+    -- Delay past the loading screen so the chat line is actually seen.
+    timer.Simple(3, function()
+        local command = 'bind k "+mmd_wheel"'
+        MMDVMDNPC.AskPlayerToBind(command, "mmd_vmd_npc.radial.bind_default_fmt", true)
+        notification.AddLegacy(
+            string.format(WL("mmd_vmd_npc.radial.bind_default_fmt",
+                "The motion wheel has no key bound. Open the console (~) and run: %s"), command),
+            NOTIFY_GENERIC, 10)
     end)
 end)

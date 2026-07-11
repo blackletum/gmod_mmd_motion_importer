@@ -439,7 +439,10 @@ function TOOL.BuildCPanel(panel)
     end)
 
     -- The motion wheel uses a REAL console bind (bind <key> +mmd_wheel), not a
-    -- convar, so this binder reads the live binding and rebinds on change.
+    -- convar — and the engine BLOCKS bind/unbind from Lua ("Command is
+    -- blocked!"). So this binder cannot rebind anything itself: picking a key
+    -- prints the exact console command in chat + console (and copies it to the
+    -- clipboard) for the player to run, then keeps showing the LIVE binding.
     local wheelBindRow = vgui.Create("DPanel")
     wheelBindRow:SetTall(30)
     wheelBindRow.Paint = nil
@@ -451,20 +454,75 @@ function TOOL.BuildCPanel(panel)
     local wheelBinder = vgui.Create("DBinder", wheelBindRow)
     wheelBinder:Dock(RIGHT)
     wheelBinder:SetWide(130)
-    do
+
+    local function live_wheel_bind_code()
         local boundKey = input.LookupBinding and input.LookupBinding("+mmd_wheel")
-        local code = boundKey and input.GetKeyCode and input.GetKeyCode(boundKey)
-        if code and code > 0 then wheelBinder:SetValue(code) end
+        if not boundKey or boundKey == "" or not input.GetKeyCode then return 0 end
+        -- LookupBinding reports lowercase names; be tolerant of a GetKeyCode
+        -- that only resolves the canonical (uppercase) spelling of mouse keys.
+        local code = input.GetKeyCode(boundKey) or 0
+        if code <= 0 then code = input.GetKeyCode(string.upper(boundKey)) or 0 end
+        return code > 0 and code or 0
     end
+
+    local suppressBinderChange = false
+    local function set_binder_display(code)
+        -- SetValue fires OnChange (DBinder routes it through SetSelectedNumber),
+        -- so programmatic display updates must not be mistaken for user input.
+        suppressBinderChange = true
+        wheelBinder:SetValue(code or 0)
+        suppressBinderChange = false
+    end
+    set_binder_display(live_wheel_bind_code())
+
     wheelBinder.OnChange = function(_, keyCode)
+        if suppressBinderChange then return end
         keyCode = tonumber(keyCode) or 0
         local old = input.LookupBinding and input.LookupBinding("+mmd_wheel")
-        if old and old ~= "" then RunConsoleCommand("unbind", old) end
+        local command, messageKey
         if keyCode > 0 and input.GetKeyName then
             local name = input.GetKeyName(keyCode)
-            if name and name ~= "" then
-                RunConsoleCommand("bind", name, "+mmd_wheel")
+            -- Left/right click are how a capture gets dismissed (and both
+            -- already have jobs inside the wheel), so picking them means
+            -- "never mind". Re-picking the already-bound key needs no command
+            -- either — and that is also what an ESC-cancel reports (DBinder
+            -- re-sets the current value, firing OnChange), so without this
+            -- check every cancel would print a no-op instruction.
+            local isCancelButton = keyCode == MOUSE_LEFT or keyCode == MOUSE_RIGHT
+            local sameKey = old and old ~= "" and name and string.lower(old) == string.lower(name)
+            if name and name ~= "" and not isCancelButton and not sameKey then
+                if old and old ~= "" then
+                    command = string.format('unbind %s; bind %s "+mmd_wheel"', old, name)
+                else
+                    command = string.format('bind %s "+mmd_wheel"', name)
+                end
+                messageKey = "mmd_vmd_npc.ui.bind_run_fmt"
             end
+        elseif old and old ~= "" then
+            command = "unbind " .. old
+            messageKey = "mmd_vmd_npc.ui.unbind_run_fmt"
+        end
+        if command and MMDVMDNPC and MMDVMDNPC.AskPlayerToBind then
+            MMDVMDNPC.AskPlayerToBind(command, messageKey)
+        end
+        -- The real binding did not change (only the player can change it), so
+        -- snap the display back to it.
+        timer.Simple(0, function()
+            if IsValid(wheelBinder) then set_binder_display(live_wheel_bind_code()) end
+        end)
+    end
+
+    -- Reflect the live binding once the player actually runs the command,
+    -- without breaking DBinder's own Think-driven key capture.
+    local baseBinderThink = wheelBinder.Think
+    wheelBinder.Think = function(selfBinder)
+        if baseBinderThink then baseBinderThink(selfBinder) end
+        if input.IsKeyTrapping and input.IsKeyTrapping() then return end
+        if (selfBinder.NextLiveBindCheck or 0) > SysTime() then return end
+        selfBinder.NextLiveBindCheck = SysTime() + 1
+        local code = live_wheel_bind_code()
+        if code ~= (tonumber(selfBinder:GetValue()) or 0) then
+            set_binder_display(code)
         end
     end
     motionTab:AddItem(wheelBindRow)
