@@ -444,18 +444,7 @@ local function clamp_meta_string(value, limit)
     return string.sub(value, 1, limit or 256)
 end
 
-local function read_motion_file(info)
-    local path = info and info.path or ""
-    local realm = info and info.realm or "DATA"
-    local raw = file.Read(path, realm)
-    if not raw then
-        return nil, "motion json not found: " .. path
-    end
-
-    local parsed = util.JSONToTable(raw)
-    if not istable(parsed) then
-        return nil, "motion file is not valid JSON: " .. path
-    end
+local function build_motion_from_parsed(parsed, path, realm, info)
     if parsed.format ~= EXPECTED_FORMAT then
         return nil, "unsupported motion JSON format: " .. tostring(parsed.format or "missing")
     end
@@ -528,6 +517,95 @@ local function read_motion_file(info)
     end)
 
     return motion
+end
+
+local function read_motion_file(info)
+    local path = info and info.path or ""
+    local realm = info and info.realm or "DATA"
+    local raw = file.Read(path, realm)
+    if not raw then
+        return nil, "motion json not found: " .. path
+    end
+
+    local parsed = util.JSONToTable(raw)
+    if not istable(parsed) then
+        return nil, "motion file is not valid JSON: " .. path
+    end
+    return build_motion_from_parsed(parsed, path, realm, info)
+end
+
+-- Header-only motion read ------------------------------------------------------
+-- Motion JSONs are dozens of MB, but everything the meta derive needs lives in
+-- the writer's small scalar HEAD (format .. bone_count, before the huge
+-- "bones" array) and small TAIL ("flex_count", "music", "camera", the names,
+-- "meta", "is_addon"). Splicing those two fragments around stubbed track
+-- arrays yields a tiny valid JSON that goes through the exact same
+-- normalization — so first-time indexing of a freshly subscribed pack costs
+-- milliseconds per file instead of a multi-second util.JSONToTable of the
+-- whole file (which froze the game for minutes on the first menu open).
+-- Any layout mismatch fails closed: the caller falls back to the full parse.
+--
+-- The anchors are safe to locate with plain byte search: inside JSON string
+-- values every quote is escaped (\"), so the raw sequences '"bones":' and
+-- '"flex_count":' can only be real keys — and both are unique, top-level keys
+-- in this format. A pathological file that still splices wrong produces
+-- invalid JSON and falls back.
+local MOTION_HEADER_HEAD_BYTES = 16384
+local MOTION_HEADER_TAIL_BYTES = 524288
+local MOTION_HEADER_TAIL_MAX = 8388608
+
+local function parse_motion_header(info)
+    local path = info and info.path or ""
+    local realm = info and info.realm or "DATA"
+    local f = file.Open(path, "rb", realm)
+    if not f then return nil end
+    local size = f:Size() or 0
+    -- Small files parse quickly anyway; let them take the exact full path.
+    if size <= MOTION_HEADER_TAIL_BYTES then f:Close() return nil end
+
+    local head = f:Read(math.min(MOTION_HEADER_HEAD_BYTES, size)) or ""
+    local bonesAt = string.find(head, '"bones":', 1, true)
+    if not bonesAt then f:Close() return nil end
+    local headPart = string.gsub(string.sub(head, 1, bonesAt - 1), ",%s*$", "")
+
+    -- "flex_count" precedes "music"/"camera"/"meta" in the writer layout, so a
+    -- splice anchored there provably contains every tail field; grow the tail
+    -- window until the anchor is inside it (the camera block between it and
+    -- EOF can be ~1.5MB at the 20000-key cap).
+    local tailLen = MOTION_HEADER_TAIL_BYTES
+    local anchorAt, tail
+    while true do
+        tailLen = math.min(tailLen, size)
+        f:Seek(size - tailLen)
+        tail = f:Read(tailLen) or ""
+        anchorAt = string.find(tail, '"flex_count":', 1, true)
+        if anchorAt or tailLen >= size or tailLen >= MOTION_HEADER_TAIL_MAX then break end
+        tailLen = tailLen * 4
+    end
+    f:Close()
+    if not anchorAt then return nil end
+
+    -- Layout-order gate: in the writer layout "flex_count" immediately follows
+    -- the flexes ARRAY (bytes '],'), which is what guarantees the splice keeps
+    -- every remaining tail key. A re-serialized file with reordered keys (e.g.
+    -- jq -S) can carry keys BETWEEN "bones" and "flex_count" that the splice
+    -- would silently drop (a camera block, say — persisting hasCamera=false
+    -- until the file changes); such files must take the full parse instead.
+    if anchorAt < 3 or string.sub(tail, anchorAt - 2, anchorAt - 1) ~= "]," then return nil end
+
+    local spliced = headPart .. ',"bones":[],"flexes":[],' .. string.sub(tail, anchorAt)
+    local parsed = util.JSONToTable(spliced)
+    if not istable(parsed) then return nil end
+    -- The track arrays were stubbed out, so the meta derive must take its
+    -- counts from the writer's scalars; without them this mode cannot match
+    -- the full parse and must not be used. NaN is rejected and the use site
+    -- clamps: one hand-edited "bone_count":1e999 must not put a value into
+    -- _meta_index.dat that util.TableToJSON cannot round-trip (that would
+    -- silently wipe the whole persisted index every session).
+    local boneCount, flexCount = parsed.bone_count, parsed.flex_count
+    if not isnumber(boneCount) or boneCount ~= boneCount then return nil end
+    if not isnumber(flexCount) or flexCount ~= flexCount then return nil end
+    return parsed
 end
 
 -- Lightweight persistent header/metadata indexes -----------------------------
@@ -612,8 +690,36 @@ function MMDVMDNPC.MotionMetadata(motionID)
     end
 
     local hadCachedMotion = MMDVMDNPC.Cache[info.id] ~= nil
-    local motion, err = MMDVMDNPC.LoadMotion(info.id)
-    if not motion then return nil, err end
+
+    -- Header fast path: splice the small head + tail of the file and run the
+    -- same normalization, skipping the multi-MB track arrays entirely. Falls
+    -- back to the exact full parse for any file that does not match the
+    -- writer's layout. The header-mode motion has stubbed (empty) tracks and
+    -- must NEVER enter MMDVMDNPC.Cache — playback would pose nothing. Known
+    -- trade-off: track-level validation (duplicate targets, bad keyframes)
+    -- is skipped here, so such a broken file gets listed and only errors when
+    -- played — LoadMotion still full-parses on every play/build path.
+    -- A motion already resident in the Cache skips the header I/O: LoadMotion
+    -- serves it from memory when fresh, exactly like the old path.
+    local motion, headerCounts
+    if not hadCachedMotion then
+        local parsedHeader = parse_motion_header(info)
+        if parsedHeader then
+            local headerMotion = build_motion_from_parsed(parsedHeader, info.path, info.realm, info)
+            if headerMotion then
+                motion = headerMotion
+                headerCounts = {
+                    bones = math.Clamp(math.floor(parsedHeader.bone_count), 0, 65535),
+                    flexes = math.Clamp(math.floor(parsedHeader.flex_count), 0, 65535),
+                }
+            end
+        end
+    end
+    if not motion then
+        local loaded, err = MMDVMDNPC.LoadMotion(info.id)
+        if not loaded then return nil, err end
+        motion = loaded
+    end
 
     -- Category rule: motions in the user's DATA folder are ALWAYS "User Import"
     -- (the realm decides, not the JSON — a local import that was also exported
@@ -640,8 +746,8 @@ function MMDVMDNPC.MotionMetadata(motionID)
         frameEnd = motion.frameEnd or 0,
         frameCount = motion.frameCount or 0,
         duration = motion.duration or 0,
-        boneCount = #(motion.boneTracks or {}),
-        flexCount = #(motion.flexTracks or {}),
+        boneCount = headerCounts and headerCounts.bones or #(motion.boneTracks or {}),
+        flexCount = headerCounts and headerCounts.flexes or #(motion.flexTracks or {}),
         -- The name/source/music strings also come straight from the JSON and
         -- are netted per entry: clamp them like the meta block.
         displayName = clamp_meta_string((motion.displayName and motion.displayName ~= "") and motion.displayName or info.id, 256),
