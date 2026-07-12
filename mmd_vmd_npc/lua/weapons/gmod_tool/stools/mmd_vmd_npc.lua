@@ -761,13 +761,19 @@ function TOOL.BuildCPanel(panel)
             return istable(meta) and tostring(meta.englishName or "") or ""
         end
 
+        local rows = {}
         local function add_row(id, meta)
             seen[id] = true
             if not stool_row_matches(meta, id, query) then return end
-            local line = motionList:AddLine(motion_display_name(meta or id), english_text(meta), stool_category_text(meta), duration_text(meta))
-            line.MotionID = id
-            line.Meta = meta
-            if id == selected then selectedLine = line end
+            -- Default order: alphabetical by English name, falling back to
+            -- the display name for motions without one, so mixed-language
+            -- packs still read as a single sorted list.
+            local english = english_text(meta)
+            rows[#rows + 1] = {
+                id = id,
+                meta = meta,
+                sortKey = string.lower(english ~= "" and english or motion_display_name(meta or id)),
+            }
         end
 
         if #detailsOrdered > 0 then
@@ -780,6 +786,17 @@ function TOOL.BuildCPanel(panel)
                 id = tostring(id or "")
                 if id ~= "" then add_row(id, detailsByID[id]) end
             end
+        end
+
+        table.sort(rows, function(a, b)
+            if a.sortKey ~= b.sortKey then return a.sortKey < b.sortKey end
+            return a.id < b.id
+        end)
+        for _, row in ipairs(rows) do
+            local line = motionList:AddLine(motion_display_name(row.meta or row.id), english_text(row.meta), stool_category_text(row.meta), duration_text(row.meta))
+            line.MotionID = row.id
+            line.Meta = row.meta
+            if row.id == selected then selectedLine = line end
         end
 
         -- Keep the currently selected motion visible even when it is missing
