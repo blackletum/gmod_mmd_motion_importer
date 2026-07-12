@@ -651,14 +651,45 @@ local function send_build_progress(ply, status, job, message)
     net.Send(ply)
 end
 
-local function send_play_status(ply, status, message, ent)
+-- startedTime: the playback's authoritative epoch (state.started), passed for
+-- "playing"/resume statuses together with the server's CurTime at send. The
+-- client anchors its local interpolated poser as
+--     localStarted = clientCurTime - (serverNow - started)
+-- i.e. by ELAPSED dance time, which stays correct even when the client's
+-- CurTime estimate carries a residual offset against the server clock (the
+-- engine's clock correction can settle offset after an alt-tab pause; both
+-- pose writers anchoring and ticking in their own realm's CurTime made that
+-- offset a PERMANENT per-frame flicker between two nearby dance timestamps,
+-- for every dance, until the game restarted). The entity INDEX also rides
+-- along: net.WriteEntity resolves to NULL when the entity has not reached the
+-- client yet (net beats snapshots — same race the camera system handles), and
+-- the index lets the client retry instead of misaddressing another entity.
+local function send_play_status(ply, status, message, ent, startedTime)
     if not IsValid(ply) then return end
 
     net.Start("mmdvmd_play_status")
         net.WriteString(tostring(status or ""))
         net.WriteString(tostring(message or ""))
         net.WriteEntity(IsValid(ent) and ent or NULL)
+        net.WriteUInt(IsValid(ent) and ent:EntIndex() or 0, 16)
+        net.WriteDouble(tonumber(startedTime) or 0)
+        net.WriteDouble(CurTime())
     net.Send(ply)
+end
+
+-- Periodic body-pose clock sync for the initiator's local poser. Every signal
+-- carries (started, serverNow) so a one-off delivery hitch (a message that
+-- sat buffered through an alt-tab) is corrected by the NEXT sync instead of
+-- lasting the whole dance; it also lets the client REAP local poser states
+-- the server no longer confirms — the belt-and-braces kill for any leaked
+-- second writer that used to flicker until game restart.
+local function send_playback_body_sync(state, ent)
+    if not state or not IsValid(state.ply) or not IsValid(ent) then return end
+    net.Start("mmdvmd_playback_sync")
+        net.WriteUInt(ent:EntIndex(), 16)
+        net.WriteDouble(tonumber(state.started) or 0)
+        net.WriteDouble(CurTime())
+    net.Send(state.ply)
 end
 
 function MMDVMDNPC.CancelBuildTasksForPlayer(ply)
@@ -3239,7 +3270,7 @@ local function set_playback_paused(playbackEnt, state, paused, ply)
     state.nextPausedStatus = nil
     send_audio_pause(state, false)
     send_camera_sync(state)
-    send_play_status(state.ply or ply, state.sentPlaying and "playing" or "countdown", "playback resumed", playbackEnt)
+    send_play_status(state.ply or ply, state.sentPlaying and "playing" or "countdown", "playback resumed", playbackEnt, state.started)
     return true
 end
 
@@ -3360,7 +3391,7 @@ local function update_playback_state(ent, state, now)
             freeze_player_target(ent, is_playable_player(ent))
         end
         if IsValid(state.ply) then
-            send_play_status(state.ply, "playing", state.path or "", ent)
+            send_play_status(state.ply, "playing", state.path or "", ent, state.started)
         end
         send_audio_start(state)
     end
@@ -3396,9 +3427,15 @@ local function update_playback_state(ent, state, now)
             finished = false
             restart_audio_for_loop(state)
             send_camera_sync(state)
+            state.nextBodySync = 0
         end
     end
     sourceFrame = math.Clamp(sourceFrame, startFrame, endFrame)
+
+    if now >= (state.nextBodySync or 0) then
+        state.nextBodySync = now + 2
+        send_playback_body_sync(state, ent)
+    end
 
     local lowerFrame = math.floor(sourceFrame)
     local upperFrame = math.min(endFrame, lowerFrame + 1)

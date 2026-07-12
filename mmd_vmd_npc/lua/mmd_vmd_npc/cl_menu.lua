@@ -489,10 +489,18 @@ end
 -- The server invalidated every built cache for a model (flex-mapping edit):
 -- drop our client-side replicas too, or the local interpolated poser would
 -- keep replaying the pre-edit build under the same path key while the server
--- plays the rebuilt one — the two would visibly disagree.
+-- plays the rebuilt one — the two would visibly disagree. Running local
+-- playbacks captured a `built` reference at start, so they must stop too
+-- (the server's networked pose takes over alone until the next dance).
 net.Receive("mmdvmd_client_built_invalidate", function()
     local model = net.ReadString()
     if model == "" then return end
+    for ent, state in pairs(MMDVMDNPC.LocalPlaybacks or {}) do
+        local built = state and state.built or nil
+        if built and tostring(built.model or "") == model and MMDVMDNPC.StopLocalPlaybackFor then
+            MMDVMDNPC.StopLocalPlaybackFor(ent, false)
+        end
+    end
     for path, built in pairs(MMDVMDNPC.ClientBuiltCache or {}) do
         if built and tostring(built.model or "") == model then
             MMDVMDNPC.ClientBuiltCache[path] = nil
@@ -1516,62 +1524,138 @@ local function activate_self_proxy_camera(ent)
     MMDVMDNPC.CameraInitialized = true
 end
 
-local function start_local_playback(path, playbackEnt)
+-- Local playbacks whose entity has not been networked to this client yet
+-- (net messages outrun entity snapshots — the same race the camera system
+-- retries on). Keyed by entity INDEX from the wire; resolved from the local
+-- playback Think hook until the entity appears or the attempt expires. The
+-- old code fell back to posing TargetStatus.ent here, which misfiled the
+-- state under an unrelated valid entity that no stop message could ever
+-- address — an orphaned second pose writer that flickered every later dance
+-- on that entity until the game restarted.
+MMDVMDNPC.PendingLocalPlaybacks = MMDVMDNPC.PendingLocalPlaybacks or {}
+
+-- serverStarted is the server ticker's own CurTime epoch for this playback.
+-- Both writers computing the frame from the SAME epoch (and the same clock)
+-- is what keeps the networked pose and the local interpolated pose on the
+-- same dance timestamp; seeding from message-receipt time instead let any
+-- delivery skew become a permanent per-frame flicker between two poses.
+local function start_local_playback(path, playbackEnt, serverStarted)
     local built = MMDVMDNPC.ClientBuiltCache[path or ""]
-    local targetStatus = MMDVMDNPC.TargetStatus or {}
-    local ent = IsValid(playbackEnt) and playbackEnt or targetStatus.ent
-    if not built or not IsValid(ent) then return end
+    if not built or not IsValid(playbackEnt) then return end
+    local ent = playbackEnt
+    -- Entity-index reuse guard: a pending start resolved after its original
+    -- entity died could land on an unrelated entity. A built cache is per
+    -- model, so a model mismatch proves the wrong entity — skip; the server's
+    -- networked pose owns whatever is actually dancing.
+    local builtModel = string.lower(string.Replace(tostring(built.model or ""), "\\", "/"))
+    local entModel = string.lower(string.Replace(tostring(ent.GetModel and ent:GetModel() or ""), "\\", "/"))
+    if builtModel ~= "" and entModel ~= "" and builtModel ~= entModel then return end
     if is_local_self_playback_proxy(ent) then
         activate_self_proxy_camera(ent)
     end
 
     MMDVMDNPC.LocalPlaybacks = MMDVMDNPC.LocalPlaybacks or {}
     local settings = selected_playback_settings()
+    local started = tonumber(serverStarted) or 0
     MMDVMDNPC.LocalPlaybacks[ent] = {
         path = path,
         built = built,
         ent = ent,
-        started = CurTime(),
+        started = started > 0 and started or CurTime(),
         nextTick = 0,
         loopPlayback = settings and settings.loopPlayback == true,
+        -- The SAME pelvis value the server captured from this settings
+        -- snapshot: the local poser reading the live convar while the server
+        -- kept the snapshot made the two writers disagree on the pelvis (and
+        -- thus the whole body height) for the entire dance.
+        pelvisZOffset = tonumber(settings and settings.pelvisZOffset) or 0,
+        -- Server-confirmation clock for the orphan reaper (CurTime, so a
+        -- paused game does not age states the server also is not ticking).
+        lastServerSync = CurTime(),
     }
+end
+
+local function queue_pending_local_playback(entIndex, path, serverStarted)
+    entIndex = tonumber(entIndex) or 0
+    if entIndex <= 0 then return end
+    MMDVMDNPC.PendingLocalPlaybacks[entIndex] = {
+        path = path,
+        started = serverStarted,
+        -- CurTime like everything else here: a paused game must not expire a
+        -- pending whose entity simply has not been simulated in yet.
+        expires = CurTime() + 5,
+    }
+end
+
+local function resolve_pending_local_playbacks()
+    local pendings = MMDVMDNPC.PendingLocalPlaybacks
+    if not pendings or next(pendings) == nil then return end
+    local now = CurTime()
+    for entIndex, pending in pairs(pendings) do
+        local ent = Entity(entIndex)
+        if IsValid(ent) then
+            pendings[entIndex] = nil
+            start_local_playback(pending.path, ent, pending.started)
+        elseif (pending.expires or 0) < now then
+            pendings[entIndex] = nil
+        end
+    end
 end
 
 local function pause_local_playback(ent)
     local playbacks = MMDVMDNPC.LocalPlaybacks or {}
     if IsValid(ent) then
         local state = playbacks[ent]
-        if not state or state.paused then return end
+        if not state then return end
+        -- The server repeats "paused" every second; it doubles as the alive
+        -- signal that keeps the orphan reaper away while no body syncs flow.
+        state.lastServerSync = CurTime()
+        if state.paused then return end
         state.paused = true
         state.pauseStarted = CurTime()
         return
     end
     for _, state in pairs(playbacks) do
-        if state and not state.paused then
-            state.paused = true
-            state.pauseStarted = CurTime()
+        if state then
+            state.lastServerSync = CurTime()
+            if not state.paused then
+                state.paused = true
+                state.pauseStarted = CurTime()
+            end
         end
     end
 end
 
-local function resume_one_local_playback(state)
-    if not state or not state.paused then return end
+-- serverStarted (when provided) is the server's post-resume epoch and is
+-- taken verbatim — even for a state the client never saw get paused. A
+-- missed or misaddressed pause message used to leave the local epoch behind
+-- the server's by exactly the pause duration, a permanent offset the two
+-- pose writers then flickered across on every frame.
+local function resume_one_local_playback(state, serverStarted)
+    if not state then return end
+    state.lastServerSync = CurTime()
+    local authoritative = tonumber(serverStarted) or 0
+    if not state.paused and authoritative <= 0 then return end
     local now = CurTime()
-    local pausedFor = math.max(0, now - (tonumber(state.pauseStarted) or now))
+    if authoritative > 0 then
+        state.started = authoritative
+    elseif state.paused then
+        local pausedFor = math.max(0, now - (tonumber(state.pauseStarted) or now))
+        state.started = (tonumber(state.started) or now) + pausedFor
+    end
     state.paused = false
     state.pauseStarted = nil
-    state.started = (tonumber(state.started) or now) + pausedFor
     state.nextTick = 0
 end
 
-local function resume_local_playback(ent)
+local function resume_local_playback(ent, serverStarted)
     local playbacks = MMDVMDNPC.LocalPlaybacks or {}
     if IsValid(ent) then
-        resume_one_local_playback(playbacks[ent])
+        resume_one_local_playback(playbacks[ent], serverStarted)
         return
     end
     for _, state in pairs(playbacks) do
-        resume_one_local_playback(state)
+        resume_one_local_playback(state, serverStarted)
     end
 end
 
@@ -1600,6 +1684,9 @@ local function stop_one_local_playback(ent, clearPose)
         clear_local_playback_pose(state.ent, state.built)
     end
 end
+
+-- For receivers defined earlier in this file (built-cache invalidation).
+MMDVMDNPC.StopLocalPlaybackFor = stop_one_local_playback
 
 local function stop_local_playback(clearPose, ent)
     if IsValid(ent) then
@@ -1636,6 +1723,7 @@ force_self_view_cleanup = function()
 end
 
 hook.Add("Think", "MMDVMDNPCLocalInterpolatedPlayback", function()
+    resolve_pending_local_playbacks()
     local playbacks = MMDVMDNPC.LocalPlaybacks or {}
     if next(playbacks) == nil then return end
 
@@ -1645,6 +1733,13 @@ hook.Add("Think", "MMDVMDNPCLocalInterpolatedPlayback", function()
         local frames = built.frames or {}
         if not IsValid(ent) or #frames <= 0 then
             stop_one_local_playback(ent, false)
+        elseif now - (tonumber(state.lastServerSync) or now) > 8 then
+            -- The server confirms every live playback at least every ~2s
+            -- (body sync while playing, repeated status while paused). A
+            -- state it has stopped confirming is an orphan — a leaked second
+            -- pose writer that would otherwise fight every later dance on
+            -- this entity until the game restarts. Clear its pose and drop it.
+            stop_one_local_playback(ent, true)
         elseif state.paused then
             apply_local_eye_tracking(ent, state, now)
         elseif now >= (state.nextTick or 0) then
@@ -1673,8 +1768,7 @@ hook.Add("Think", "MMDVMDNPCLocalInterpolatedPlayback", function()
             local lowerIndex = math.Clamp(lowerFrame - startFrame + 1, 1, #frames)
             local upperIndex = math.Clamp(upperFrame - startFrame + 1, 1, #frames)
 
-            local pelvis = GetConVar("mmd_vmd_npc_pelvis_z_offset")
-            apply_local_built_sample(ent, frames[lowerIndex], frames[upperIndex], fraction, pelvis and pelvis:GetFloat() or 0)
+            apply_local_built_sample(ent, frames[lowerIndex], frames[upperIndex], fraction, state.pelvisZOffset or 0)
             apply_local_eye_tracking(ent, state, now)
 
             if finished then
@@ -3906,6 +4000,27 @@ net.Receive("mmdvmd_play_status", function()
     local status = net.ReadString()
     local message = net.ReadString()
     local playbackEnt = net.ReadEntity()
+    -- net.WriteEntity resolves to NULL when the entity has not been networked
+    -- to this client yet (net beats snapshots); the index both re-resolves
+    -- that case and addresses the pending-start queue.
+    local entIndex = net.ReadUInt(16)
+    -- The server ticker's authoritative epoch for "playing"/resume statuses
+    -- (0 for everything else) plus the server's CurTime at send. Anchoring by
+    -- ELAPSED dance time — localStarted = CurTime() - (serverNow - started) —
+    -- keeps the local poser on the server's dance timestamp even when the
+    -- client's CurTime estimate carries a residual offset against the server
+    -- clock (post-alt-tab clock correction), which used to become a permanent
+    -- per-frame flicker between the two pose writers.
+    local serverStarted = net.ReadDouble()
+    local serverNow = net.ReadDouble()
+    local anchoredStart = 0
+    if serverStarted > 0 then
+        anchoredStart = serverNow > 0 and (CurTime() - (serverNow - serverStarted)) or serverStarted
+    end
+    if not IsValid(playbackEnt) and entIndex > 0 then
+        local resolved = Entity(entIndex)
+        if IsValid(resolved) then playbackEnt = resolved end
+    end
 
     MMDVMDNPC.PlayStatus = {
         status = status,
@@ -3927,9 +4042,24 @@ net.Receive("mmdvmd_play_status", function()
 
     if status == "playing" then
         if message == "playback resumed" then
-            resume_local_playback(playbackEnt)
+            -- The authoritative epoch belongs to ONE dance: only apply it
+            -- when the entity resolved. The unresolved-ent broadcast resume
+            -- must stay measured-only, or it would stamp this dance's epoch
+            -- onto every other local playback.
+            resume_local_playback(playbackEnt, IsValid(playbackEnt) and anchoredStart or nil)
+        elseif IsValid(playbackEnt) then
+            -- A fresh authoritative start supersedes any stale pending for
+            -- this index (a silently torn-down earlier dance never sends a
+            -- stop, and a stale pending resolving later would overwrite this
+            -- state with the OLD dance's clip and epoch).
+            if entIndex > 0 then
+                MMDVMDNPC.PendingLocalPlaybacks[entIndex] = nil
+            end
+            start_local_playback(message, playbackEnt, anchoredStart)
         else
-            start_local_playback(message, playbackEnt)
+            -- Entity not networked yet: retry from Think instead of guessing
+            -- at a target (the old TargetStatus fallback orphaned states).
+            queue_pending_local_playback(entIndex, message, anchoredStart)
         end
     elseif status == "paused" then
         pause_local_playback(playbackEnt)
@@ -3941,6 +4071,9 @@ net.Receive("mmdvmd_play_status", function()
         end
     elseif status == "stopped" or status == "finished" or status == "error" then
         local clearPose = status == "stopped" or status == "error"
+        if entIndex > 0 then
+            MMDVMDNPC.PendingLocalPlaybacks[entIndex] = nil
+        end
         if IsValid(playbackEnt) then
             stop_local_playback(clearPose, playbackEnt)
         else
@@ -3951,6 +4084,7 @@ net.Receive("mmdvmd_play_status", function()
             end
         end
     elseif status == "stopped_all" then
+        MMDVMDNPC.PendingLocalPlaybacks = {}
         stop_local_playback(true)
     elseif status == "self_reset" then
         if force_self_view_cleanup then
@@ -3958,6 +4092,35 @@ net.Receive("mmdvmd_play_status", function()
         end
     elseif status == "missing_build" then
         chat.AddText(Color(255, 200, 0), "[MMD VMD] ", Color(255, 255, 255), tostring(message))
+    end
+end)
+
+-- Periodic body-pose clock sync (every ~2s per playing dance): re-anchors the
+-- local poser's epoch by elapsed dance time so a one-off delivery hitch (a
+-- status that sat buffered through an alt-tab) or a residual client-clock
+-- offset is corrected within seconds instead of flickering for the rest of
+-- the dance; also the liveness signal for the orphan reaper.
+net.Receive("mmdvmd_playback_sync", function()
+    local entIndex = net.ReadUInt(16)
+    local serverStarted = net.ReadDouble()
+    local serverNow = net.ReadDouble()
+    if entIndex <= 0 then return end
+    local ent = Entity(entIndex)
+    if not IsValid(ent) then return end
+    local state = (MMDVMDNPC.LocalPlaybacks or {})[ent]
+    if not state then return end
+    state.lastServerSync = CurTime()
+    if serverStarted > 0 and serverNow > 0 then
+        -- Body syncs only flow while the server is PLAYING this entity, and
+        -- net messages are ordered — so a sync is proof any local paused
+        -- flag is wrong (a misaddressed broadcast pause): heal it instead of
+        -- leaving this dance frozen on the networked pose.
+        if state.paused then
+            state.paused = false
+            state.pauseStarted = nil
+            state.nextTick = 0
+        end
+        state.started = CurTime() - (serverNow - serverStarted)
     end
 end)
 
