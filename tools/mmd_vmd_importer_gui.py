@@ -145,6 +145,7 @@ class ImportWorker(QtCore.QThread):
                 output_rotation_json=rotation_json,
                 progress=self._log,
                 cancel_check=self._cancelled,
+                disable_foot_ik=bool(self.settings.get("disable_foot_ik")),
             )
             if self.cancel_requested:
                 raise RuntimeError(I18N.t("error.import_cancelled"))
@@ -602,6 +603,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.detect_gmod_button.setToolTip(self.tr("inputs.detect_gmod.tooltip"))
             self.export_addon_check.setText(self.tr("inputs.export_addon"))
             self.export_addon_check.setToolTip(self.tr("inputs.export_addon.tooltip"))
+            self.disable_foot_ik_check.setText(self.tr("inputs.disable_foot_ik"))
+            self.disable_foot_ik_check.setToolTip(self.tr("inputs.disable_foot_ik.tooltip"))
             self.input_audio_offset_slider.setToolTip(self.tr("inputs.audio_offset.tooltip"))
             self.audio_offset_slider.setToolTip(self.tr("preview.audio_offset.tooltip"))
 
@@ -767,6 +770,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.import_button.setMinimumHeight(48)
         self.export_addon_check = QtWidgets.QCheckBox(self.tr("inputs.export_addon"))
         self.export_addon_check.setToolTip(self.tr("inputs.export_addon.tooltip"))
+        self.disable_foot_ik_check = QtWidgets.QCheckBox(self.tr("inputs.disable_foot_ik"))
+        self.disable_foot_ik_check.setToolTip(self.tr("inputs.disable_foot_ik.tooltip"))
         self.cancel_button = QtWidgets.QPushButton(self.tr("inputs.cancel_import"))
         self.cancel_button.setEnabled(False)
         self.detect_gmod_button.clicked.connect(self.detect_gmod)
@@ -776,6 +781,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         for button in (self.detect_gmod_button, self.preview_button, self.import_button):
             actions.addWidget(button)
         actions.addWidget(self.export_addon_check)
+        actions.addWidget(self.disable_foot_ik_check)
         actions.addWidget(self.cancel_button)
         actions.addStretch(1)
         layout.addLayout(actions)
@@ -1031,6 +1037,8 @@ class ImporterWindow(QtWidgets.QMainWindow):
             self.set_audio_offset_value(int(audio_offset or 0), persist=False)
             export_addon = self.settings_store.value("export_addon", False, bool)
             self.export_addon_check.setChecked(bool(export_addon))
+            disable_foot_ik = self.settings_store.value("disable_foot_ik", False, bool)
+            self.disable_foot_ik_check.setChecked(bool(disable_foot_ik))
         finally:
             self._loading_settings = False
 
@@ -1043,6 +1051,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.body_row.pathBrowsed.connect(self.on_body_vmd_selected)
         self.motion_meta_table.itemChanged.connect(self._on_motion_meta_changed)
         self.export_addon_check.toggled.connect(lambda _value: self.save_persisted_settings())
+        self.disable_foot_ik_check.toggled.connect(lambda _value: self.save_persisted_settings())
 
     def _retranslate_motion_meta_headers(self) -> None:
         for column, field in enumerate(import_vmd.MOTION_META_FIELDS):
@@ -1114,6 +1123,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
         self.settings_store.setValue("audio_offset_centis", int(round(self.current_audio_offset_seconds() * 100)))
         self.settings_store.setValue("flex_vmds", self.flex_vmd_paths())
         self.settings_store.setValue("export_addon", self.export_addon_check.isChecked())
+        self.settings_store.setValue("disable_foot_ik", self.disable_foot_ik_check.isChecked())
         self.settings_store.sync()
 
     def auto_detect_missing_paths(self) -> None:
@@ -1453,6 +1463,7 @@ class ImporterWindow(QtWidgets.QMainWindow):
             "flex_vmds": self.flex_vmd_paths(),
             "export_addon": export_addon,
             "addon_gma_path": addon_gma_path,
+            "disable_foot_ik": self.disable_foot_ik_check.isChecked(),
         }
         self.log.clear()
         self.load_preview()

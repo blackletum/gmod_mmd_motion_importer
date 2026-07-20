@@ -64,6 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-end", type=int, required=True)
     parser.add_argument("--output-rotation-json", type=Path)
     parser.add_argument("--bone-map-json", default="{}")
+    parser.add_argument("--disable-foot-ik", action="store_true",
+                        help="mute all IK on the model before baking (for motions authored without foot IK)")
     return parser.parse_args(argv)
 
 
@@ -314,6 +316,48 @@ def import_motion(armature: bpy.types.Object, vmd_path: Path) -> None:
     print(f"Importing VMD motion: {vmd_path}")
     call_operator(bpy.ops.mmd_tools.import_vmd, filepath=str(vmd_path))
     print(f"Imported VMD motion: {vmd_path}")
+
+
+def disable_foot_ik(armature: bpy.types.Object) -> None:
+    """Force every IK constraint on the model off before baking.
+
+    Motions authored WITHOUT foot IK leave the IK target bones at the rest
+    pose; baking them with IK enabled pins the legs to those resting targets
+    while the FK keyframes dance. Runs after import_motion so it also wins
+    over any IK on/off animation the VMD itself carried:
+
+    1. Drop imported fcurves on pose.bones[...].mmd_ik_toggle (mmd_tools
+       imports VMD IK on/off frames as animation of that property).
+    2. Set mmd_ik_toggle = False on every pose bone — mmd_tools' update
+       callback zeroes the influence of the matching IK constraints AND the
+       chain's LIMIT_ROTATION (mmd_ik_limit_override) constraints, exactly
+       like toggling IK off in MMD.
+    3. Belt and braces: mute + zero every IK-type constraint directly, in
+       case the model was not imported through mmd_tools.
+    """
+    anim = armature.animation_data
+    action = anim.action if anim else None
+    if action:
+        for fcurve in [f for f in action.fcurves if "mmd_ik_toggle" in (f.data_path or "")]:
+            action.fcurves.remove(fcurve)
+
+    toggled = 0
+    for pbone in armature.pose.bones:
+        try:
+            if getattr(pbone, "mmd_ik_toggle", None):
+                pbone.mmd_ik_toggle = False
+                toggled += 1
+        except Exception as exc:
+            print(f"mmd_ik_toggle off failed on {pbone.name}: {exc}")
+
+    muted = 0
+    for pbone in armature.pose.bones:
+        for constraint in pbone.constraints:
+            if constraint.type == "IK":
+                constraint.mute = True
+                constraint.influence = 0.0
+                muted += 1
+    print(f"Disabled foot IK: toggled {toggled} MMD IK bone(s) off, muted {muted} IK constraint(s).")
 
 
 def bake_pose(armature: bpy.types.Object, frame_start: int, frame_end: int) -> None:
@@ -824,6 +868,8 @@ def main() -> int:
     clear_scene()
     armature = import_model(args.mmd_model)
     import_motion(armature, args.input_vmd)
+    if args.disable_foot_ik:
+        disable_foot_ik(armature)
     bake_pose(armature, args.frame_start, args.frame_end)
     if args.output_rotation_json:
         export_parent_corrected_bone_rotations(

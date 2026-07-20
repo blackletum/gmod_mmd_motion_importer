@@ -76,6 +76,8 @@
   "inputs.bake_import": "Bake Motion and Install to GMod",
   "inputs.export_addon": "Also export as GMod addon",
   "inputs.export_addon.tooltip": "Package the imported motion JSON and optional music into a distributable .gma file.",
+  "inputs.disable_foot_ik": "Disable foot IK (motion baked without IK)",
+  "inputs.disable_foot_ik.tooltip": "Turn off every IK constraint on the model (feet and toes) before baking. Use for motions authored without foot IK — baking those with IK enabled pins the legs to the rest pose. Leave off for normal motions.",
   "inputs.cancel_import": "Cancel Import",
   "inputs.progress.title": "Bake Progress",
   "inputs.progress.idle": "No bake running.",

@@ -2638,6 +2638,7 @@ def build_blender_bake_command(
     frame_start: int,
     frame_end: int,
     output_rotation_json: Path | None = None,
+    disable_foot_ik: bool = False,
 ) -> list[str]:
     command = [
         str(blender),
@@ -2657,6 +2658,8 @@ def build_blender_bake_command(
         "--frame-end",
         str(frame_end),
     ]
+    if disable_foot_ik:
+        command.append("--disable-foot-ik")
     if output_rotation_json is not None:
         command.extend(
             [
@@ -2679,6 +2682,7 @@ def bake_vmd_with_blender(
     output_rotation_json: Path | None = None,
     progress: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
+    disable_foot_ik: bool = False,
 ) -> Path:
     if not vmd_path.exists():
         raise FileNotFoundError(vmd_path)
@@ -2718,7 +2722,10 @@ def bake_vmd_with_blender(
         frame_start,
         frame_end,
         output_rotation_json.resolve(),
+        disable_foot_ik=disable_foot_ik,
     )
+    if disable_foot_ik:
+        emit_progress(progress, "Foot IK disabled for this bake (motion authored without IK).")
     emit_progress(progress, "Starting Blender bake process...")
     started = time.monotonic()
     bake_env = os.environ.copy()
@@ -3063,6 +3070,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--export-addon-gma", type=Path, help="also package the imported motion and optional music as a .gma file")
     parser.add_argument("--frame-start", type=int, default=0, help="first VMD frame to bake")
     parser.add_argument("--frame-end", type=int, help="last VMD frame to bake; defaults to the VMD max frame")
+    parser.add_argument("--disable-foot-ik", action="store_true",
+                        help="mute all IK on the model before baking; use for motions authored without foot IK")
     parser.add_argument("--install-addon", action="store_true", help="legacy no-op; addon installation is no longer performed")
     parser.add_argument("--output-dir", type=Path, help="override GMod motion JSON output directory")
     parser.add_argument("--gmod-dir", type=Path, help="override Garry's Mod installation directory")
@@ -3096,6 +3105,7 @@ def main(argv: list[str]) -> int:
             frame_start=args.frame_start,
             frame_end=args.frame_end,
             output_rotation_json=rotation_json_for_cache,
+            disable_foot_ik=args.disable_foot_ik,
         )
         print(f"Baked VMD: {vmd_for_cache}")
         print(f"Parent-corrected rotation JSON: {rotation_json_for_cache}")

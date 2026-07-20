@@ -58,6 +58,8 @@
   "inputs.bake_import": "خبز الحركة وتثبيتها في GMod",
   "inputs.export_addon": "تصدير أيضاً كإضافة GMod",
   "inputs.export_addon.tooltip": "يحزم JSON الحركة المستوردة والموسيقى الاختيارية في ملف .gma قابل للتوزيع.",
+  "inputs.disable_foot_ik": "تعطيل IK للقدمين (حركة بدون IK)",
+  "inputs.disable_foot_ik.tooltip": "يوقف جميع قيود IK في النموذج (القدمان وأصابع القدم) قبل الخبز. استخدمه للحركات المصنوعة بدون IK للقدمين — خبزها مع تفعيل IK يثبّت الساقين على الوضعية الأولية. اتركه معطلاً للحركات العادية.",
   "inputs.cancel_import": "إلغاء الاستيراد",
   "inputs.progress.title": "تقدم الخبز",
   "inputs.progress.idle": "لا يوجد خبز قيد التشغيل.",

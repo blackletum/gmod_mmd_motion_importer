@@ -76,6 +76,8 @@
   "inputs.bake_import": "モーションをベイクして GMod にインストール",
   "inputs.export_addon": "GMod アドオンとしても出力",
   "inputs.export_addon.tooltip": "インポート済みモーション JSON と任意の音楽を配布可能な .gma にパッケージします。",
+  "inputs.disable_foot_ik": "足IKを無効化（IKなしモーション用）",
+  "inputs.disable_foot_ik.tooltip": "ベイク前にモデルの全IK制約（足・つま先）をオフにします。足IKを使わずに作られたモーション用です——IK有効のままベイクすると脚が初期ポーズに固定されます。通常のモーションではオフのままにしてください。",
   "inputs.cancel_import": "インポートをキャンセル",
   "inputs.progress.title": "ベイク進行状況",
   "inputs.progress.idle": "ベイクは実行されていません。",
